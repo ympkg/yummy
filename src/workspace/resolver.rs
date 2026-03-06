@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use console::style;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::config::schema::{LockFile, LockedDependency};
@@ -131,11 +131,6 @@ pub fn resolve_and_download_full(
     let mut queue = VecDeque::new();
     let mut ordered_keys = Vec::new(); // track order for jar collection
 
-    for (coord, version) in dependencies {
-        let mc = MavenCoord::parse(coord, version)?;
-        queue.push_back(mc);
-    }
-
     let client = reqwest::blocking::Client::builder()
         .user_agent("ym/0.1.0")
         .timeout(std::time::Duration::from_secs(30))
@@ -143,17 +138,44 @@ pub fn resolve_and_download_full(
 
     let repo_urls = build_repo_list(repos);
 
-    // Resolve transitive graph (sequential — needs POM parsing)
+    // Resolve transitive graph with nearest-wins strategy (Maven convention).
+    // Track the depth at which each groupId:artifactId was first resolved.
     let mut coords_to_download: Vec<(String, MavenCoord)> = Vec::new();
     let mut dep_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Maps groupId:artifactId -> (depth, chosen version)
+    let mut resolved_versions: HashMap<String, (usize, String)> = HashMap::new();
+    // Track BFS depth per queued item
+    let mut depth_map: HashMap<String, usize> = HashMap::new();
+
+    // Initialize direct dependencies at depth 0
+    for (coord, version) in dependencies {
+        let mc = MavenCoord::parse(coord, version)?;
+        let ga_key = format!("{}:{}", mc.group_id, mc.artifact_id);
+        depth_map.insert(mc.versioned_key(), 0);
+        resolved_versions.insert(ga_key, (0, mc.version.clone()));
+        queue.push_back(mc);
+    }
 
     while let Some(coord) = queue.pop_front() {
         let key = coord.versioned_key();
+        let ga_key = format!("{}:{}", coord.group_id, coord.artifact_id);
+        let current_depth = depth_map.get(&key).copied().unwrap_or(0);
+
         if visited.contains(&key) {
             continue;
         }
+
+        // Nearest-wins: if we already resolved this GA at a shallower depth
+        // with a different version, skip this deeper version
+        if let Some(&(resolved_depth, ref resolved_ver)) = resolved_versions.get(&ga_key) {
+            if resolved_ver != &coord.version && resolved_depth < current_depth {
+                continue; // A nearer version was already chosen
+            }
+        }
+
         visited.insert(key.clone());
         ordered_keys.push(key.clone());
+        resolved_versions.entry(ga_key).or_insert((current_depth, coord.version.clone()));
 
         // Download POM for transitive deps (must be sequential for graph resolution)
         let transitive = resolve_transitive(&client, &coord, cache_dir, &repo_urls)?;
@@ -176,7 +198,10 @@ pub fn resolve_and_download_full(
             coords_to_download.push((key, coord));
         }
 
+        let child_depth = current_depth + 1;
         for dep in transitive {
+            let dep_vk = dep.versioned_key();
+            depth_map.entry(dep_vk).or_insert(child_depth);
             queue.push_back(dep);
         }
     }
@@ -324,23 +349,26 @@ fn resolve_transitive(
 
     let pom_content = std::fs::read_to_string(&pom_path)?;
 
-    // Collect parent POM properties (up to 3 levels)
-    let mut all_properties = std::collections::HashMap::new();
-    resolve_parent_properties(client, &pom_content, cache_dir, repos, &mut all_properties, 0)?;
+    // Collect parent POM properties (unlimited depth with cycle detection)
+    let mut all_properties = HashMap::new();
+    let mut visited_poms = HashSet::new();
+    resolve_parent_properties(client, &pom_content, cache_dir, repos, &mut all_properties, 0, &mut visited_poms)?;
 
-    parse_pom_dependencies_with_props(&pom_content, &all_properties)
+    parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, repos)
 }
 
 /// Recursively fetch parent POM properties.
+/// Uses cycle detection via visited_poms set and a depth limit of 20.
 fn resolve_parent_properties(
     client: &reqwest::blocking::Client,
     pom_content: &str,
     cache_dir: &Path,
     repos: &[String],
-    properties: &mut std::collections::HashMap<String, String>,
+    properties: &mut HashMap<String, String>,
     depth: u8,
+    visited_poms: &mut HashSet<String>,
 ) -> Result<()> {
-    if depth > 3 {
+    if depth > 20 {
         return Ok(());
     }
 
@@ -361,6 +389,12 @@ fn resolve_parent_properties(
                 }
             }
             if let (Some(g), Some(a), Some(v)) = (pg, pa, pv) {
+                let parent_key = format!("{}:{}:{}", g, a, v);
+                if visited_poms.contains(&parent_key) {
+                    break; // Cycle detected
+                }
+                visited_poms.insert(parent_key);
+
                 let parent_coord = MavenCoord {
                     group_id: g.to_string(),
                     artifact_id: a.to_string(),
@@ -373,15 +407,17 @@ fn resolve_parent_properties(
                 if parent_pom_path.exists() {
                     let parent_content = std::fs::read_to_string(&parent_pom_path)?;
                     // Recurse into grandparent first (so child overrides parent)
-                    resolve_parent_properties(client, &parent_content, cache_dir, repos, properties, depth + 1)?;
+                    resolve_parent_properties(client, &parent_content, cache_dir, repos, properties, depth + 1, visited_poms)?;
                     // Then merge parent properties
                     let parent_doc = roxmltree::Document::parse(&parent_content)?;
                     let parent_props = collect_pom_properties(&parent_doc);
                     for (k, v) in parent_props {
                         properties.entry(k).or_insert(v);
                     }
-                    // Parent managed versions as fallback
-                    let managed = collect_managed_versions(&parent_doc, properties);
+                    // Parent managed versions (including BOM imports)
+                    let managed = collect_managed_versions_with_bom(
+                        &parent_doc, properties, client, cache_dir, repos, 0,
+                    );
                     for (k, v) in managed {
                         properties.entry(format!("managed:{}", k)).or_insert(v);
                     }
@@ -401,9 +437,13 @@ fn resolve_parent_properties(
 }
 
 /// Parse POM dependencies with pre-collected properties (including parent).
+/// Now supports BOM imports in dependencyManagement.
 fn parse_pom_dependencies_with_props(
     pom: &str,
-    extra_properties: &std::collections::HashMap<String, String>,
+    extra_properties: &HashMap<String, String>,
+    client: &reqwest::blocking::Client,
+    cache_dir: &Path,
+    repos: &[String],
 ) -> Result<Vec<MavenCoord>> {
     let doc = roxmltree::Document::parse(pom)?;
 
@@ -414,7 +454,9 @@ fn parse_pom_dependencies_with_props(
         properties.insert(k, v);
     }
 
-    let managed = collect_managed_versions(&doc, &properties);
+    let managed = collect_managed_versions_with_bom(
+        &doc, &properties, client, cache_dir, repos, 0,
+    );
 
     let mut deps = Vec::new();
 
@@ -450,8 +492,9 @@ fn parse_pom_dependencies_with_props(
                 }
             }
 
+            // Skip import scope (handled in dependencyManagement)
             if let Some(ref s) = scope {
-                if s == "test" || s == "provided" || s == "system" {
+                if s == "test" || s == "provided" || s == "system" || s == "import" {
                     continue;
                 }
             }
@@ -460,16 +503,18 @@ fn parse_pom_dependencies_with_props(
             }
 
             if let (Some(g), Some(a)) = (group_id, artifact_id) {
+                let resolved_g = resolve_properties(&g, &properties);
+                let resolved_a = resolve_properties(&a, &properties);
                 let resolved_version = version
                     .map(|v| resolve_properties(&v, &properties))
-                    .or_else(|| managed.get(&format!("{}:{}", g, a)).cloned())
-                    .or_else(|| extra_properties.get(&format!("managed:{}:{}", g, a)).cloned());
+                    .or_else(|| managed.get(&format!("{}:{}", resolved_g, resolved_a)).cloned())
+                    .or_else(|| extra_properties.get(&format!("managed:{}:{}", resolved_g, resolved_a)).cloned());
 
                 if let Some(v) = resolved_version {
                     if !v.contains("${") {
                         deps.push(MavenCoord {
-                            group_id: g,
-                            artifact_id: a,
+                            group_id: resolved_g,
+                            artifact_id: resolved_a,
                             version: v,
                         });
                     }
@@ -481,23 +526,70 @@ fn parse_pom_dependencies_with_props(
     Ok(deps)
 }
 
-/// Collect <properties> from POM.
-fn collect_pom_properties(doc: &roxmltree::Document) -> std::collections::HashMap<String, String> {
-    let mut props = std::collections::HashMap::new();
+/// Collect <properties> from POM, including built-in Maven properties.
+fn collect_pom_properties(doc: &roxmltree::Document) -> HashMap<String, String> {
+    let mut props = HashMap::new();
+    let root = doc.root_element();
 
-    // Also grab project.version
-    for node in doc.descendants() {
-        if node.tag_name().name() == "version" {
-            if let Some(parent) = node.parent() {
-                if parent.tag_name().name() == "project" || parent.tag_name().name() == "parent" {
-                    if let Some(v) = node.text() {
-                        props.insert("project.version".to_string(), v.to_string());
+    // Collect project-level coordinates as built-in properties
+    let mut project_group_id = None;
+    let mut project_artifact_id = None;
+    let mut project_version = None;
+    let mut parent_group_id = None;
+    let mut parent_version = None;
+
+    for node in root.children() {
+        match node.tag_name().name() {
+            "groupId" => project_group_id = node.text().map(|s| s.to_string()),
+            "artifactId" => project_artifact_id = node.text().map(|s| s.to_string()),
+            "version" => project_version = node.text().map(|s| s.to_string()),
+            "parent" => {
+                for child in node.children() {
+                    match child.tag_name().name() {
+                        "groupId" => parent_group_id = child.text().map(|s| s.to_string()),
+                        "version" => parent_version = child.text().map(|s| s.to_string()),
+                        _ => {}
                     }
                 }
             }
+            _ => {}
         }
     }
 
+    // project.version: own version or inherited from parent
+    if let Some(ref v) = project_version {
+        props.insert("project.version".to_string(), v.clone());
+        props.insert("pom.version".to_string(), v.clone());
+    } else if let Some(ref v) = parent_version {
+        props.insert("project.version".to_string(), v.clone());
+        props.insert("pom.version".to_string(), v.clone());
+    }
+
+    // project.groupId: own or inherited from parent
+    if let Some(ref g) = project_group_id {
+        props.insert("project.groupId".to_string(), g.clone());
+        props.insert("pom.groupId".to_string(), g.clone());
+    } else if let Some(ref g) = parent_group_id {
+        props.insert("project.groupId".to_string(), g.clone());
+        props.insert("pom.groupId".to_string(), g.clone());
+    }
+
+    if let Some(ref a) = project_artifact_id {
+        props.insert("project.artifactId".to_string(), a.clone());
+        props.insert("pom.artifactId".to_string(), a.clone());
+    }
+
+    // parent.* properties
+    if let Some(ref g) = parent_group_id {
+        props.insert("parent.groupId".to_string(), g.clone());
+        props.insert("project.parent.groupId".to_string(), g.clone());
+    }
+    if let Some(ref v) = parent_version {
+        props.insert("parent.version".to_string(), v.clone());
+        props.insert("project.parent.version".to_string(), v.clone());
+    }
+
+    // Collect explicit <properties>
     for node in doc.descendants() {
         if node.tag_name().name() == "properties" {
             for child in node.children() {
@@ -513,12 +605,22 @@ fn collect_pom_properties(doc: &roxmltree::Document) -> std::collections::HashMa
     props
 }
 
-/// Collect versions from <dependencyManagement>.
-fn collect_managed_versions(
+/// Collect versions from <dependencyManagement>, including BOM imports.
+/// When a dependency has scope=import and type=pom, recursively fetch and
+/// merge its dependencyManagement entries (outer takes precedence).
+fn collect_managed_versions_with_bom(
     doc: &roxmltree::Document,
-    properties: &std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
-    let mut managed = std::collections::HashMap::new();
+    properties: &HashMap<String, String>,
+    client: &reqwest::blocking::Client,
+    cache_dir: &Path,
+    repos: &[String],
+    bom_depth: u8,
+) -> HashMap<String, String> {
+    if bom_depth > 10 {
+        return HashMap::new(); // Prevent infinite BOM recursion
+    }
+
+    let mut managed = HashMap::new();
 
     for node in doc.descendants() {
         if node.tag_name().name() != "dependencyManagement" {
@@ -535,17 +637,80 @@ fn collect_managed_versions(
                 let mut g = None;
                 let mut a = None;
                 let mut v = None;
+                let mut scope = None;
+                let mut dep_type = None;
                 for child in dep.children() {
                     match child.tag_name().name() {
                         "groupId" => g = child.text(),
                         "artifactId" => a = child.text(),
                         "version" => v = child.text(),
+                        "scope" => scope = child.text(),
+                        "type" => dep_type = child.text(),
                         _ => {}
                     }
                 }
-                if let (Some(g), Some(a), Some(v)) = (g, a, v) {
-                    let resolved = resolve_properties(v, properties);
-                    managed.insert(format!("{}:{}", g, a), resolved);
+
+                if let (Some(g), Some(a)) = (g, a) {
+                    let resolved_g = resolve_properties(g, properties);
+                    let resolved_a = resolve_properties(a, properties);
+
+                    // Handle BOM import: scope=import + type=pom
+                    if scope == Some("import") && dep_type == Some("pom") {
+                        if let Some(v) = v {
+                            let resolved_v = resolve_properties(v, properties);
+                            if !resolved_v.contains("${") {
+                                // Download and parse the BOM POM
+                                let bom_coord = MavenCoord {
+                                    group_id: resolved_g.clone(),
+                                    artifact_id: resolved_a.clone(),
+                                    version: resolved_v,
+                                };
+                                let bom_pom_path = bom_coord.pom_path(cache_dir);
+                                if !bom_pom_path.exists() {
+                                    let _ = download_from_repos(
+                                        client, &bom_coord, &bom_pom_path, repos,
+                                        |c, r| c.pom_url(r),
+                                    );
+                                }
+                                if bom_pom_path.exists() {
+                                    if let Ok(bom_content) = std::fs::read_to_string(&bom_pom_path) {
+                                        if let Ok(bom_doc) = roxmltree::Document::parse(&bom_content) {
+                                            // Collect BOM's own properties
+                                            let mut bom_props = properties.clone();
+                                            let bom_local_props = collect_pom_properties(&bom_doc);
+                                            for (k, val) in bom_local_props {
+                                                bom_props.entry(k).or_insert(val);
+                                            }
+
+                                            // Also resolve BOM's parent properties
+                                            let mut bom_visited = HashSet::new();
+                                            let _ = resolve_parent_properties(
+                                                client, &bom_content, cache_dir, repos,
+                                                &mut bom_props, 0, &mut bom_visited,
+                                            );
+
+                                            // Recursively collect managed versions from BOM
+                                            let bom_managed = collect_managed_versions_with_bom(
+                                                &bom_doc, &bom_props, client, cache_dir, repos,
+                                                bom_depth + 1,
+                                            );
+                                            // Outer definitions take precedence
+                                            for (k, val) in bom_managed {
+                                                managed.entry(k).or_insert(val);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Regular managed dependency
+                    if let Some(v) = v {
+                        let resolved = resolve_properties(v, properties);
+                        managed.insert(format!("{}:{}", resolved_g, resolved_a), resolved);
+                    }
                 }
             }
         }
@@ -555,10 +720,10 @@ fn collect_managed_versions(
 }
 
 /// Replace ${property.name} placeholders with values from properties map.
-fn resolve_properties(value: &str, properties: &std::collections::HashMap<String, String>) -> String {
+/// Iterates up to 10 rounds to handle transitive property references.
+fn resolve_properties(value: &str, properties: &HashMap<String, String>) -> String {
     let mut result = value.to_string();
-    // Iterate until no more substitutions (handles nested refs)
-    for _ in 0..5 {
+    for _ in 0..10 {
         let prev = result.clone();
         for (key, val) in properties {
             result = result.replace(&format!("${{{}}}", key), val);
@@ -734,4 +899,408 @@ pub fn fetch_latest_version(group_id: &str, artifact_id: &str) -> Result<String>
     }
 
     bail!("Could not find {}:{} on Maven Central", group_id, artifact_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- MavenCoord tests ---
+
+    #[test]
+    fn test_maven_coord_parse_basic() {
+        let mc = MavenCoord::parse("org.springframework:spring-core", "5.3.0").unwrap();
+        assert_eq!(mc.group_id, "org.springframework");
+        assert_eq!(mc.artifact_id, "spring-core");
+        assert_eq!(mc.version, "5.3.0");
+    }
+
+    #[test]
+    fn test_maven_coord_parse_strips_prefix() {
+        let mc = MavenCoord::parse("com.example:lib", "^2.19.0").unwrap();
+        assert_eq!(mc.version, "2.19.0");
+        let mc2 = MavenCoord::parse("com.example:lib", "~1.5.0").unwrap();
+        assert_eq!(mc2.version, "1.5.0");
+    }
+
+    #[test]
+    fn test_maven_coord_parse_invalid() {
+        assert!(MavenCoord::parse("invalid", "1.0").is_err());
+        assert!(MavenCoord::parse("a:b:c", "1.0").is_err());
+    }
+
+    #[test]
+    fn test_maven_coord_keys() {
+        let mc = MavenCoord::parse("org.example:lib", "1.0").unwrap();
+        assert_eq!(mc.key(), "org.example:lib");
+        assert_eq!(mc.versioned_key(), "org.example:lib:1.0");
+    }
+
+    #[test]
+    fn test_maven_coord_urls() {
+        let mc = MavenCoord::parse("org.example:lib", "1.0").unwrap();
+        let repo = "https://repo1.maven.org/maven2";
+        assert_eq!(mc.jar_url(repo), "https://repo1.maven.org/maven2/org/example/lib/1.0/lib-1.0.jar");
+        assert_eq!(mc.pom_url(repo), "https://repo1.maven.org/maven2/org/example/lib/1.0/lib-1.0.pom");
+    }
+
+    #[test]
+    fn test_maven_coord_paths() {
+        let mc = MavenCoord::parse("org.example:lib", "1.0").unwrap();
+        let cache = Path::new("/tmp/cache");
+        assert_eq!(mc.jar_path(cache), PathBuf::from("/tmp/cache/org.example/lib/1.0/lib-1.0.jar"));
+        assert_eq!(mc.pom_path(cache), PathBuf::from("/tmp/cache/org.example/lib/1.0/lib-1.0.pom"));
+    }
+
+    // --- Property resolution tests (Phase 1.4) ---
+
+    #[test]
+    fn test_resolve_properties_simple() {
+        let mut props = HashMap::new();
+        props.insert("spring.version".to_string(), "5.3.0".to_string());
+        assert_eq!(resolve_properties("${spring.version}", &props), "5.3.0");
+    }
+
+    #[test]
+    fn test_resolve_properties_no_placeholder() {
+        let props = HashMap::new();
+        assert_eq!(resolve_properties("plain-text", &props), "plain-text");
+    }
+
+    #[test]
+    fn test_resolve_properties_transitive() {
+        let mut props = HashMap::new();
+        props.insert("base".to_string(), "1.0".to_string());
+        props.insert("derived".to_string(), "${base}".to_string());
+        // ${derived} -> ${base} -> 1.0
+        assert_eq!(resolve_properties("${derived}", &props), "1.0");
+    }
+
+    #[test]
+    fn test_resolve_properties_multiple() {
+        let mut props = HashMap::new();
+        props.insert("g".to_string(), "org.example".to_string());
+        props.insert("v".to_string(), "2.0".to_string());
+        assert_eq!(resolve_properties("${g}:lib:${v}", &props), "org.example:lib:2.0");
+    }
+
+    #[test]
+    fn test_resolve_properties_unresolved() {
+        let props = HashMap::new();
+        assert_eq!(resolve_properties("${unknown}", &props), "${unknown}");
+    }
+
+    // --- POM property collection tests ---
+
+    #[test]
+    fn test_collect_pom_properties_basic() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>org.example</groupId>
+    <artifactId>my-app</artifactId>
+    <version>1.0.0</version>
+    <properties>
+        <spring.version>5.3.0</spring.version>
+        <java.version>17</java.version>
+    </properties>
+</project>"#;
+        let doc = roxmltree::Document::parse(pom).unwrap();
+        let props = collect_pom_properties(&doc);
+        assert_eq!(props.get("spring.version").unwrap(), "5.3.0");
+        assert_eq!(props.get("java.version").unwrap(), "17");
+        assert_eq!(props.get("project.groupId").unwrap(), "org.example");
+        assert_eq!(props.get("project.version").unwrap(), "1.0.0");
+        assert_eq!(props.get("project.artifactId").unwrap(), "my-app");
+    }
+
+    #[test]
+    fn test_collect_pom_properties_inherits_parent() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>org.parent</groupId>
+        <artifactId>parent-pom</artifactId>
+        <version>2.0.0</version>
+    </parent>
+    <artifactId>child</artifactId>
+</project>"#;
+        let doc = roxmltree::Document::parse(pom).unwrap();
+        let props = collect_pom_properties(&doc);
+        // groupId and version inherited from parent
+        assert_eq!(props.get("project.groupId").unwrap(), "org.parent");
+        assert_eq!(props.get("project.version").unwrap(), "2.0.0");
+        assert_eq!(props.get("parent.groupId").unwrap(), "org.parent");
+        assert_eq!(props.get("parent.version").unwrap(), "2.0.0");
+    }
+
+    // --- Managed versions / BOM tests (Phase 1.1) ---
+
+    #[test]
+    fn test_collect_managed_versions_basic() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>lib-a</artifactId>
+                <version>1.0</version>
+            </dependency>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>lib-b</artifactId>
+                <version>2.0</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>"#;
+        let doc = roxmltree::Document::parse(pom).unwrap();
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let managed = collect_managed_versions_with_bom(&doc, &props, &client, Path::new("/tmp"), &[], 0);
+        assert_eq!(managed.get("com.example:lib-a").unwrap(), "1.0");
+        assert_eq!(managed.get("com.example:lib-b").unwrap(), "2.0");
+    }
+
+    #[test]
+    fn test_collect_managed_versions_with_property_resolution() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <properties>
+        <lib.version>3.0</lib.version>
+    </properties>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>lib</artifactId>
+                <version>${lib.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>"#;
+        let doc = roxmltree::Document::parse(pom).unwrap();
+        let mut props = HashMap::new();
+        props.insert("lib.version".to_string(), "3.0".to_string());
+        let client = reqwest::blocking::Client::new();
+        let managed = collect_managed_versions_with_bom(&doc, &props, &client, Path::new("/tmp"), &[], 0);
+        assert_eq!(managed.get("com.example:lib").unwrap(), "3.0");
+    }
+
+    #[test]
+    fn test_bom_depth_limit() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>bom</artifactId>
+                <version>1.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>"#;
+        let doc = roxmltree::Document::parse(pom).unwrap();
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        // At depth 11 (> 10 limit), should return empty
+        let managed = collect_managed_versions_with_bom(&doc, &props, &client, Path::new("/tmp"), &[], 11);
+        assert!(managed.is_empty());
+    }
+
+    // --- POM dependency parsing tests ---
+
+    #[test]
+    fn test_parse_pom_dependencies_basic() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>lib</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let deps = parse_pom_dependencies_with_props(pom, &props, &client, Path::new("/tmp"), &[]).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].group_id, "com.example");
+        assert_eq!(deps[0].artifact_id, "lib");
+        assert_eq!(deps[0].version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_pom_skips_test_scope() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>"#;
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let deps = parse_pom_dependencies_with_props(pom, &props, &client, Path::new("/tmp"), &[]).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pom_skips_optional() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>optional-lib</artifactId>
+            <version>1.0</version>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+</project>"#;
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let deps = parse_pom_dependencies_with_props(pom, &props, &client, Path::new("/tmp"), &[]).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pom_skips_provided_scope() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>servlet-api</artifactId>
+            <version>3.0</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+</project>"#;
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let deps = parse_pom_dependencies_with_props(pom, &props, &client, Path::new("/tmp"), &[]).unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pom_uses_managed_version() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.example</groupId>
+                <artifactId>lib</artifactId>
+                <version>2.0</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>lib</artifactId>
+        </dependency>
+    </dependencies>
+</project>"#;
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let deps = parse_pom_dependencies_with_props(pom, &props, &client, Path::new("/tmp"), &[]).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].version, "2.0");
+    }
+
+    #[test]
+    fn test_parse_pom_skips_dependency_management_section() {
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.managed</groupId>
+                <artifactId>lib</artifactId>
+                <version>1.0</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>"#;
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let deps = parse_pom_dependencies_with_props(pom, &props, &client, Path::new("/tmp"), &[]).unwrap();
+        // dependencyManagement deps should not appear as direct dependencies
+        assert!(deps.is_empty());
+    }
+
+    // --- Repo list tests ---
+
+    #[test]
+    fn test_build_repo_list_default() {
+        let repos = build_repo_list(&[]);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0], DEFAULT_REPO);
+    }
+
+    #[test]
+    fn test_build_repo_list_custom() {
+        let custom = vec!["https://custom.repo/maven".to_string()];
+        let repos = build_repo_list(&custom);
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0], "https://custom.repo/maven");
+        assert_eq!(repos[1], DEFAULT_REPO);
+    }
+
+    #[test]
+    fn test_build_repo_list_no_duplicate_central() {
+        let custom = vec![DEFAULT_REPO.to_string()];
+        let repos = build_repo_list(&custom);
+        assert_eq!(repos.len(), 1);
+    }
+
+    #[test]
+    fn test_build_repo_list_trims_trailing_slash() {
+        let custom = vec!["https://custom.repo/maven/".to_string()];
+        let repos = build_repo_list(&custom);
+        assert_eq!(repos[0], "https://custom.repo/maven");
+    }
+
+    // --- Lock file conflict detection tests (Phase 1.3) ---
+
+    #[test]
+    fn test_check_conflicts_no_conflicts() {
+        let mut lock = LockFile::default();
+        lock.dependencies.insert("com.example:lib:1.0".to_string(), LockedDependency { sha256: None, dependencies: None });
+        let conflicts = check_conflicts(&lock);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_check_conflicts_detects_multiple_versions() {
+        let mut lock = LockFile::default();
+        lock.dependencies.insert("com.example:lib:1.0".to_string(), LockedDependency { sha256: None, dependencies: None });
+        lock.dependencies.insert("com.example:lib:2.0".to_string(), LockedDependency { sha256: None, dependencies: None });
+        let conflicts = check_conflicts(&lock);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, "com.example:lib");
+        assert!(conflicts[0].1.contains(&"1.0".to_string()));
+        assert!(conflicts[0].1.contains(&"2.0".to_string()));
+    }
+
+    // --- Lock-based resolution tests ---
+
+    #[test]
+    fn test_try_resolve_from_lock_empty() {
+        let deps = BTreeMap::new();
+        let lock = LockFile::default();
+        let result = try_resolve_from_lock(&deps, Path::new("/tmp/cache"), &lock);
+        // Empty lock returns None
+        assert!(result.is_none());
+    }
 }
