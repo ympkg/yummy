@@ -133,7 +133,7 @@ fn generate_idea_project(
     all_jars.dedup();
     for jar in &all_jars {
         let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
-        let jar_abs = jar.to_string_lossy().to_string();
+        let jar_abs = to_idea_path(&jar.to_string_lossy());
         let sources_section = make_sources_section(jar, download_sources);
         let lib_xml = format!(
             r#"<component name="libraryTable">
@@ -197,7 +197,7 @@ fn generate_single_project_idea(
     let mut dep_entries = String::new();
     for jar in &jars {
         let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
-        let jar_abs = jar.to_string_lossy().to_string();
+        let jar_abs = to_idea_path(&jar.to_string_lossy());
         dep_entries.push_str(&format!(
             "    <orderEntry type=\"library\" name=\"{}\" level=\"project\" />\n",
             jar_name
@@ -313,7 +313,7 @@ fn make_sources_section(jar: &std::path::Path, download_sources: bool) -> String
     }
 
     if sources_jar.exists() {
-        let sources_abs = sources_jar.to_string_lossy().to_string();
+        let sources_abs = to_idea_path(&sources_jar.to_string_lossy());
         format!(
             "    <SOURCES>\n      <root url=\"jar://{}!/\" />\n    </SOURCES>\n",
             sources_abs
@@ -369,4 +369,115 @@ fn pathdiff(base: &Path, target: &Path) -> String {
         .strip_prefix(base)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| target.to_string_lossy().to_string())
+}
+
+/// Detect if running under WSL (Windows Subsystem for Linux).
+fn is_wsl() -> bool {
+    if let Ok(osrelease) = std::fs::read_to_string("/proc/version") {
+        let lower = osrelease.to_lowercase();
+        return lower.contains("microsoft") || lower.contains("wsl");
+    }
+    false
+}
+
+/// Convert a WSL Linux path to a Windows path for IDEA compatibility.
+/// e.g., /mnt/c/Users/foo -> C:/Users/foo
+///       /home/user/project -> \\wsl$\<distro>\home\user\project (via wslpath)
+fn to_idea_path(path: &str) -> String {
+    if !is_wsl() {
+        return path.to_string();
+    }
+
+    // /mnt/<drive>/... -> <DRIVE>:/...
+    if path.starts_with("/mnt/") && path.len() > 5 {
+        let rest = &path[5..];
+        if let Some(idx) = rest.find('/') {
+            let drive = rest[..idx].to_uppercase();
+            if drive.len() == 1 {
+                return format!("{}:{}", drive, &rest[idx..]);
+            }
+        } else if rest.len() == 1 {
+            return format!("{}:/", rest.to_uppercase());
+        }
+    }
+
+    // For non-/mnt/ paths, try wslpath -w
+    if let Ok(output) = std::process::Command::new("wslpath")
+        .arg("-w")
+        .arg(path)
+        .output()
+    {
+        if output.status.success() {
+            let win_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !win_path.is_empty() {
+                // Convert backslashes to forward slashes for IDEA XML
+                return win_path.replace('\\', "/");
+            }
+        }
+    }
+
+    path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_source_folders_fallback() {
+        let tmpdir = std::env::temp_dir().join("ym-idea-src-test");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        // No src dir at all -> fallback
+        let folders = detect_source_folders(&tmpdir);
+        assert!(folders.contains("$MODULE_DIR$/src"));
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn test_detect_source_folders_maven_convention() {
+        let tmpdir = std::env::temp_dir().join("ym-idea-maven-test");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(tmpdir.join("src/main/java")).unwrap();
+        std::fs::create_dir_all(tmpdir.join("src/test/java")).unwrap();
+        std::fs::create_dir_all(tmpdir.join("src/main/resources")).unwrap();
+
+        let folders = detect_source_folders(&tmpdir);
+        assert!(folders.contains("src/main/java"));
+        assert!(folders.contains("src/test/java"));
+        assert!(folders.contains("src/main/resources"));
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn test_to_idea_path_mnt_conversion() {
+        // Only test the path conversion logic (not WSL detection)
+        // /mnt/c/Users/foo -> C:/Users/foo
+        let path = "/mnt/c/Users/foo/project";
+        if path.starts_with("/mnt/") {
+            let rest = &path[5..];
+            if let Some(idx) = rest.find('/') {
+                let drive = rest[..idx].to_uppercase();
+                let result = format!("{}:{}", drive, &rest[idx..]);
+                assert_eq!(result, "C:/Users/foo/project");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pathdiff_relative() {
+        let base = Path::new("/home/user/project");
+        let target = Path::new("/home/user/project/modules/core");
+        assert_eq!(pathdiff(base, target), "modules/core");
+    }
+
+    #[test]
+    fn test_pathdiff_absolute_fallback() {
+        let base = Path::new("/home/user/project");
+        let target = Path::new("/other/path");
+        assert_eq!(pathdiff(base, target), "/other/path");
+    }
 }
