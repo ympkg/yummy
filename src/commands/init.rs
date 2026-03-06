@@ -246,7 +246,13 @@ fn execute_interactive(dir: &Path, existing: Option<&YmConfig>) -> Result<()> {
         config.license = Some(license);
     }
 
-    config.package = Some(package);
+    config.package = Some(package.clone());
+    // Ensure main class is fully qualified
+    let main_class = if !main_class.contains('.') && !package.is_empty() {
+        format!("{}.{}", package, main_class)
+    } else {
+        main_class
+    };
     config.main = Some(main_class);
 
     // Merge env: init-managed keys overwrite, user-added keys preserved
@@ -717,14 +723,17 @@ fn default_scripts() -> BTreeMap<String, String> {
 fn create_sample_main(src_dir: &Path, config: &YmConfig) -> Result<()> {
     let main_class = config.main.as_deref().unwrap_or("Main");
 
-    // Support qualified names like "com.example.Application"
-    let (pkg_dir, class_name) = if let Some(idx) = main_class.rfind('.') {
-        let pkg = &main_class[..idx];
-        let cls = &main_class[idx + 1..];
-        let pkg_path = src_dir.join(pkg.replace('.', "/"));
-        (pkg_path, cls)
+    // Determine package: from qualified main class name, or from config.package
+    let (pkg, class_name) = if let Some(idx) = main_class.rfind('.') {
+        (Some(&main_class[..idx]), &main_class[idx + 1..])
     } else {
-        (src_dir.to_path_buf(), main_class)
+        (config.package.as_deref(), main_class)
+    };
+
+    let pkg_dir = if let Some(p) = pkg {
+        src_dir.join(p.replace('.', "/"))
+    } else {
+        src_dir.to_path_buf()
     };
 
     std::fs::create_dir_all(&pkg_dir)?;
@@ -733,8 +742,8 @@ fn create_sample_main(src_dir: &Path, config: &YmConfig) -> Result<()> {
         return Ok(());
     }
 
-    let package_decl = if main_class.contains('.') {
-        format!("package {};\n\n", &main_class[..main_class.rfind('.').unwrap()])
+    let package_decl = if let Some(p) = pkg {
+        format!("package {};\n\n", p)
     } else {
         String::new()
     };
