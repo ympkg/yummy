@@ -135,7 +135,7 @@ fn regenerate_lock() -> Result<()> {
     println!(
         "  {} Generated {} with {} entries ({} JARs)       {}ms",
         style("✓").green(),
-        style("ym.lock").bold(),
+        style("package-lock.json").bold(),
         lock.dependencies.len(),
         jars.len(),
         elapsed.as_millis()

@@ -5,7 +5,7 @@ use schema::{LockFile, YmConfig};
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = "package.json";
-pub const LOCK_FILE: &str = "ym.lock";
+pub const LOCK_FILE: &str = "package-lock.json";
 pub const CACHE_DIR: &str = ".ym";
 pub const OUTPUT_DIR: &str = "out";
 pub const CLASSES_DIR: &str = "classes";

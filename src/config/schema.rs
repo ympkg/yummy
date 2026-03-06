@@ -119,7 +119,7 @@ pub struct HotReloadConfig {
     pub watch_extensions: Option<Vec<String>>,
 }
 
-/// Lock file (ym.lock)
+/// Lock file (package-lock.json)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LockFile {
     pub version: u32,
