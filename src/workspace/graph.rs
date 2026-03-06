@@ -21,8 +21,38 @@ pub struct WorkspaceGraph {
 }
 
 impl WorkspaceGraph {
-    /// Build the workspace graph by scanning all package.json files
+    /// Build the workspace graph by scanning all package.json files.
+    /// Uses a cached graph when available and all package.json mtimes match.
     pub fn build(workspace_root: &Path) -> Result<Self> {
+        let cache_dir = workspace_root.join(config::CACHE_DIR);
+
+        // Try loading from cache first
+        if let Some(cached) = super::cache::GraphCache::load(&cache_dir) {
+            if let Ok(ws) = Self::from_cache(&cached) {
+                return Ok(ws);
+            }
+        }
+
+        let ws = Self::build_fresh(workspace_root)?;
+
+        // Save to cache for next time
+        let cache_data: Vec<(String, PathBuf, Vec<String>)> = ws
+            .name_to_index
+            .keys()
+            .filter_map(|name| {
+                let pkg = ws.get_package(name)?;
+                let ws_deps = pkg.config.workspace_dependencies.clone().unwrap_or_default();
+                Some((name.clone(), pkg.path.clone(), ws_deps))
+            })
+            .collect();
+        let graph_cache = super::cache::GraphCache::build_from_workspace(workspace_root, &cache_data);
+        let _ = graph_cache.save(&cache_dir);
+
+        Ok(ws)
+    }
+
+    /// Build the graph fresh from disk (no cache).
+    fn build_fresh(workspace_root: &Path) -> Result<Self> {
         let root_config = config::load_config(&workspace_root.join(config::CONFIG_FILE))?;
         let patterns = root_config
             .workspaces
@@ -65,6 +95,39 @@ impl WorkspaceGraph {
             if let Some(ref ws_deps) = pkg.config.workspace_dependencies {
                 let from = name_to_index[&pkg.name];
                 for dep_name in ws_deps {
+                    if let Some(&to) = name_to_index.get(dep_name) {
+                        graph.add_edge(from, to, ());
+                    }
+                }
+            }
+        }
+
+        Ok(WorkspaceGraph {
+            graph,
+            name_to_index,
+        })
+    }
+
+    /// Reconstruct the graph from a validated cache.
+    fn from_cache(cached: &super::cache::GraphCache) -> Result<Self> {
+        let mut graph = DiGraph::new();
+        let mut name_to_index = HashMap::new();
+
+        for cpkg in &cached.packages {
+            let config_path = PathBuf::from(&cpkg.path).join(config::CONFIG_FILE);
+            let cfg = config::load_config(&config_path)?;
+            let node = PackageNode {
+                name: cpkg.name.clone(),
+                path: PathBuf::from(&cpkg.path),
+                config: cfg,
+            };
+            let idx = graph.add_node(node);
+            name_to_index.insert(cpkg.name.clone(), idx);
+        }
+
+        for cpkg in &cached.packages {
+            if let Some(&from) = name_to_index.get(&cpkg.name) {
+                for dep_name in &cpkg.workspace_dependencies {
                     if let Some(&to) = name_to_index.get(dep_name) {
                         graph.add_edge(from, to, ());
                     }
@@ -154,5 +217,102 @@ impl WorkspaceGraph {
     /// Get all package names
     pub fn all_packages(&self) -> Vec<String> {
         self.name_to_index.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_graph_cache_roundtrip() {
+        let tmpdir = std::env::temp_dir().join("ym-graph-test");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        // Create a minimal workspace root
+        let root_config = r#"{"name":"root","workspaces":["packages/*"]}"#;
+        std::fs::write(tmpdir.join("package.json"), root_config).unwrap();
+
+        // Create a package
+        let pkg_dir = tmpdir.join("packages").join("my-lib");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("package.json"), r#"{"name":"my-lib"}"#).unwrap();
+
+        // Build fresh
+        let ws = WorkspaceGraph::build(&tmpdir).unwrap();
+        assert_eq!(ws.all_packages().len(), 1);
+        assert!(ws.get_package("my-lib").is_some());
+
+        // Build again - should use cache
+        let ws2 = WorkspaceGraph::build(&tmpdir).unwrap();
+        assert_eq!(ws2.all_packages().len(), 1);
+        assert!(ws2.get_package("my-lib").is_some());
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn test_graph_cache_invalidates_on_change() {
+        let tmpdir = std::env::temp_dir().join("ym-graph-cache-inv-test");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        let root_config = r#"{"name":"root","workspaces":["packages/*"]}"#;
+        std::fs::write(tmpdir.join("package.json"), root_config).unwrap();
+
+        let pkg_dir = tmpdir.join("packages").join("lib-a");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("package.json"), r#"{"name":"lib-a"}"#).unwrap();
+
+        // Build and cache
+        let ws = WorkspaceGraph::build(&tmpdir).unwrap();
+        assert_eq!(ws.all_packages().len(), 1);
+
+        // Add another package -> cache should be invalidated
+        let pkg_dir_b = tmpdir.join("packages").join("lib-b");
+        std::fs::create_dir_all(&pkg_dir_b).unwrap();
+        std::fs::write(pkg_dir_b.join("package.json"), r#"{"name":"lib-b"}"#).unwrap();
+
+        // Touch root to invalidate
+        std::fs::write(tmpdir.join("package.json"), root_config).unwrap();
+
+        let ws2 = WorkspaceGraph::build(&tmpdir).unwrap();
+        assert_eq!(ws2.all_packages().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn test_transitive_closure_ordering() {
+        let tmpdir = std::env::temp_dir().join("ym-topo-test");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        std::fs::write(tmpdir.join("package.json"), r#"{"name":"root","workspaces":["packages/*"]}"#).unwrap();
+
+        // A depends on B, B depends on C
+        for (name, deps) in &[("lib-a", r#"["lib-b"]"#), ("lib-b", r#"["lib-c"]"#), ("lib-c", "null")] {
+            let dir = tmpdir.join("packages").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let ws_deps = if *deps == "null" {
+                "".to_string()
+            } else {
+                format!(r#","workspaceDependencies":{}"#, deps)
+            };
+            std::fs::write(dir.join("package.json"), format!(r#"{{"name":"{}"{}}}"#, name, ws_deps)).unwrap();
+        }
+
+        let ws = WorkspaceGraph::build(&tmpdir).unwrap();
+        let closure = ws.transitive_closure("lib-a").unwrap();
+        assert_eq!(closure.len(), 3);
+        // C must come before B, B before A
+        let pos_c = closure.iter().position(|n| n == "lib-c").unwrap();
+        let pos_b = closure.iter().position(|n| n == "lib-b").unwrap();
+        let pos_a = closure.iter().position(|n| n == "lib-a").unwrap();
+        assert!(pos_c < pos_b);
+        assert!(pos_b < pos_a);
+
+        let _ = std::fs::remove_dir_all(&tmpdir);
     }
 }
