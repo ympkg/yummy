@@ -3,6 +3,7 @@ use console::style;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::config::schema::{LockFile, LockedDependency};
 
@@ -147,6 +148,9 @@ pub fn resolve_and_download_full(
     // Track BFS depth per queued item
     let mut depth_map: HashMap<String, usize> = HashMap::new();
 
+    // In-memory POM cache to avoid re-parsing the same POM
+    let pom_cache = PomCache::new();
+
     // Initialize direct dependencies at depth 0
     for (coord, version) in dependencies {
         let mc = MavenCoord::parse(coord, version)?;
@@ -177,8 +181,8 @@ pub fn resolve_and_download_full(
         ordered_keys.push(key.clone());
         resolved_versions.entry(ga_key).or_insert((current_depth, coord.version.clone()));
 
-        // Download POM for transitive deps (must be sequential for graph resolution)
-        let transitive = resolve_transitive(&client, &coord, cache_dir, &repo_urls)?;
+        // Download POM for transitive deps with in-memory + disk cache
+        let transitive = resolve_transitive_cached(&client, &coord, cache_dir, &repo_urls, Some(&pom_cache))?;
 
         // Apply exclusions: filter out excluded transitive dependencies
         let transitive: Vec<MavenCoord> = transitive
@@ -333,12 +337,98 @@ fn try_resolve_from_lock(
     Some(all_jars)
 }
 
+/// In-memory cache for parsed POM transitive dependencies.
+/// Key: groupId:artifactId:version, Value: list of dependency coords.
+struct PomCache {
+    entries: Mutex<HashMap<String, Vec<(String, String, String)>>>,
+}
+
+impl PomCache {
+    fn new() -> Self {
+        PomCache {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<MavenCoord>> {
+        let entries = self.entries.lock().unwrap();
+        entries.get(key).map(|v| {
+            v.iter()
+                .map(|(g, a, ver)| MavenCoord {
+                    group_id: g.clone(),
+                    artifact_id: a.clone(),
+                    version: ver.clone(),
+                })
+                .collect()
+        })
+    }
+
+    fn insert(&self, key: &str, deps: &[MavenCoord]) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.insert(
+            key.to_string(),
+            deps.iter()
+                .map(|d| (d.group_id.clone(), d.artifact_id.clone(), d.version.clone()))
+                .collect(),
+        );
+    }
+}
+
 fn resolve_transitive(
     client: &reqwest::blocking::Client,
     coord: &MavenCoord,
     cache_dir: &Path,
     repos: &[String],
 ) -> Result<Vec<MavenCoord>> {
+    resolve_transitive_cached(client, coord, cache_dir, repos, None)
+}
+
+fn resolve_transitive_cached(
+    client: &reqwest::blocking::Client,
+    coord: &MavenCoord,
+    cache_dir: &Path,
+    repos: &[String],
+    pom_cache: Option<&PomCache>,
+) -> Result<Vec<MavenCoord>> {
+    let cache_key = coord.versioned_key();
+
+    // Check in-memory cache first
+    if let Some(cache) = pom_cache {
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok(cached);
+        }
+    }
+
+    // Check on-disk POM cache (.ym/pom-cache/)
+    let pom_cache_dir = cache_dir
+        .parent()  // up from maven/ to cache/
+        .and_then(|p| p.parent())  // up from cache/ to .ym/
+        .unwrap_or(cache_dir)
+        .join("pom-cache");
+    let pom_cache_file = pom_cache_dir
+        .join(&coord.group_id)
+        .join(&coord.artifact_id)
+        .join(format!("{}.json", coord.version));
+
+    if pom_cache_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pom_cache_file) {
+            if let Ok(cached_deps) = serde_json::from_str::<Vec<(String, String, String)>>(&content) {
+                let deps: Vec<MavenCoord> = cached_deps
+                    .iter()
+                    .map(|(g, a, v)| MavenCoord {
+                        group_id: g.clone(),
+                        artifact_id: a.clone(),
+                        version: v.clone(),
+                    })
+                    .collect();
+                if let Some(cache) = pom_cache {
+                    cache.insert(&cache_key, &deps);
+                }
+                return Ok(deps);
+            }
+        }
+    }
+
     let pom_path = coord.pom_path(cache_dir);
 
     if !pom_path.exists() {
@@ -354,7 +444,24 @@ fn resolve_transitive(
     let mut visited_poms = HashSet::new();
     resolve_parent_properties(client, &pom_content, cache_dir, repos, &mut all_properties, 0, &mut visited_poms)?;
 
-    parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, repos)
+    let deps = parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, repos)?;
+
+    // Write to disk cache
+    if let Some(parent) = pom_cache_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let serializable: Vec<(String, String, String)> = deps
+        .iter()
+        .map(|d| (d.group_id.clone(), d.artifact_id.clone(), d.version.clone()))
+        .collect();
+    let _ = std::fs::write(&pom_cache_file, serde_json::to_string(&serializable).unwrap_or_default());
+
+    // Store in memory cache
+    if let Some(cache) = pom_cache {
+        cache.insert(&cache_key, &deps);
+    }
+
+    Ok(deps)
 }
 
 /// Recursively fetch parent POM properties.
