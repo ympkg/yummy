@@ -832,6 +832,61 @@ pub fn check_conflicts(lock: &LockFile) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+/// Resolve all Maven dependencies for a workspace at once, then distribute per module.
+/// This avoids redundant POM resolution across modules that share dependencies.
+pub fn resolve_workspace_deps(
+    all_module_deps: &[(String, BTreeMap<String, String>)],
+    cache_dir: &Path,
+    lock: &mut LockFile,
+    repos: &[String],
+    exclusions: &[String],
+) -> Result<HashMap<String, Vec<PathBuf>>> {
+    // 1. Merge all module deps into a single set (collect all unique coords)
+    let mut merged_deps = BTreeMap::new();
+    for (_name, deps) in all_module_deps {
+        for (coord, version) in deps {
+            merged_deps.entry(coord.clone()).or_insert(version.clone());
+        }
+    }
+
+    if merged_deps.is_empty() {
+        return Ok(all_module_deps.iter().map(|(name, _)| (name.clone(), vec![])).collect());
+    }
+
+    // 2. Resolve once for the entire workspace
+    let all_jars = resolve_and_download_full(&merged_deps, cache_dir, lock, repos, exclusions)?;
+
+    // 3. Build a lookup: groupId:artifactId -> jar path
+    let mut jar_lookup: HashMap<String, PathBuf> = HashMap::new();
+    for jar in &all_jars {
+        // Extract group:artifact from the cache path structure: cache/group/artifact/version/artifact-version.jar
+        if let Some(version_dir) = jar.parent() {
+            if let Some(artifact_dir) = version_dir.parent() {
+                if let Some(group_dir) = artifact_dir.parent() {
+                    let artifact = artifact_dir.file_name().unwrap().to_string_lossy();
+                    let group = group_dir.file_name().unwrap().to_string_lossy();
+                    let version = version_dir.file_name().unwrap().to_string_lossy();
+                    let key = format!("{}:{}:{}", group, artifact, version);
+                    jar_lookup.insert(key, jar.clone());
+                    // Also insert without version for simpler lookup
+                    let ga_key = format!("{}:{}", group, artifact);
+                    jar_lookup.entry(ga_key).or_insert(jar.clone());
+                }
+            }
+        }
+    }
+
+    // 4. Distribute jars per module: each module gets the full resolved set
+    //    (since transitive deps are shared across the workspace)
+    let mut per_module = HashMap::new();
+    for (name, _deps) in all_module_deps {
+        // Each module gets all resolved jars (workspace shares classpath)
+        per_module.insert(name.clone(), all_jars.clone());
+    }
+
+    Ok(per_module)
+}
+
 /// Search Maven Central for an artifact by keyword
 pub fn search_maven(query: &str) -> Result<Vec<(String, String, String)>> {
     let client = reqwest::blocking::Client::builder()

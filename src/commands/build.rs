@@ -217,7 +217,7 @@ fn print_total_time(start: Instant) {
     }
 }
 
-fn build_workspace(root: &Path, _cfg: &YmConfig, target: Option<&str>, release: bool) -> Result<()> {
+fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, release: bool) -> Result<()> {
     let ws = WorkspaceGraph::build(root)?;
 
     let packages = if let Some(target) = target {
@@ -238,6 +238,54 @@ fn build_workspace(root: &Path, _cfg: &YmConfig, target: Option<&str>, release: 
         all
     };
 
+    // Workspace-level dependency resolution: resolve all modules' deps at once (B3)
+    let dep_start = Instant::now();
+    let all_module_deps: Vec<(String, std::collections::BTreeMap<String, String>)> = packages
+        .iter()
+        .map(|name| {
+            let pkg = ws.get_package(name).unwrap();
+            let mut deps = pkg.config.dependencies.as_ref().cloned().unwrap_or_default();
+            // Inherit root deps
+            if let Some(ref root_deps) = root_cfg.dependencies {
+                for (k, v) in root_deps {
+                    deps.entry(k.clone()).or_insert(v.clone());
+                }
+            }
+            // Apply root resolutions
+            if let Some(ref resolutions) = root_cfg.resolutions {
+                for (k, v) in resolutions {
+                    if deps.contains_key(k) {
+                        deps.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            (name.clone(), deps)
+        })
+        .collect();
+
+    let cache = config::maven_cache_dir(root);
+    let lock_path = root.join(config::LOCK_FILE);
+    let mut lock = config::load_lock(&lock_path)?;
+    let mut registries: Vec<String> = Vec::new();
+    if let Some(ref regs) = root_cfg.registries {
+        registries.extend(regs.values().cloned());
+    }
+    let exclusions = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
+
+    let per_module_jars = crate::workspace::resolver::resolve_workspace_deps(
+        &all_module_deps, &cache, &mut lock, &registries, &exclusions,
+    )?;
+    config::save_lock(&lock_path, &lock)?;
+
+    let dep_time = dep_start.elapsed();
+    let total_jars: usize = per_module_jars.values().next().map(|v| v.len()).unwrap_or(0);
+    println!(
+        "  {} Resolved workspace dependencies ({} jars)        {:>6}ms",
+        style("✓").green(),
+        total_jars,
+        dep_time.as_millis()
+    );
+
     // Group into topological levels for parallel compilation
     let levels = compute_parallel_levels(&packages, &ws);
 
@@ -245,12 +293,11 @@ fn build_workspace(root: &Path, _cfg: &YmConfig, target: Option<&str>, release: 
 
     for level in &levels {
         if level.len() == 1 {
-            // Single package: compile normally
             let pkg_name = &level[0];
             let pkg = ws.get_package(pkg_name).unwrap();
             let start = Instant::now();
 
-            let jars = resolve_deps(&pkg.path, &pkg.config)?;
+            let jars = per_module_jars.get(pkg_name).cloned().unwrap_or_default();
             let mut classpath = jars;
             classpath.extend(workspace_classpath.clone());
 
@@ -258,14 +305,13 @@ fn build_workspace(root: &Path, _cfg: &YmConfig, target: Option<&str>, release: 
             let elapsed = start.elapsed();
 
             if !result.success {
-                eprintln!("{}", result.errors);
+                eprint!("{}", compiler::colorize_errors(&result.errors));
                 bail!("Compilation of '{}' failed", pkg_name);
             }
 
             print_compile_result(pkg_name, &result, elapsed);
             workspace_classpath.push(config::output_classes_dir(&pkg.path));
         } else {
-            // Multiple packages at same level: compile in parallel with rayon
             let start = Instant::now();
             let cp_snapshot = workspace_classpath.clone();
 
@@ -273,7 +319,7 @@ fn build_workspace(root: &Path, _cfg: &YmConfig, target: Option<&str>, release: 
                 .par_iter()
                 .map(|pkg_name| {
                     let pkg = ws.get_package(pkg_name).unwrap();
-                    let jars = resolve_deps(&pkg.path, &pkg.config).unwrap_or_default();
+                    let jars = per_module_jars.get(pkg_name).cloned().unwrap_or_default();
                     let mut classpath = jars;
                     classpath.extend(cp_snapshot.clone());
                     let result = compile_project(&pkg.path, &pkg.config, &classpath);
@@ -307,16 +353,16 @@ fn build_workspace(root: &Path, _cfg: &YmConfig, target: Option<&str>, release: 
     if release {
         if let Some(target) = target {
             let pkg = ws.get_package(target).unwrap();
-            // Collect all workspace dep classes + maven jars
             let mut all_deps = Vec::new();
             for pkg_name in &packages {
                 let p = ws.get_package(pkg_name).unwrap();
                 if pkg_name != target {
-                    // Include classes from workspace deps
                     all_deps.push(config::output_classes_dir(&p.path));
                 }
-                let dep_jars = resolve_deps(&p.path, &p.config)?;
-                all_deps.extend(dep_jars);
+            }
+            // Add the pre-resolved jars
+            if let Some(jars) = per_module_jars.get(target) {
+                all_deps.extend(jars.clone());
             }
             build_release_jar(&pkg.path, &pkg.config, &all_deps)?;
         } else {
@@ -567,8 +613,8 @@ pub fn compile_project(
 
     let encoding = cfg.compiler.as_ref().and_then(|c| c.encoding.clone());
 
-    // Resolve annotation processor JARs
-    let ap_jars = resolve_annotation_processors(project, cfg)?;
+    // Resolve annotation processor JARs (auto-discover from classpath if not configured)
+    let ap_jars = resolve_annotation_processors(project, cfg, classpath)?;
 
     let lint = cfg.compiler.as_ref().and_then(|c| c.lint.clone()).unwrap_or_default();
     let extra_args = cfg.compiler.as_ref().and_then(|c| c.args.clone()).unwrap_or_default();
@@ -602,31 +648,58 @@ pub fn compile_project(
     incremental::incremental_compile(&compile_cfg, &cache, &engine)
 }
 
-/// Resolve annotation processor JARs from config.
-/// Processors are specified as "groupId:artifactId" in compiler.annotationProcessors.
-/// They are resolved from the same Maven dependencies.
-fn resolve_annotation_processors(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
-    let ap_coords = match cfg.compiler.as_ref().and_then(|c| c.annotation_processors.as_ref()) {
-        Some(coords) if !coords.is_empty() => coords,
-        _ => return Ok(vec![]),
-    };
-
-    let deps = cfg.dependencies.as_ref().cloned().unwrap_or_default();
-    let cache = config::maven_cache_dir(project);
-    let mut jars = Vec::new();
-
-    for coord in ap_coords {
-        // Find matching version from dependencies
-        if let Some(version) = deps.get(coord) {
-            let mc = crate::workspace::resolver::MavenCoord::parse(coord, version)?;
-            let jar = mc.jar_path(&cache);
-            if jar.exists() {
-                jars.push(jar);
+/// Resolve annotation processor JARs.
+/// First checks explicit config (compiler.annotationProcessors), then
+/// auto-discovers from classpath JARs containing META-INF/services/javax.annotation.processing.Processor.
+fn resolve_annotation_processors(project: &Path, cfg: &YmConfig, classpath: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    // Explicit configuration takes precedence
+    if let Some(coords) = cfg.compiler.as_ref().and_then(|c| c.annotation_processors.as_ref()) {
+        if !coords.is_empty() {
+            let deps = cfg.dependencies.as_ref().cloned().unwrap_or_default();
+            let cache = config::maven_cache_dir(project);
+            let mut jars = Vec::new();
+            for coord in coords {
+                if let Some(version) = deps.get(coord) {
+                    let mc = crate::workspace::resolver::MavenCoord::parse(coord, version)?;
+                    let jar = mc.jar_path(&cache);
+                    if jar.exists() {
+                        jars.push(jar);
+                    }
+                }
             }
+            return Ok(jars);
         }
     }
 
-    Ok(jars)
+    // Auto-discover: scan classpath JARs for annotation processor services
+    Ok(discover_annotation_processors(classpath))
+}
+
+/// Scan classpath JARs for META-INF/services/javax.annotation.processing.Processor
+fn discover_annotation_processors(classpath: &[PathBuf]) -> Vec<PathBuf> {
+    classpath
+        .iter()
+        .filter(|jar| {
+            jar.extension().and_then(|e| e.to_str()) == Some("jar")
+                && jar.exists()
+                && has_annotation_processor(jar)
+        })
+        .cloned()
+        .collect()
+}
+
+fn has_annotation_processor(jar_path: &Path) -> bool {
+    let file = match std::fs::File::open(jar_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    archive
+        .by_name("META-INF/services/javax.annotation.processing.Processor")
+        .is_ok()
 }
 
 /// Ensure the JDK is available based on config. Sets JAVA_HOME if a JDK was downloaded.
