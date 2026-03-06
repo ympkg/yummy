@@ -374,15 +374,6 @@ impl PomCache {
     }
 }
 
-fn resolve_transitive(
-    client: &reqwest::blocking::Client,
-    coord: &MavenCoord,
-    cache_dir: &Path,
-    repos: &[String],
-) -> Result<Vec<MavenCoord>> {
-    resolve_transitive_cached(client, coord, cache_dir, repos, None)
-}
-
 fn resolve_transitive_cached(
     client: &reqwest::blocking::Client,
     coord: &MavenCoord,
