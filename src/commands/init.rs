@@ -51,6 +51,7 @@ fn resolve_dir(name: Option<&str>) -> Result<PathBuf> {
 fn execute_defaults(dir: &Path) -> Result<()> {
     let dir_name = dir_name(dir);
     let author = git_user_name();
+    let pkg = default_package(&dir_name);
 
     let mut config = YmConfig {
         name: dir_name,
@@ -63,7 +64,8 @@ fn execute_defaults(dir: &Path) -> Result<()> {
         config.author = Some(a.clone());
     }
     config.license = Some("MIT".to_string());
-    config.main = Some("Main".to_string());
+    config.package = Some(pkg.clone());
+    config.main = Some(format!("{}.Main", pkg));
     config.dependencies = Some(BTreeMap::new());
     config.dev_dependencies = Some(BTreeMap::new());
     config.env = Some({
@@ -78,7 +80,7 @@ fn execute_defaults(dir: &Path) -> Result<()> {
     let main_class = config.main.as_deref().unwrap_or("Main");
     let main_path = main_class.replace('.', "/");
     println!("  {} Created ym.json", style("✓").green());
-    println!("  {} Created src/{}.java", style("✓").green(), main_path);
+    println!("  {} Created src/main/java/{}.java", style("✓").green(), main_path);
 
     Ok(())
 }
@@ -124,9 +126,17 @@ fn execute_interactive(dir: &Path, existing: Option<&YmConfig>) -> Result<()> {
         .allow_empty(true)
         .interact_text()?;
 
+    let default_package = existing
+        .and_then(|c| c.package.clone())
+        .unwrap_or_else(|| default_package(&name));
+    let package: String = Input::new()
+        .with_prompt("package")
+        .default(default_package)
+        .interact_text()?;
+
     let default_main = existing
         .and_then(|c| c.main.clone())
-        .unwrap_or_else(|| to_class_name(&name));
+        .unwrap_or_else(|| format!("{}.{}", package, to_class_name(&name)));
     let main_class: String = Input::new()
         .with_prompt("main class")
         .default(default_main)
@@ -236,6 +246,7 @@ fn execute_interactive(dir: &Path, existing: Option<&YmConfig>) -> Result<()> {
         config.license = Some(license);
     }
 
+    config.package = Some(package);
     config.main = Some(main_class);
 
     // Merge env: init-managed keys overwrite, user-added keys preserved
@@ -284,7 +295,7 @@ fn execute_interactive(dir: &Path, existing: Option<&YmConfig>) -> Result<()> {
     let main_class = config.main.as_deref().unwrap_or("Main");
     let main_path = main_class.replace('.', "/");
     println!("  {} Created ym.json", style("✓").green());
-    println!("  {} Created src/{}.java", style("✓").green(), main_path);
+    println!("  {} Created src/main/java/{}.java", style("✓").green(), main_path);
 
     Ok(())
 }
@@ -458,8 +469,14 @@ fn execute_from_template(dir: &Path, template: &str) -> Result<()> {
     let mut dev_deps = BTreeMap::new();
 
     std::fs::create_dir_all(dir)?;
-    let src_dir = dir.join("src");
+    let src_dir = dir.join("src").join("main").join("java");
     std::fs::create_dir_all(&src_dir)?;
+
+    let resources_dir = dir.join("src").join("main").join("resources");
+    std::fs::create_dir_all(&resources_dir)?;
+
+    let test_java_dir = dir.join("src").join("test").join("java");
+    std::fs::create_dir_all(&test_java_dir)?;
 
     match template {
         "spring" => {
@@ -475,6 +492,7 @@ fn execute_from_template(dir: &Path, template: &str) -> Result<()> {
                 "org.springframework.boot:spring-boot-starter-test".to_string(),
                 "3.4.0".to_string(),
             );
+            config.package = Some("com.example".to_string());
             config.main = Some("com.example.Application".to_string());
 
             let pkg_dir = src_dir.join("com").join("example");
@@ -494,9 +512,15 @@ public class Application {
             std::fs::write(pkg_dir.join("Application.java"), main_content)?;
         }
         "cli" => {
-            config.main = Some("Main".to_string());
+            let pkg = default_package(&dir_name);
+            config.package = Some(pkg.clone());
+            config.main = Some(format!("{}.Main", pkg));
+            let pkg_dir = src_dir.join(pkg.replace('.', "/"));
+            std::fs::create_dir_all(&pkg_dir)?;
             let main_content = format!(
-                r#"public class Main {{
+                r#"package {};
+
+public class Main {{
     public static void main(String[] args) {{
         if (args.length == 0) {{
             System.out.println("Usage: {} <command>");
@@ -506,31 +530,40 @@ public class Application {
     }}
 }}
 "#,
-                dir_name
+                pkg, dir_name
             );
-            std::fs::write(src_dir.join("Main.java"), main_content)?;
+            std::fs::write(pkg_dir.join("Main.java"), main_content)?;
         }
         "lib" | "library" => {
             dev_deps.insert(
                 "org.junit.jupiter:junit-jupiter".to_string(),
                 "5.11.0".to_string(),
             );
+            let pkg = default_package(&dir_name);
+            config.package = Some(pkg.clone());
             let class_name = to_class_name(&dir_name);
+            let pkg_path = pkg.replace('.', "/");
+            let pkg_dir = src_dir.join(&pkg_path);
+            std::fs::create_dir_all(&pkg_dir)?;
             let lib_content = format!(
-                r#"public class {} {{
+                r#"package {};
+
+public class {} {{
     public String greet(String name) {{
         return "Hello, " + name + "!";
     }}
 }}
 "#,
-                class_name
+                pkg, class_name
             );
-            std::fs::write(src_dir.join(format!("{}.java", class_name)), lib_content)?;
+            std::fs::write(pkg_dir.join(format!("{}.java", class_name)), lib_content)?;
 
-            let test_dir = dir.join("test");
-            std::fs::create_dir_all(&test_dir)?;
+            let test_pkg_dir = test_java_dir.join(&pkg_path);
+            std::fs::create_dir_all(&test_pkg_dir)?;
             let test_content = format!(
-                r#"import org.junit.jupiter.api.Test;
+                r#"package {};
+
+import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class {}Test {{
@@ -541,16 +574,18 @@ class {}Test {{
     }}
 }}
 "#,
-                class_name, class_name, class_name
+                pkg, class_name, class_name, class_name
             );
             std::fs::write(
-                test_dir.join(format!("{}Test.java", class_name)),
+                test_pkg_dir.join(format!("{}Test.java", class_name)),
                 test_content,
             )?;
         }
         _ => {
             // Default "app" template
-            config.main = Some("Main".to_string());
+            let pkg = default_package(&dir_name);
+            config.package = Some(pkg.clone());
+            config.main = Some(format!("{}.Main", pkg));
             create_sample_main(&src_dir, &config)?;
         }
     }
@@ -602,9 +637,15 @@ fn write_project(dir: &Path, config: &YmConfig) -> Result<()> {
     let config_path = dir.join(config::CONFIG_FILE);
     config::save_config(&config_path, config)?;
 
-    let src_dir = dir.join("src");
+    let src_dir = dir.join("src").join("main").join("java");
     std::fs::create_dir_all(&src_dir)?;
     create_sample_main(&src_dir, config)?;
+
+    let resources_dir = dir.join("src").join("main").join("resources");
+    std::fs::create_dir_all(&resources_dir)?;
+
+    let test_dir = dir.join("src").join("test").join("java");
+    std::fs::create_dir_all(&test_dir)?;
 
     // Create .gitignore
     let gitignore_path = dir.join(".gitignore");
@@ -613,6 +654,19 @@ fn write_project(dir: &Path, config: &YmConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// my-app → myapp
+pub fn sanitize_package_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// my-app → com.example.myapp
+pub fn default_package(name: &str) -> String {
+    format!("com.example.{}", sanitize_package_name(name))
 }
 
 fn dir_name(dir: &Path) -> String {

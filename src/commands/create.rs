@@ -27,8 +27,17 @@ pub fn execute(name: String, template: Option<String>, include_deps: bool) -> Re
     }
 
     // Create directory structure
-    let src_dir = dir.join("src");
+    let pkg = super::init::default_package(&name);
+    let pkg_path = pkg.replace('.', "/");
+
+    let src_dir = dir.join("src").join("main").join("java");
     std::fs::create_dir_all(&src_dir)?;
+
+    let resources_dir = dir.join("src").join("main").join("resources");
+    std::fs::create_dir_all(&resources_dir)?;
+
+    let test_java_dir = dir.join("src").join("test").join("java");
+    std::fs::create_dir_all(&test_java_dir)?;
 
     // Create ym.json
     let java_version = cfg.target.clone().unwrap_or_else(|| "21".to_string());
@@ -39,45 +48,74 @@ pub fn execute(name: String, template: Option<String>, include_deps: bool) -> Re
         target: Some(java_version),
         ..Default::default()
     };
+    module_config.package = Some(pkg.clone());
 
     let mut deps = BTreeMap::new();
     let mut dev_deps = BTreeMap::new();
+
+    let pkg_dir = src_dir.join(&pkg_path);
+    std::fs::create_dir_all(&pkg_dir)?;
 
     match template {
         "lib" | "library" => {
             if include_deps {
                 dev_deps.insert("org.junit.jupiter:junit-jupiter".to_string(), "5.11.0".to_string());
             }
-            // Create a sample library class
             let class_name = to_class_name(&name);
             let lib_content = format!(
-                r#"public class {} {{
+                r#"package {};
+
+public class {} {{
     public String greet(String name) {{
         return "Hello, " + name + "!";
     }}
 }}
 "#,
-                class_name
+                pkg, class_name
             );
-            std::fs::write(src_dir.join(format!("{}.java", class_name)), lib_content)?;
+            std::fs::write(pkg_dir.join(format!("{}.java", class_name)), lib_content)?;
+
+            let test_pkg_dir = test_java_dir.join(&pkg_path);
+            std::fs::create_dir_all(&test_pkg_dir)?;
+            let test_content = format!(
+                r#"package {};
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+class {}Test {{
+    @Test
+    void testGreet() {{
+        {} lib = new {}();
+        assertEquals("Hello, World!", lib.greet("World"));
+    }}
+}}
+"#,
+                pkg, class_name, class_name, class_name
+            );
+            std::fs::write(
+                test_pkg_dir.join(format!("{}Test.java", class_name)),
+                test_content,
+            )?;
         }
         _ => {
-            module_config.main = Some("Main".to_string());
+            module_config.main = Some(format!("{}.Main", pkg));
             if include_deps {
                 deps.insert("com.google.guava:guava".to_string(), "33.4.0-jre".to_string());
                 dev_deps.insert("org.junit.jupiter:junit-jupiter".to_string(), "5.11.0".to_string());
             }
-            // Create Main.java
             let main_content = format!(
-                r#"public class Main {{
+                r#"package {};
+
+public class Main {{
     public static void main(String[] args) {{
         System.out.println("Hello from {}!");
     }}
 }}
 "#,
-                name
+                pkg, name
             );
-            std::fs::write(src_dir.join("Main.java"), main_content)?;
+            std::fs::write(pkg_dir.join("Main.java"), main_content)?;
         }
     }
 
@@ -88,10 +126,6 @@ pub fn execute(name: String, template: Option<String>, include_deps: bool) -> Re
 
     let config_path = dir.join(config::CONFIG_FILE);
     config::save_config(&config_path, &module_config)?;
-
-    // Create test directory
-    let test_dir = dir.join("test");
-    std::fs::create_dir_all(&test_dir)?;
 
     println!();
     println!(

@@ -76,5 +76,10 @@ fn is_resource_file(path: &Path) -> bool {
             | "cfg"
             | "ini"
             | "toml"
+            | "graphql"
+            | "graphqls"
+            | "proto"
+            | "ftl"
+            | "mustache"
     )
 }

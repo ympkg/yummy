@@ -23,6 +23,9 @@ pub struct YmConfig {
     pub main: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
