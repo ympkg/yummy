@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-agent:
+    name: Build ym-agent.jar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build ym-agent.jar
+        run: |
+          mkdir -p ym-agent/out
+          javac -d ym-agent/out ym-agent/src/main/java/dev/yummy/agent/*.java
+          jar cfm ym-agent/ym-agent.jar ym-agent/src/main/resources/META-INF/MANIFEST.MF -C ym-agent/out .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ym-agent
+          path: ym-agent/ym-agent.jar
+
+  build-binary:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure linker for aarch64
+        if: matrix.cross
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload binary (unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ym-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ym
+
+      - name: Upload binary (windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ym-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ym.exe
+
+  release:
+    name: Create Release
+    needs: [build-agent, build-binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package archives
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            dir="ym-${VERSION}-${target}"
+            mkdir "$dir"
+            cp "artifacts/ym-${target}/ym" "$dir/"
+            cp "artifacts/ym-agent/ym-agent.jar" "$dir/"
+            cp README.md "$dir/" 2>/dev/null || true
+            chmod +x "$dir/ym"
+            tar czf "${dir}.tar.gz" "$dir"
+          done
+
+          # Windows zip
+          target="x86_64-pc-windows-msvc"
+          dir="ym-${VERSION}-${target}"
+          mkdir "$dir"
+          cp "artifacts/ym-${target}/ym.exe" "$dir/"
+          cp "artifacts/ym-agent/ym-agent.jar" "$dir/"
+          cp README.md "$dir/" 2>/dev/null || true
+          zip -r "${dir}.zip" "$dir"
+
+      - name: Generate checksums
+        run: |
+          sha256sum ym-*.tar.gz ym-*.zip > SHA256SUMS.txt
+          cp artifacts/ym-agent/ym-agent.jar .
+          sha256sum ym-agent.jar >> SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ym-*.tar.gz
+            ym-*.zip
+            ym-agent.jar
+            SHA256SUMS.txt
