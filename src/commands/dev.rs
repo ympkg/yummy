@@ -164,10 +164,12 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
     super::build::execute(Some(target.to_string()), false)?;
     let _build_time = start.elapsed();
 
-    // Build full classpath
+    // Build full classpath and map src dirs to module names
     let mut classpath = Vec::new();
     let mut watch_dirs = Vec::new();
     let mut all_jars = Vec::new();
+    // Map: source directory -> module name (for fine-grained rebuild)
+    let mut src_to_module: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     for pkg_name in &packages {
         let pkg = ws.get_package(pkg_name).unwrap();
@@ -177,7 +179,8 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
 
         let src = config::source_dir(&pkg.path);
         if src.exists() {
-            watch_dirs.push(src);
+            watch_dirs.push(src.clone());
+            src_to_module.push((src, pkg_name.clone()));
         }
     }
     classpath.extend(all_jars);
@@ -213,7 +216,6 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
 
     let watcher = FileWatcher::new(&watch_dirs, watch_extensions)?;
 
-    // Recompile all workspace packages on change
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
@@ -242,9 +244,17 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
             }
         }
 
-        // Rebuild all packages in the closure
+        // Fine-grained rebuild: determine which module(s) changed
+        let changed_modules = identify_changed_modules(&changed, &src_to_module);
+
         let compile_start = Instant::now();
-        let build_ok = super::build::execute(Some(target.to_string()), false).is_ok();
+        let build_ok = if changed_modules.is_empty() {
+            // Fallback: rebuild all
+            super::build::execute(Some(target.to_string()), false).is_ok()
+        } else {
+            // Only recompile changed module(s) and their downstream dependents
+            recompile_affected_modules(&changed_modules, &packages, &ws, &classpath)
+        };
         let compile_time = compile_start.elapsed();
 
         if build_ok {
@@ -252,9 +262,15 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
             let _ = child.wait();
             child = super::run::start_java_process(&main_class, &classpath, &jvm_args)?;
 
+            let module_info = if changed_modules.is_empty() {
+                "all".to_string()
+            } else {
+                changed_modules.join(", ")
+            };
             println!(
-                "  {} Recompiled ({}ms) -> Restarted {}",
+                "  {} Recompiled [{}] ({}ms) -> Restarted {}",
                 style(&now).dim(),
+                module_info,
                 compile_time.as_millis(),
                 style("✓").green()
             );
@@ -273,6 +289,71 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
     let _ = child.wait();
 
     Ok(())
+}
+
+/// Identify which workspace module(s) contain the changed files.
+fn identify_changed_modules(
+    changed_files: &[std::path::PathBuf],
+    src_to_module: &[(std::path::PathBuf, String)],
+) -> Vec<String> {
+    let mut modules = Vec::new();
+    for file in changed_files {
+        for (src_dir, module_name) in src_to_module {
+            if file.starts_with(src_dir) && !modules.contains(module_name) {
+                modules.push(module_name.clone());
+                break;
+            }
+        }
+    }
+    modules
+}
+
+/// Recompile only affected modules (changed + downstream dependents).
+fn recompile_affected_modules(
+    changed_modules: &[String],
+    all_packages: &[String],
+    ws: &WorkspaceGraph,
+    full_classpath: &[std::path::PathBuf],
+) -> bool {
+    // Find all downstream dependents of the changed modules
+    let mut to_recompile: Vec<String> = changed_modules.to_vec();
+
+    for pkg_name in all_packages {
+        if to_recompile.contains(pkg_name) {
+            continue;
+        }
+        // Check if this package depends (transitively) on any changed module
+        if let Some(pkg) = ws.get_package(pkg_name) {
+            if let Some(ref ws_deps) = pkg.config.workspace_dependencies {
+                for dep in ws_deps {
+                    if to_recompile.contains(dep) && !to_recompile.contains(pkg_name) {
+                        to_recompile.push(pkg_name.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Recompile each affected module in order
+    for pkg_name in &to_recompile {
+        if let Some(pkg) = ws.get_package(pkg_name) {
+            let result = super::build::compile_project(&pkg.path, &pkg.config, full_classpath);
+            match result {
+                Ok(r) if r.success => {}
+                Ok(r) => {
+                    eprint!("{}", crate::compiler::colorize_errors(&r.errors));
+                    return false;
+                }
+                Err(e) => {
+                    eprintln!("  {} Error compiling {}: {}", style("✗").red(), pkg_name, e);
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
 }
 
 fn dev_watch_loop(
@@ -420,6 +501,55 @@ fn chrono_time() -> String {
     let minutes = (secs % 3600) / 60;
     let seconds = secs % 60;
     format!("[{:02}:{:02}:{:02}]", hours, minutes, seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_identify_changed_modules() {
+        let src_to_module = vec![
+            (std::path::PathBuf::from("/project/core/src"), "core".to_string()),
+            (std::path::PathBuf::from("/project/web/src"), "web".to_string()),
+            (std::path::PathBuf::from("/project/api/src"), "api".to_string()),
+        ];
+
+        // Change in core module
+        let changed = vec![std::path::PathBuf::from("/project/core/src/Main.java")];
+        let modules = identify_changed_modules(&changed, &src_to_module);
+        assert_eq!(modules, vec!["core"]);
+
+        // Changes in multiple modules
+        let changed = vec![
+            std::path::PathBuf::from("/project/core/src/Foo.java"),
+            std::path::PathBuf::from("/project/web/src/Bar.java"),
+        ];
+        let modules = identify_changed_modules(&changed, &src_to_module);
+        assert_eq!(modules.len(), 2);
+        assert!(modules.contains(&"core".to_string()));
+        assert!(modules.contains(&"web".to_string()));
+
+        // No matching module
+        let changed = vec![std::path::PathBuf::from("/other/path/Test.java")];
+        let modules = identify_changed_modules(&changed, &src_to_module);
+        assert!(modules.is_empty());
+    }
+
+    #[test]
+    fn test_identify_changed_modules_dedup() {
+        let src_to_module = vec![
+            (std::path::PathBuf::from("/project/core/src"), "core".to_string()),
+        ];
+
+        // Multiple changes in same module should not duplicate
+        let changed = vec![
+            std::path::PathBuf::from("/project/core/src/A.java"),
+            std::path::PathBuf::from("/project/core/src/B.java"),
+        ];
+        let modules = identify_changed_modules(&changed, &src_to_module);
+        assert_eq!(modules, vec!["core"]);
+    }
 }
 
 fn count_source_files(dir: &std::path::Path, extensions: &[String]) -> usize {
