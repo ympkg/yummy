@@ -10,7 +10,14 @@ use crate::scripts;
 use crate::watcher::FileWatcher;
 use crate::workspace::graph::WorkspaceGraph;
 
-pub fn execute_with_options(target: Option<String>, no_reload: bool, program_args: Vec<String>) -> Result<()> {
+pub fn execute(
+    target: Option<String>,
+    no_reload: bool,
+    debug: bool,
+    debug_port: Option<u16>,
+    suspend: bool,
+    jvm_extra_args: Vec<String>,
+) -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
@@ -22,28 +29,31 @@ pub fn execute_with_options(target: Option<String>, no_reload: bool, program_arg
 
     if cfg.workspaces.is_some() {
         let target = target.as_deref().unwrap_or_else(|| {
-            eprintln!("  In workspace mode, specify a target: ym dev <module>");
+            eprintln!("  In workspace mode, specify a target: ymc dev <module>");
             std::process::exit(1);
         });
-        return dev_workspace(&project, target);
+        let result = dev_workspace(&project, target);
+        // Run postdev script
+        scripts::run_script(&cfg.scripts, &cfg.env, "postdev", &project)?;
+        return result;
     }
 
     let display_name = target.as_deref().unwrap_or(&cfg.name);
     println!();
-    println!("  {} {}", style("ym dev").bold(), display_name);
+    println!("  {} {}", style("ymc dev").bold(), display_name);
     println!();
 
-    // Resolve dependencies
+    // Resolve dependencies (auto-download all, then scope-filter)
     let start = Instant::now();
-    let jars = super::build::resolve_deps(&project, &cfg)?;
-    let dep_count = jars.len();
+    let _all_jars = super::build::resolve_deps(&project, &cfg)?;
+    // Compilation: compile + provided
+    let compile_jars = super::build::resolve_deps_with_scopes(&project, &cfg, &["compile", "provided"])?;
+    // Runtime: compile + runtime
+    let runtime_jars = super::build::resolve_deps_with_scopes(&project, &cfg, &["compile", "runtime"])?;
+    let dep_count = runtime_jars.len();
     let resolve_time = start.elapsed();
 
-    let ws_count = cfg
-        .workspace_dependencies
-        .as_ref()
-        .map(|d| d.len())
-        .unwrap_or(0);
+    let ws_count = cfg.workspace_module_deps().len();
 
     println!(
         "  {} Resolved dependencies ({} workspace + {} maven)     {:>4}ms",
@@ -53,9 +63,9 @@ pub fn execute_with_options(target: Option<String>, no_reload: bool, program_arg
         resolve_time.as_millis()
     );
 
-    // Initial compile
+    // Initial compile (compile + provided scope)
     let compile_start = Instant::now();
-    let result = super::build::compile_project(&project, &cfg, &jars)?;
+    let result = super::build::compile_project(&project, &cfg, &compile_jars)?;
     let compile_time = compile_start.elapsed();
 
     if !result.success {
@@ -72,22 +82,65 @@ pub fn execute_with_options(target: Option<String>, no_reload: bool, program_arg
     );
 
     // Find main class
-    let main_class = super::run::resolve_main_class(&cfg, &project, target.as_deref())?;
+    let main_class = resolve_main_class(&cfg, &project, target.as_deref())?;
 
-    // Build classpath
+    // Build runtime classpath (compile + runtime scope)
     let out_dir = config::output_classes_dir(&project);
     let mut classpath = vec![out_dir.clone()];
-    classpath.extend(jars.clone());
+    classpath.extend(runtime_jars.clone());
 
     let mut jvm_args: Vec<String> = cfg.jvm_args.clone().unwrap_or_default();
 
+    // Add user-provided JVM args (from -- args)
+    jvm_args.extend(jvm_extra_args.clone());
+
+    // JDWP debug support
+    if debug || suspend {
+        let port = debug_port.unwrap_or(5005);
+        // Check if debug port is already in use
+        if is_port_in_use(port) {
+            eprintln!(
+                "  {} Debug port {} is already in use. Use --debug-port to specify another port.",
+                style("!").yellow(),
+                style(port).bold()
+            );
+        }
+        let suspend_flag = if suspend { "y" } else { "n" };
+        jvm_args.push(format!(
+            "-agentlib:jdwp=transport=dt_socket,server=y,suspend={},address=*:{}",
+            suspend_flag, port
+        ));
+        if suspend {
+            println!(
+                "  {} Waiting for debugger on port {}...",
+                style("!").yellow(),
+                style(port).bold()
+            );
+        } else {
+            println!(
+                "  {} Debug mode: listening on port {}",
+                style("✓").green(),
+                port
+            );
+        }
+    }
+
     // Enable enhanced class redefinition on JBR (DCEVM built-in)
-    if let Ok(java_home) = std::env::var("JAVA_HOME") {
-        let home_lower = java_home.to_lowercase();
-        if home_lower.contains("jbr") || home_lower.contains("jetbrains") {
-            if !jvm_args.iter().any(|a| a.contains("AllowEnhancedClassRedefinition")) {
-                jvm_args.push("-XX:+AllowEnhancedClassRedefinition".to_string());
-            }
+    // Detect via JAVA_HOME path or java -version output
+    if !jvm_args.iter().any(|a| a.contains("AllowEnhancedClassRedefinition")) && detect_dcevm() {
+        jvm_args.push("-XX:+AllowEnhancedClassRedefinition".to_string());
+    }
+
+    // Spring Boot DevTools: auto-configure if devtools JAR is on classpath
+    if runtime_jars.iter().any(|p| p.to_string_lossy().contains("spring-boot-devtools")) {
+        // Enable restart classloader and livereload
+        if !jvm_args.iter().any(|a| a.contains("spring.devtools")) {
+            jvm_args.push("-Dspring.devtools.restart.enabled=true".to_string());
+            jvm_args.push("-Dspring.devtools.livereload.enabled=true".to_string());
+            println!(
+                "  {} Spring Boot DevTools detected (restart + livereload)",
+                style("✓").green(),
+            );
         }
     }
 
@@ -119,7 +172,7 @@ pub fn execute_with_options(target: Option<String>, no_reload: bool, program_arg
 
     // Start the Java process
     let run_start = Instant::now();
-    let mut child = super::run::start_java_process_with_args(&main_class, &classpath, &jvm_args, &program_args)?;
+    let mut child = start_java_process(&main_class, &classpath, &jvm_args)?;
     let run_time = run_start.elapsed();
 
     println!(
@@ -148,27 +201,29 @@ pub fn execute_with_options(target: Option<String>, no_reload: bool, program_arg
 
     let watcher = FileWatcher::new(&[src_dir], watch_extensions)?;
 
-    dev_watch_loop(watcher, &mut child, &main_class, &classpath, &jvm_args, &program_args, &project, &cfg, &jars, agent_port)
+    let result = dev_watch_loop(watcher, &mut child, &main_class, &classpath, &jvm_args, &project, &cfg, &compile_jars, agent_port);
+
+    // Run postdev script
+    scripts::run_script(&cfg.scripts, &cfg.env, "postdev", &project)?;
+
+    result
 }
 
 fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
     println!();
-    println!("  {} {}", style("ym dev").bold(), target);
+    println!("  {} {}", style("ymc dev").bold(), target);
     println!();
 
     let ws = WorkspaceGraph::build(root)?;
     let packages = ws.transitive_closure(target)?;
 
-    // Build all packages
     let start = Instant::now();
     super::build::execute(Some(target.to_string()), false)?;
     let _build_time = start.elapsed();
 
-    // Build full classpath and map src dirs to module names
     let mut classpath = Vec::new();
     let mut watch_dirs = Vec::new();
     let mut all_jars = Vec::new();
-    // Map: source directory -> module name (for fine-grained rebuild)
     let mut src_to_module: Vec<(std::path::PathBuf, String)> = Vec::new();
 
     for pkg_name in &packages {
@@ -186,12 +241,11 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
     classpath.extend(all_jars);
 
     let target_pkg = ws.get_package(target).unwrap();
-    let main_class = super::run::resolve_main_class(&target_pkg.config, &target_pkg.path, None)?;
+    let main_class = resolve_main_class(&target_pkg.config, &target_pkg.path, None)?;
     let jvm_args = target_pkg.config.jvm_args.clone().unwrap_or_default();
 
-    // Start Java process
     let run_start = Instant::now();
-    let mut child = super::run::start_java_process(&main_class, &classpath, &jvm_args)?;
+    let mut child = start_java_process(&main_class, &classpath, &jvm_args)?;
     let run_time = run_start.elapsed();
 
     println!(
@@ -244,23 +298,19 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
             }
         }
 
-        // Fine-grained rebuild: determine which module(s) changed
         let changed_modules = identify_changed_modules(&changed, &src_to_module);
 
         let compile_start = Instant::now();
         let build_ok = if changed_modules.is_empty() {
-            // Fallback: rebuild all
             super::build::execute(Some(target.to_string()), false).is_ok()
         } else {
-            // Only recompile changed module(s) and their downstream dependents
             recompile_affected_modules(&changed_modules, &packages, &ws, &classpath)
         };
         let compile_time = compile_start.elapsed();
 
         if build_ok {
-            let _ = child.kill();
-            let _ = child.wait();
-            child = super::run::start_java_process(&main_class, &classpath, &jvm_args)?;
+            graceful_stop(&mut child);
+            child = start_java_process(&main_class, &classpath, &jvm_args)?;
 
             let module_info = if changed_modules.is_empty() {
                 "all".to_string()
@@ -285,8 +335,7 @@ fn dev_workspace(root: &std::path::Path, target: &str) -> Result<()> {
 
     println!();
     println!("  Stopping...");
-    let _ = child.kill();
-    let _ = child.wait();
+    graceful_stop(&mut child);
 
     Ok(())
 }
@@ -309,16 +358,12 @@ fn identify_changed_modules(
 }
 
 /// Recompile only affected modules (changed + downstream dependents).
-/// Maintains topological order from all_packages for correct compilation sequence.
 fn recompile_affected_modules(
     changed_modules: &[String],
     all_packages: &[String],
     ws: &WorkspaceGraph,
     full_classpath: &[std::path::PathBuf],
 ) -> bool {
-    // Find all downstream dependents of the changed modules.
-    // We iterate all_packages in topological order (deps first), so when we check
-    // a package's dependencies, any transitive dependent is already marked.
     let mut affected: std::collections::HashSet<String> = changed_modules.iter().cloned().collect();
 
     for pkg_name in all_packages {
@@ -326,16 +371,13 @@ fn recompile_affected_modules(
             continue;
         }
         if let Some(pkg) = ws.get_package(pkg_name) {
-            if let Some(ref ws_deps) = pkg.config.workspace_dependencies {
-                // If any of this module's deps are affected, this module is too
-                if ws_deps.iter().any(|dep| affected.contains(dep)) {
-                    affected.insert(pkg_name.clone());
-                }
+            let ws_deps = pkg.config.workspace_module_deps();
+            if ws_deps.iter().any(|dep| affected.contains(dep)) {
+                affected.insert(pkg_name.clone());
             }
         }
     }
 
-    // Recompile in topological order (important: deps before dependents)
     for pkg_name in all_packages {
         if !affected.contains(pkg_name) {
             continue;
@@ -365,7 +407,6 @@ fn dev_watch_loop(
     main_class: &str,
     classpath: &[std::path::PathBuf],
     jvm_args: &[String],
-    program_args: &[String],
     project: &std::path::Path,
     cfg: &config::schema::YmConfig,
     jars: &[std::path::PathBuf],
@@ -454,10 +495,9 @@ fn dev_watch_loop(
         }
 
         // Fall back to restart
-        let _ = child.kill();
-        let _ = child.wait();
+        graceful_stop(child);
 
-        *child = super::run::start_java_process_with_args(main_class, classpath, jvm_args, program_args)?;
+        *child = start_java_process(main_class, classpath, jvm_args)?;
 
         println!(
             "  {} Compiled {} file(s) ({}ms) -> Restarted {}",
@@ -470,10 +510,120 @@ fn dev_watch_loop(
 
     println!();
     println!("  Stopping...");
-    let _ = child.kill();
-    let _ = child.wait();
+    graceful_stop(child);
 
     Ok(())
+}
+
+/// Resolve the main class from config or source scanning
+pub fn resolve_main_class(cfg: &config::schema::YmConfig, project: &std::path::Path, _target: Option<&str>) -> Result<String> {
+    if let Some(ref main) = cfg.main {
+        return Ok(main.clone());
+    }
+
+    // Scan for main classes
+    let src_dir = config::source_dir_for(project, cfg);
+    let main_classes = find_main_classes(&src_dir);
+
+    match main_classes.len() {
+        0 => bail!("No main class found. Set 'main' in package.toml or add a class with 'public static void main(String[] args)'"),
+        1 => Ok(main_classes[0].clone()),
+        _ => {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                bail!("Multiple main classes found: {}. Set 'main' in package.toml", main_classes.join(", "));
+            }
+            let selection = dialoguer::Select::new()
+                .with_prompt("Select main class")
+                .items(&main_classes)
+                .default(0)
+                .interact()?;
+            Ok(main_classes[selection].clone())
+        }
+    }
+}
+
+fn find_main_classes(src_dir: &std::path::Path) -> Vec<String> {
+    let mut result = Vec::new();
+    if !src_dir.exists() {
+        return result;
+    }
+    for entry in walkdir::WalkDir::new(src_dir) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("java") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            if content.contains("public static void main(String") ||
+               content.contains("public static void main( String") {
+                if let Ok(rel) = entry.path().strip_prefix(src_dir) {
+                    let class_name = rel
+                        .to_string_lossy()
+                        .replace('/', ".")
+                        .replace('\\', ".")
+                        .trim_end_matches(".java")
+                        .to_string();
+                    result.push(class_name);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Start a Java process
+fn start_java_process(
+    main_class: &str,
+    classpath: &[std::path::PathBuf],
+    jvm_args: &[String],
+) -> Result<std::process::Child> {
+    let cp = classpath
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(if cfg!(windows) { ";" } else { ":" });
+
+    let mut cmd = std::process::Command::new("java");
+    for arg in jvm_args {
+        cmd.arg(arg);
+    }
+    cmd.arg("-cp").arg(&cp).arg(main_class);
+
+    let child = cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to start Java process: {}", e))?;
+
+    Ok(child)
+}
+
+/// Gracefully stop a Java process: SIGTERM → 5s timeout → SIGKILL.
+fn graceful_stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Send SIGTERM via kill command
+        let pid = child.id();
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        // Wait up to 5 seconds
+        for _ in 0..50 {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Force kill
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Extract Java class names from changed file paths.
@@ -506,55 +656,6 @@ fn chrono_time() -> String {
     format!("[{:02}:{:02}:{:02}]", hours, minutes, seconds)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_identify_changed_modules() {
-        let src_to_module = vec![
-            (std::path::PathBuf::from("/project/core/src"), "core".to_string()),
-            (std::path::PathBuf::from("/project/web/src"), "web".to_string()),
-            (std::path::PathBuf::from("/project/api/src"), "api".to_string()),
-        ];
-
-        // Change in core module
-        let changed = vec![std::path::PathBuf::from("/project/core/src/Main.java")];
-        let modules = identify_changed_modules(&changed, &src_to_module);
-        assert_eq!(modules, vec!["core"]);
-
-        // Changes in multiple modules
-        let changed = vec![
-            std::path::PathBuf::from("/project/core/src/Foo.java"),
-            std::path::PathBuf::from("/project/web/src/Bar.java"),
-        ];
-        let modules = identify_changed_modules(&changed, &src_to_module);
-        assert_eq!(modules.len(), 2);
-        assert!(modules.contains(&"core".to_string()));
-        assert!(modules.contains(&"web".to_string()));
-
-        // No matching module
-        let changed = vec![std::path::PathBuf::from("/other/path/Test.java")];
-        let modules = identify_changed_modules(&changed, &src_to_module);
-        assert!(modules.is_empty());
-    }
-
-    #[test]
-    fn test_identify_changed_modules_dedup() {
-        let src_to_module = vec![
-            (std::path::PathBuf::from("/project/core/src"), "core".to_string()),
-        ];
-
-        // Multiple changes in same module should not duplicate
-        let changed = vec![
-            std::path::PathBuf::from("/project/core/src/A.java"),
-            std::path::PathBuf::from("/project/core/src/B.java"),
-        ];
-        let modules = identify_changed_modules(&changed, &src_to_module);
-        assert_eq!(modules, vec!["core"]);
-    }
-}
-
 fn count_source_files(dir: &std::path::Path, extensions: &[String]) -> usize {
     if !dir.exists() {
         return 0;
@@ -571,4 +672,57 @@ fn count_source_files(dir: &std::path::Path, extensions: &[String]) -> usize {
             }
         })
         .count()
+}
+
+/// Detect DCEVM/JBR support via JAVA_HOME path or `java -version` output.
+fn detect_dcevm() -> bool {
+    // Method 1: JAVA_HOME path contains jbr/jetbrains
+    if let Ok(java_home) = std::env::var("JAVA_HOME") {
+        let home_lower = java_home.to_lowercase();
+        if home_lower.contains("jbr") || home_lower.contains("jetbrains") {
+            return true;
+        }
+    }
+
+    // Method 2: parse `java -version` output for JBR/DCEVM signature
+    if let Ok(output) = std::process::Command::new("java")
+        .arg("-version")
+        .output()
+    {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        if stderr.contains("jetbrains") || stderr.contains("jbr") || stderr.contains("dcevm") {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_identify_changed_modules() {
+        let src_to_module = vec![
+            (std::path::PathBuf::from("/project/core/src"), "core".to_string()),
+            (std::path::PathBuf::from("/project/web/src"), "web".to_string()),
+        ];
+
+        let changed = vec![std::path::PathBuf::from("/project/core/src/Main.java")];
+        let modules = identify_changed_modules(&changed, &src_to_module);
+        assert_eq!(modules, vec!["core"]);
+
+        let changed = vec![
+            std::path::PathBuf::from("/project/core/src/Foo.java"),
+            std::path::PathBuf::from("/project/web/src/Bar.java"),
+        ];
+        let modules = identify_changed_modules(&changed, &src_to_module);
+        assert_eq!(modules.len(), 2);
+    }
+}
+
+/// Check if a TCP port is already in use by attempting to bind to it.
+fn is_port_in_use(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
 }

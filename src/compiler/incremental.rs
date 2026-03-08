@@ -123,12 +123,18 @@ impl Fingerprints {
     }
 
     /// Remove entries for files that no longer exist.
-    pub fn prune(&mut self, existing_files: &[PathBuf]) {
+    /// Returns the list of removed source paths.
+    pub fn prune(&mut self, existing_files: &[PathBuf]) -> Vec<String> {
         let existing_keys: std::collections::HashSet<String> = existing_files
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect();
+        let removed: Vec<String> = self.entries.keys()
+            .filter(|k| !existing_keys.contains(k.as_str()))
+            .cloned()
+            .collect();
         self.entries.retain(|k, _| existing_keys.contains(k));
+        removed
     }
 }
 
@@ -422,6 +428,8 @@ fn read_u32(data: &[u8], pos: usize) -> Option<u32> {
 
 /// Incremental compile: only compile changed files.
 /// Falls back to full compilation if output dir is empty.
+/// Supports build cache sharing: on full recompilation, checks
+/// ~/.ym/cache/build-cache/{input_hash}/ for cached .class files.
 pub fn incremental_compile(
     config: &super::CompileConfig,
     cache_dir: &Path,
@@ -439,7 +447,13 @@ pub fn incremental_compile(
             .unwrap_or(false);
 
     let files_to_compile = if !has_classes {
-        all_files.clone() // Full compile
+        // Full compile needed — try build cache first
+        if !all_files.is_empty() {
+            if let Some(result) = try_restore_build_cache(config, &all_files, &mut fingerprints, &fp_dir)? {
+                return Ok(result);
+            }
+        }
+        all_files.clone()
     } else if changed.is_empty() {
         return Ok(super::CompileResult {
             success: true,
@@ -470,6 +484,8 @@ pub fn incremental_compile(
 
     let result = compile_files(&incremental_config, &files_to_compile, engine)?;
 
+    let is_full_compile = files_to_compile.len() == all_files.len();
+
     if result.success {
         // Update fingerprints for compiled files
         for file in &files_to_compile {
@@ -490,8 +506,22 @@ pub fn incremental_compile(
                 }
             }
         }
-        fingerprints.prune(&all_files);
+        let removed = fingerprints.prune(&all_files);
+        // Delete orphan .class files for deleted sources
+        for removed_src in &removed {
+            let src_path = Path::new(removed_src);
+            if let Some(class_file) = find_class_for_source(src_path, &config.source_dirs, &config.output_dir) {
+                let _ = std::fs::remove_file(&class_file);
+            }
+        }
         fingerprints.save(&fp_dir)?;
+
+        // Save to build cache after successful full compilation
+        if is_full_compile && !files_to_compile.is_empty() {
+            if let Err(e) = save_build_cache(config, &all_files) {
+                eprintln!("  Warning: failed to save build cache: {}", e);
+            }
+        }
     }
 
     Ok(super::CompileResult {
@@ -521,6 +551,139 @@ fn find_class_for_source(source: &Path, source_dirs: &[PathBuf], output_dir: &Pa
 fn fingerprint_dir_for(cache_dir: &Path, output_dir: &Path) -> PathBuf {
     let hash = hash_bytes(output_dir.to_string_lossy().as_bytes());
     cache_dir.join("fingerprints").join(&hash[..16])
+}
+
+/// Compute a content-addressable key from all compilation inputs.
+/// Key = hash(sorted source hashes + classpath paths + compiler options)
+fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBuf]) -> Result<String> {
+    let mut hasher = Sha256::new();
+
+    // Source content hashes (sorted for determinism)
+    let mut source_hashes: Vec<(String, String)> = Vec::new();
+    for f in source_files {
+        let h = hash_file(f)?;
+        let rel = f.to_string_lossy().to_string();
+        source_hashes.push((rel, h));
+    }
+    source_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, hash) in &source_hashes {
+        hasher.update(path.as_bytes());
+        hasher.update(hash.as_bytes());
+    }
+
+    // Classpath (sorted paths)
+    let mut cp: Vec<String> = config.classpath.iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    cp.sort();
+    for p in &cp {
+        hasher.update(b"cp:");
+        hasher.update(p.as_bytes());
+    }
+
+    // Compiler options
+    if let Some(ref v) = config.java_version {
+        hasher.update(b"ver:");
+        hasher.update(v.as_bytes());
+    }
+    if let Some(ref e) = config.encoding {
+        hasher.update(b"enc:");
+        hasher.update(e.as_bytes());
+    }
+    for arg in &config.extra_args {
+        hasher.update(b"arg:");
+        hasher.update(arg.as_bytes());
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Build cache directory: ~/.ym/cache/build-cache/{key}/
+fn build_cache_dir(key: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".ym")
+        .join("cache")
+        .join("build-cache")
+        .join(key)
+}
+
+/// Try to restore compiled classes from the build cache.
+/// Returns Some(CompileResult) on cache hit, None on miss.
+fn try_restore_build_cache(
+    config: &super::CompileConfig,
+    source_files: &[PathBuf],
+    fingerprints: &mut Fingerprints,
+    fp_dir: &Path,
+) -> Result<Option<super::CompileResult>> {
+    let key = compute_build_cache_key(config, source_files)?;
+    let cache_dir = build_cache_dir(&key);
+
+    if !cache_dir.exists() {
+        return Ok(None);
+    }
+
+    // Cache hit — restore .class files
+    std::fs::create_dir_all(&config.output_dir)?;
+    copy_dir_recursive(&cache_dir, &config.output_dir)?;
+
+    // Rebuild fingerprints from restored files
+    for file in source_files {
+        let hash = hash_file(file).unwrap_or_default();
+        let mtime = std::fs::metadata(file)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        fingerprints.update_source(file, &hash, mtime);
+
+        if let Some(class_file) = find_class_for_source(file, &config.source_dirs, &config.output_dir) {
+            if let Ok(abi_hash) = compute_class_abi_hash(&class_file) {
+                fingerprints.update_abi(file, &abi_hash);
+            }
+        }
+    }
+    fingerprints.save(fp_dir)?;
+
+    Ok(Some(super::CompileResult {
+        success: true,
+        files_compiled: 0,
+        errors: format!("(restored from build cache)"),
+    }))
+}
+
+/// Save compiled output to the build cache.
+fn save_build_cache(config: &super::CompileConfig, source_files: &[PathBuf]) -> Result<()> {
+    let key = compute_build_cache_key(config, source_files)?;
+    let cache_dir = build_cache_dir(&key);
+
+    if cache_dir.exists() {
+        return Ok(()); // Already cached
+    }
+
+    std::fs::create_dir_all(&cache_dir)?;
+    copy_dir_recursive(&config.output_dir, &cache_dir)?;
+
+    Ok(())
+}
+
+/// Recursively copy directory contents.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(src) {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(src)?;
+        let dest = dst.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), &dest)?;
+        }
+    }
+    Ok(())
 }
 
 /// Compile specific files using the selected compiler engine.
@@ -565,6 +728,7 @@ fn compile_with_javac(
         cmd.arg("-encoding").arg(enc);
     }
 
+    let _cp_argfile_guard;
     if !config.classpath.is_empty() {
         let sep = if cfg!(windows) { ";" } else { ":" };
         let cp = config
@@ -573,7 +737,18 @@ fn compile_with_javac(
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<_>>()
             .join(sep);
-        cmd.arg("-cp").arg(&cp);
+        // Use @argfile for very long classpaths (OS command line limits)
+        if cp.len() > 8000 {
+            let cp_file = config.output_dir.join(".ym-classpath.txt");
+            std::fs::write(&cp_file, format!("-cp\n{}", cp))?;
+            cmd.arg(format!("@{}", cp_file.display()));
+            _cp_argfile_guard = Some(ArgfileCleanup(cp_file));
+        } else {
+            _cp_argfile_guard = None;
+            cmd.arg("-cp").arg(&cp);
+        }
+    } else {
+        _cp_argfile_guard = None;
     }
 
     // Annotation processor path
@@ -628,7 +803,7 @@ fn compile_with_javac(
 }
 
 /// RAII guard to clean up argfile after compilation
-struct ArgfileCleanup(PathBuf);
+pub(crate) struct ArgfileCleanup(pub(crate) PathBuf);
 impl Drop for ArgfileCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);

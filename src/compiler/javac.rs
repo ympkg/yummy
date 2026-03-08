@@ -34,6 +34,7 @@ pub fn compile(config: &CompileConfig) -> Result<CompileResult> {
         cmd.arg("-encoding").arg(enc);
     }
 
+    let _cp_argfile_guard;
     if !config.classpath.is_empty() {
         let sep = if cfg!(windows) { ";" } else { ":" };
         let cp = config
@@ -42,7 +43,18 @@ pub fn compile(config: &CompileConfig) -> Result<CompileResult> {
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<_>>()
             .join(sep);
-        cmd.arg("-cp").arg(&cp);
+        // Use @argfile for very long classpaths (OS command line limits)
+        if cp.len() > 8000 {
+            let cp_file = config.output_dir.join(".ym-classpath.txt");
+            std::fs::write(&cp_file, format!("-cp\n{}", cp))?;
+            cmd.arg(format!("@{}", cp_file.display()));
+            _cp_argfile_guard = Some(super::incremental::ArgfileCleanup(cp_file));
+        } else {
+            _cp_argfile_guard = None;
+            cmd.arg("-cp").arg(&cp);
+        }
+    } else {
+        _cp_argfile_guard = None;
     }
 
     if !config.annotation_processors.is_empty() {
@@ -65,8 +77,22 @@ pub fn compile(config: &CompileConfig) -> Result<CompileResult> {
     }
 
     let file_count = java_files.len();
-    for f in &java_files {
-        cmd.arg(f);
+    let _src_argfile_guard;
+    if file_count > 50 {
+        let argfile = config.output_dir.join(".ym-sources.txt");
+        let content = java_files
+            .iter()
+            .map(|f| f.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&argfile, &content)?;
+        cmd.arg(format!("@{}", argfile.display()));
+        _src_argfile_guard = Some(super::incremental::ArgfileCleanup(argfile));
+    } else {
+        _src_argfile_guard = None;
+        for f in &java_files {
+            cmd.arg(f);
+        }
     }
 
     let output = cmd
@@ -92,34 +118,3 @@ fn collect_java_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Scan source files for classes containing a main method
-pub fn scan_main_methods(src_dirs: &[PathBuf]) -> Result<Vec<String>> {
-    let mut main_classes = Vec::new();
-
-    for src_dir in src_dirs {
-        if !src_dir.exists() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(src_dir) {
-            let entry = entry?;
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("java") {
-                continue;
-            }
-            let content = std::fs::read_to_string(entry.path())?;
-            if content.contains("public static void main(String")
-                || content.contains("public static void main (String")
-            {
-                let rel = entry.path().strip_prefix(src_dir)?;
-                let class_name = rel
-                    .to_string_lossy()
-                    .replace('/', ".")
-                    .replace('\\', ".")
-                    .trim_end_matches(".java")
-                    .to_string();
-                main_classes.push(class_name);
-            }
-        }
-    }
-
-    Ok(main_classes)
-}

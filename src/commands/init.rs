@@ -1,39 +1,37 @@
 use anyhow::{bail, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, MultiSelect, Select};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config;
-use crate::config::schema::YmConfig;
+use crate::config::schema::{DependencyValue, YmConfig};
 use crate::jdk_manager;
 
-/// Entry point with options — aligned with yarn init
-pub fn execute_with_options(
+/// Entry point — aligned with spec 18-init.md
+pub fn execute(
     name: Option<String>,
+    interactive: bool,
     template: Option<String>,
-    yes: bool,
+    _yes: bool,
 ) -> Result<()> {
     let dir = resolve_dir(name.as_deref())?;
 
+    // Pre-check: refuse if package.toml already exists
     let config_path = dir.join(config::CONFIG_FILE);
-    let existing = if config_path.exists() {
-        Some(config::load_config(&config_path)?)
-    } else {
-        None
-    };
+    if config_path.exists() {
+        bail!("package.toml already exists in {}", dir.display());
+    }
 
     if let Some(tpl) = template {
-        if existing.is_some() {
-            bail!("package.json already exists, cannot use --template");
-        }
         return execute_from_template(&dir, &tpl);
     }
 
-    if yes && existing.is_none() {
-        execute_defaults(&dir)
+    if interactive {
+        execute_interactive(&dir)
     } else {
-        execute_interactive(&dir, existing.as_ref())
+        // Default: zero-question mode (like `bun init`)
+        execute_defaults(&dir)
     }
 }
 
@@ -47,263 +45,184 @@ fn resolve_dir(name: Option<&str>) -> Result<PathBuf> {
     }
 }
 
-/// Non-interactive mode — all defaults, no prompts
+/// Zero-question mode — generate runnable project immediately
 fn execute_defaults(dir: &Path) -> Result<()> {
     let dir_name = dir_name(dir);
-    let author = git_user_name();
     let pkg = default_package(&dir_name);
 
-    let mut config = YmConfig {
-        name: dir_name,
-        version: Some("1.0.0".to_string()),
+    let config = YmConfig {
+        name: dir_name.clone(),
+        group_id: "com.example".to_string(),
+        version: Some("0.1.0".to_string()),
         target: Some("21".to_string()),
+        package: Some(pkg.clone()),
+        main: Some(format!("{}.Main", pkg)),
+        dependencies: Some(BTreeMap::new()),
+        scripts: Some(default_scripts()),
         ..Default::default()
     };
 
-    if let Some(ref a) = author {
-        config.author = Some(a.clone());
-    }
-    config.license = Some("MIT".to_string());
-    config.package = Some(pkg.clone());
-    config.main = Some(format!("{}.Main", pkg));
-    config.dependencies = Some(BTreeMap::new());
-    config.dev_dependencies = Some(BTreeMap::new());
-    config.env = Some({
-        let mut env = BTreeMap::new();
-        env.insert("ARTIFACT".to_string(), config.name.clone());
-        env
-    });
-    config.scripts = Some(default_scripts());
-
     write_project(dir, &config)?;
+
+    // Run postinit hook if defined
+    crate::scripts::run_script(&config.scripts, &config.env, "postinit", dir)?;
 
     let main_class = config.main.as_deref().unwrap_or("Main");
     let main_path = main_class.replace('.', "/");
-    println!("  {} Created package.json", style("✓").green());
+    println!();
+    println!("  {} Created package.toml", style("✓").green());
     println!("  {} Created src/main/java/{}.java", style("✓").green(), main_path);
+    println!();
+    println!("  Done! Next steps:");
+    if dir != std::env::current_dir().unwrap_or_default() {
+        println!("    cd {}", dir_name);
+    }
+    println!("    ym dev");
+    println!();
 
     Ok(())
 }
 
-/// Interactive mode — ask all fields like yarn init
-/// If `existing` is Some, use its values as defaults (re-init mode).
-fn execute_interactive(dir: &Path, existing: Option<&YmConfig>) -> Result<()> {
-    let default_name = existing
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| dir_name(dir));
-    let default_author = existing
-        .and_then(|c| c.author.clone())
-        .or_else(|| git_user_name())
-        .unwrap_or_default();
-    let default_version = existing
-        .and_then(|c| c.version.clone())
-        .unwrap_or_else(|| "1.0.0".to_string());
-    let default_description = existing
-        .and_then(|c| c.description.clone())
-        .unwrap_or_default();
-    let default_license = existing
-        .and_then(|c| c.license.clone())
-        .unwrap_or_else(|| "MIT".to_string());
+/// Interactive mode (`-i`) — ask package name, Java version, template, JDK
+fn execute_interactive(dir: &Path) -> Result<()> {
+    let default_name = dir_name(dir);
 
-    if existing.is_some() {
-        println!("  {} Re-initializing existing project", style("→").blue());
-        println!();
-    }
-
-    let name: String = Input::new()
-        .with_prompt("name")
-        .default(default_name)
+    // 1. Package name
+    let pkg_input: String = Input::new()
+        .with_prompt("package name")
+        .default(default_package(&default_name))
         .interact_text()?;
 
-    let version: String = Input::new()
-        .with_prompt("version")
-        .default(default_version)
-        .interact_text()?;
-
-    let description: String = Input::new()
-        .with_prompt("description")
-        .default(default_description)
-        .allow_empty(true)
-        .interact_text()?;
-
-    let default_package = existing
-        .and_then(|c| c.package.clone())
-        .unwrap_or_else(|| default_package(&name));
-    let package: String = Input::new()
-        .with_prompt("package")
-        .default(default_package)
-        .interact_text()?;
-
-    let default_main = existing
-        .and_then(|c| c.main.clone())
-        .unwrap_or_else(|| format!("{}.{}", package, to_class_name(&name)));
-    let main_class: String = Input::new()
-        .with_prompt("main class")
-        .default(default_main)
-        .interact_text()?;
-
-    let author: String = Input::new()
-        .with_prompt("author")
-        .default(default_author)
-        .allow_empty(true)
-        .interact_text()?;
-
-    let license: String = Input::new()
-        .with_prompt("license")
-        .default(default_license)
-        .interact_text()?;
-
-    // --- JDK selection ---
+    // 2. Java version — scan installed JDKs
     println!();
     let term = console::Term::stderr();
     let _ = term.write_line(&format!("  {} Scanning JDKs...", style("→").blue()));
     let jdks = jdk_manager::scan_jdks();
     let _ = term.clear_last_lines(1);
 
-    let dev_jdk_path = select_jdk("Select DEV JDK (for development & hot reload)", &jdks, true)?;
-    let prod_jdk_path = select_jdk("Select PROD JDK (for build & production)", &jdks, false)?;
+    let java_version = select_java_version(&jdks)?;
 
-    // Determine java version from dev JDK
-    let java_version = dev_jdk_path.as_ref()
-        .and_then(|p| {
-            jdks.iter()
-                .find(|j| &j.path == p)
-                .map(|j| {
-                    // Extract major version
-                    let v = &j.version;
-                    if v.starts_with("1.") {
-                        v.split('.').nth(1).unwrap_or("21").to_string()
-                    } else {
-                        v.split('.').next().unwrap_or("21").to_string()
-                    }
-                })
-        })
-        .unwrap_or_else(|| "21".to_string());
-
-    // --- GraalVM native compilation ---
-    // Default to yes if PROD JDK is already GraalVM
-    let prod_is_graalvm = prod_jdk_path.as_ref()
-        .and_then(|p| jdks.iter().find(|j| &j.path == p))
-        .map(|j| {
-            let name_lower = j.display_name().to_lowercase();
-            name_lower.contains("graalvm") || name_lower.contains("graal")
-        })
-        .unwrap_or(false);
-
-    println!();
-    let use_graalvm = Confirm::new()
-        .with_prompt("  Enable GraalVM native-image compilation?")
-        .default(prod_is_graalvm)
+    // 3. Template selection
+    let template_items = ["app", "lib", "spring-boot"];
+    let template_idx = Select::new()
+        .with_prompt("template")
+        .items(&template_items)
+        .default(0)
         .interact()?;
+    let template = template_items[template_idx];
 
-    let graalvm_path = if use_graalvm {
-        let graalvm_jdks: Vec<&jdk_manager::DetectedJdk> = jdks.iter()
-            .filter(|j| {
-                let name_lower = j.display_name().to_lowercase();
-                name_lower.contains("graalvm") || name_lower.contains("graal")
-            })
-            .collect();
+    // 4. DEV JDK selection (recommend JBR for hot reload)
+    let dev_jdk_path = select_jdk("Select DEV JDK (for hot reload)", &jdks, true)?;
 
-        if graalvm_jdks.is_empty() {
-            println!("  {} No GraalVM found locally.", style("!").yellow());
-            let download = Confirm::new()
-                .with_prompt("  Download GraalVM?")
-                .default(true)
-                .interact()?;
-            if download {
-                download_jdk_interactive()?
-            } else {
-                println!("  {} Set GRAALVM_HOME in env later to enable native builds.", style("→").dim());
-                None
-            }
-        } else {
-            let graalvm_only: Vec<jdk_manager::DetectedJdk> = graalvm_jdks.into_iter().cloned().collect();
-            select_jdk("Select GraalVM (for native-image)", &graalvm_only, false)?
-        }
-    } else {
-        None
+    // Build config
+    let dir_name = dir_name(dir);
+    let mut config = YmConfig {
+        name: dir_name.clone(),
+        group_id: "com.example".to_string(),
+        version: Some("0.1.0".to_string()),
+        target: Some(java_version),
+        package: Some(pkg_input.clone()),
+        dependencies: Some(BTreeMap::new()),
+        scripts: Some(default_scripts()),
+        ..Default::default()
     };
 
-    // Build env and scripts
-    let env = build_env(&name, &dev_jdk_path, &prod_jdk_path, &graalvm_path);
-    let scripts = build_scripts(use_graalvm);
-
-    // Start from existing config or blank
-    let mut config = existing.cloned().unwrap_or_default();
-    config.name = name;
-    config.version = Some(version);
-    config.target = Some(java_version);
-
-    if !description.is_empty() {
-        config.description = Some(description);
-    } else {
-        config.description = None;
-    }
-    if !author.is_empty() {
-        config.author = Some(author);
-    }
-    if !license.is_empty() {
-        config.license = Some(license);
+    // Set up env with DEV_JAVA_HOME if JDK was selected
+    if let Some(ref path) = dev_jdk_path {
+        let mut env = BTreeMap::new();
+        env.insert("DEV_JAVA_HOME".to_string(), shorten_home(path));
+        config.env = Some(env);
+        // Update scripts to use DEV_JAVA_HOME
+        use config::schema::ScriptValue;
+        let mut scripts = BTreeMap::new();
+        scripts.insert("dev".to_string(), ScriptValue::Simple("JAVA_HOME=$DEV_JAVA_HOME ymc dev".to_string()));
+        scripts.insert("build".to_string(), ScriptValue::Simple("ymc build".to_string()));
+        scripts.insert("test".to_string(), ScriptValue::Simple("ymc test".to_string()));
+        config.scripts = Some(scripts);
     }
 
-    config.package = Some(package.clone());
-    // Ensure main class is fully qualified
-    let main_class = if !main_class.contains('.') && !package.is_empty() {
-        format!("{}.{}", package, main_class)
-    } else {
-        main_class
-    };
-    config.main = Some(main_class);
-
-    // Merge env: init-managed keys overwrite, user-added keys preserved
-    {
-        let mut merged_env = config.env.unwrap_or_default();
-        for (k, v) in env {
-            merged_env.insert(k, v);
+    // Apply template-specific config
+    match template {
+        "spring-boot" => {
+            let mut deps = BTreeMap::new();
+            deps.insert(
+                "org.springframework.boot:spring-boot-starter-web".to_string(),
+                DependencyValue::Simple("3.4.0".to_string()),
+            );
+            config.dependencies = Some(deps);
+            config.main = Some(format!("{}.Application", pkg_input));
         }
-        config.env = Some(merged_env);
-    }
-
-    if config.dependencies.is_none() {
-        config.dependencies = Some(BTreeMap::new());
-    }
-    if config.dev_dependencies.is_none() {
-        config.dev_dependencies = Some(BTreeMap::new());
-    }
-
-    // Merge scripts: init-managed scripts overwrite, user-added scripts preserved
-    {
-        let mut merged_scripts = config.scripts.unwrap_or_default();
-        for (k, v) in scripts {
-            merged_scripts.insert(k, v);
+        "lib" => {
+            let mut deps = BTreeMap::new();
+            deps.insert(
+                "org.junit.jupiter:junit-jupiter".to_string(),
+                DependencyValue::Detailed(crate::config::schema::DependencySpec {
+                    version: Some("5.11.0".to_string()),
+                    scope: Some("test".to_string()),
+                    ..Default::default()
+                }),
+            );
+            deps.insert(
+                "org.junit.platform:junit-platform-console-standalone".to_string(),
+                DependencyValue::Detailed(crate::config::schema::DependencySpec {
+                    version: Some("1.11.0".to_string()),
+                    scope: Some("test".to_string()),
+                    ..Default::default()
+                }),
+            );
+            config.dependencies = Some(deps);
+            config.main = None; // lib has no main
         }
-        config.scripts = Some(merged_scripts);
+        _ => {
+            // app (default)
+            config.main = Some(format!("{}.Main", pkg_input));
+        }
     }
 
-    // JSON preview
-    println!();
-    let json = serde_json::to_string_pretty(&config)?;
-    println!("{}", json);
-    println!();
-
-    let ok = Confirm::new()
-        .with_prompt("Is this OK?")
-        .default(true)
-        .interact()?;
-
-    if !ok {
-        println!("Aborted.");
-        return Ok(());
+    // 5. Optional dependency selection (checkbox)
+    let extra_deps = select_optional_deps(template)?;
+    if !extra_deps.is_empty() {
+        let deps = config.dependencies.get_or_insert_with(BTreeMap::new);
+        for (coord, value) in extra_deps {
+            deps.insert(coord, value);
+        }
     }
 
-    write_project(dir, &config)?;
+    write_project_for_template(dir, &config, template)?;
 
-    let main_class = config.main.as_deref().unwrap_or("Main");
-    let main_path = main_class.replace('.', "/");
-    println!("  {} Created package.json", style("✓").green());
-    println!("  {} Created src/main/java/{}.java", style("✓").green(), main_path);
+    // Run postinit hook if defined
+    crate::scripts::run_script(&config.scripts, &config.env, "postinit", dir)?;
+
+    println!();
+    println!(
+        "  {} Created {} project",
+        style("✓").green(),
+        style(template).cyan()
+    );
+    println!();
+    println!("  Done! Next steps:");
+    if dir != std::env::current_dir().unwrap_or_default() {
+        println!("    cd {}", dir_name);
+    }
+    println!("    ym dev");
+    println!();
 
     Ok(())
+}
+
+fn select_java_version(_jdks: &[jdk_manager::DetectedJdk]) -> Result<String> {
+    let version_items = ["25 (latest)", "21 (LTS)", "17 (LTS)"];
+    let version_idx = Select::new()
+        .with_prompt("Java version")
+        .items(&version_items)
+        .default(0)
+        .interact()?;
+    Ok(match version_idx {
+        0 => "25".to_string(),
+        1 => "21".to_string(),
+        2 => "17".to_string(),
+        _ => "21".to_string(),
+    })
 }
 
 /// Interactive JDK selection with arrow keys.
@@ -334,8 +253,9 @@ fn select_jdk(label: &str, jdks: &[jdk_manager::DetectedJdk], prefer_dcevm: bool
         jdks.iter().collect()
     };
 
-    // Build selection items
     let mut items: Vec<String> = Vec::new();
+    // Add "Skip" as first option
+    items.push(format!("{}", style("Skip").dim()));
 
     for jdk in &sorted_jdks {
         let mut label = format!(
@@ -351,17 +271,27 @@ fn select_jdk(label: &str, jdks: &[jdk_manager::DetectedJdk], prefer_dcevm: bool
     }
     items.push(format!("{}", style("Download other...").cyan()));
 
+    let default = if prefer_dcevm && sorted_jdks.first().map(|j| j.has_dcevm).unwrap_or(false) {
+        1 // First JBR
+    } else {
+        0 // Skip
+    };
+
     let selection = Select::new()
         .items(&items)
-        .default(0)
+        .default(default)
         .interact()?;
 
+    if selection == 0 {
+        return Ok(None); // Skip
+    }
+
     // "Download other..." is the last item
-    if selection == sorted_jdks.len() {
+    if selection == items.len() - 1 {
         return download_jdk_interactive();
     }
 
-    let selected = sorted_jdks[selection];
+    let selected = sorted_jdks[selection - 1];
     println!(
         "  {} {}",
         style("✓").green(),
@@ -371,66 +301,60 @@ fn select_jdk(label: &str, jdks: &[jdk_manager::DetectedJdk], prefer_dcevm: bool
     Ok(Some(selected.path.clone()))
 }
 
-/// Interactive JDK download: select vendor then version, or paste a URL.
+/// Interactive JDK download: select vendor then version.
 fn download_jdk_interactive() -> Result<Option<PathBuf>> {
-    let mut vendor_labels: Vec<String> = jdk_manager::DOWNLOAD_VENDORS
-        .iter()
-        .map(|(label, _)| label.to_string())
-        .collect();
-    vendor_labels.push(format!("{}", style("Paste download URL...").cyan()));
+    // Step 1: Select provider (JBR recommended)
+    let mut vendor_labels: Vec<String> = vec![
+        format!("{} {}", "JetBrains Runtime (JBR)", style("★ recommended").yellow()),
+    ];
+    for (label, _) in jdk_manager::DOWNLOAD_VENDORS.iter().skip(0) {
+        if !label.to_lowercase().contains("jetbrains") && !label.to_lowercase().contains("jbr") {
+            vendor_labels.push(label.to_string());
+        }
+    }
+    vendor_labels.push(format!("{}", style("Skip").dim()));
 
     println!();
     let vendor_idx = Select::new()
-        .with_prompt("  Vendor")
+        .with_prompt("  Provider")
         .items(&vendor_labels)
         .default(0)
         .interact()?;
 
-    // Last item = custom URL
-    if vendor_idx == jdk_manager::DOWNLOAD_VENDORS.len() {
-        let url: String = Input::new()
-            .with_prompt("  URL (.tar.gz)")
-            .interact_text()?;
-        let name: String = Input::new()
-            .with_prompt("  Name (e.g. jdk-25)")
-            .interact_text()?;
-        let path = jdk_manager::download_jdk_from_url(&url, &name)?;
-        return Ok(Some(path));
+    // Last item = Skip
+    if vendor_idx == vendor_labels.len() - 1 {
+        return Ok(None);
     }
 
-    let (_, vendor_key) = jdk_manager::DOWNLOAD_VENDORS[vendor_idx];
-
-    let version_labels: Vec<&str> = jdk_manager::JDK_VERSIONS
-        .iter()
-        .map(|(label, _)| *label)
-        .collect();
-
+    // Step 2: Select version (25 default)
+    let version_labels = ["25 (latest)", "21 (LTS)", "17 (LTS)"];
     let version_idx = Select::new()
         .with_prompt("  Version")
         .items(&version_labels)
         .default(0)
         .interact()?;
 
-    let (_, version_key) = jdk_manager::JDK_VERSIONS[version_idx];
+    let version_key = match version_idx {
+        0 => "25",
+        1 => "21",
+        2 => "17",
+        _ => "25",
+    };
+
+    // Map vendor selection to vendor key
+    let vendor_key = if vendor_idx == 0 {
+        "jbr"
+    } else {
+        // Find the matching vendor key from DOWNLOAD_VENDORS
+        jdk_manager::DOWNLOAD_VENDORS
+            .iter()
+            .find(|(label, _)| vendor_labels.get(vendor_idx).map(|l| l == *label).unwrap_or(false))
+            .map(|(_, key)| *key)
+            .unwrap_or("temurin")
+    };
 
     let path = jdk_manager::download_jdk(vendor_key, version_key)?;
     Ok(Some(path))
-}
-
-/// Build env map from selected JDKs.
-fn build_env(name: &str, dev_jdk: &Option<PathBuf>, prod_jdk: &Option<PathBuf>, graalvm: &Option<PathBuf>) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    env.insert("ARTIFACT".to_string(), name.to_string());
-    if let Some(path) = dev_jdk {
-        env.insert("DEV_JAVA_HOME".to_string(), shorten_home(path));
-    }
-    if let Some(path) = prod_jdk {
-        env.insert("PROD_JAVA_HOME".to_string(), shorten_home(path));
-    }
-    if let Some(path) = graalvm {
-        env.insert("GRAALVM_HOME".to_string(), shorten_home(path));
-    }
-    env
 }
 
 /// Replace $HOME prefix with ~ for shorter, portable paths.
@@ -444,37 +368,227 @@ fn shorten_home(path: &Path) -> String {
     path.display().to_string()
 }
 
-/// Build scripts map (env vars are handled by the "env" field).
-fn build_scripts(with_native: bool) -> BTreeMap<String, String> {
+/// Default scripts for package.toml
+fn default_scripts() -> BTreeMap<String, config::schema::ScriptValue> {
+    use config::schema::ScriptValue;
     let mut scripts = BTreeMap::new();
-    scripts.insert("dev".to_string(), "JAVA_HOME=$DEV_JAVA_HOME ymc dev".to_string());
-    scripts.insert("build".to_string(), "JAVA_HOME=$PROD_JAVA_HOME ymc build".to_string());
-    scripts.insert("test".to_string(), "JAVA_HOME=$PROD_JAVA_HOME ymc test".to_string());
-    scripts.insert("start".to_string(), "JAVA_HOME=$PROD_JAVA_HOME ymc run".to_string());
-    scripts.insert("docker:build".to_string(), "docker build -t $ARTIFACT .".to_string());
-    scripts.insert("docker:push".to_string(), "docker push $ARTIFACT".to_string());
-    if with_native {
-        scripts.insert("native".to_string(), "ymc build --release && $GRAALVM_HOME/bin/native-image -jar out/$ARTIFACT.jar -o out/$ARTIFACT".to_string());
-        scripts.insert("native:docker".to_string(), "docker run --rm -v $(pwd):/workspace -w /workspace yummy:jdk25-graal sh -c 'ymc build --release && native-image -jar out/$ARTIFACT.jar -o out/$ARTIFACT'".to_string());
-    }
+    scripts.insert("dev".to_string(), ScriptValue::Simple("ymc dev".to_string()));
+    scripts.insert("build".to_string(), ScriptValue::Simple("ymc build".to_string()));
+    scripts.insert("test".to_string(), ScriptValue::Simple("ymc test".to_string()));
     scripts
 }
 
 /// Non-interactive init from template
 fn execute_from_template(dir: &Path, template: &str) -> Result<()> {
+    // Check if template is a Git URL or local directory path
+    if is_custom_template(template) {
+        return execute_from_custom_template(dir, template);
+    }
+
     let dir_name = dir_name(dir);
+    let pkg = default_package(&dir_name);
 
     let mut config = YmConfig {
         name: dir_name.clone(),
-        version: Some("1.0.0".to_string()),
+        group_id: "com.example".to_string(),
+        version: Some("0.1.0".to_string()),
         target: Some("21".to_string()),
+        package: Some(pkg.clone()),
+        dependencies: Some(BTreeMap::new()),
+        scripts: Some(default_scripts()),
         ..Default::default()
     };
 
-    let mut deps = BTreeMap::new();
-    let mut dev_deps = BTreeMap::new();
+    match template {
+        "spring-boot" | "spring" => {
+            let mut deps = BTreeMap::new();
+            deps.insert(
+                "org.springframework.boot:spring-boot-starter-web".to_string(),
+                DependencyValue::Simple("3.4.0".to_string()),
+            );
+            config.dependencies = Some(deps);
+            config.main = Some(format!("{}.Application", pkg));
+        }
+        "lib" | "library" => {
+            let mut deps = BTreeMap::new();
+            deps.insert(
+                "org.junit.jupiter:junit-jupiter".to_string(),
+                DependencyValue::Detailed(crate::config::schema::DependencySpec {
+                    version: Some("5.11.0".to_string()),
+                    scope: Some("test".to_string()),
+                    ..Default::default()
+                }),
+            );
+            deps.insert(
+                "org.junit.platform:junit-platform-console-standalone".to_string(),
+                DependencyValue::Detailed(crate::config::schema::DependencySpec {
+                    version: Some("1.11.0".to_string()),
+                    scope: Some("test".to_string()),
+                    ..Default::default()
+                }),
+            );
+            config.dependencies = Some(deps);
+            config.main = None;
+        }
+        _ => {
+            // "app" default
+            config.main = Some(format!("{}.Main", pkg));
+        }
+    }
 
+    write_project_for_template(dir, &config, template)?;
+
+    // Run postinit hook if defined
+    crate::scripts::run_script(&config.scripts, &config.env, "postinit", dir)?;
+
+    println!();
+    println!(
+        "  {} Created {} project from '{}' template",
+        style("✓").green(),
+        style(&dir_name).bold(),
+        style(template).cyan()
+    );
+    println!();
+    println!("  Done! Next steps:");
+    if dir != std::env::current_dir().unwrap_or_default() {
+        println!("    cd {}", dir_name);
+    }
+    println!("    ym dev");
+    println!();
+
+    Ok(())
+}
+
+/// Check if template string is a custom template (Git URL or local path)
+fn is_custom_template(template: &str) -> bool {
+    template.starts_with("https://")
+        || template.starts_with("http://")
+        || template.starts_with("git@")
+        || template.starts_with("./")
+        || template.starts_with("../")
+        || template.starts_with('/')
+}
+
+/// Init from a custom template: Git URL or local directory
+fn execute_from_custom_template(dir: &Path, template: &str) -> Result<()> {
     std::fs::create_dir_all(dir)?;
+
+    if template.starts_with("https://") || template.starts_with("http://") || template.starts_with("git@") {
+        // Clone Git repo to temp dir, then copy contents
+        println!(
+            "  {} Cloning template from {}",
+            style("→").blue(),
+            style(template).dim()
+        );
+
+        let tmp = tempfile::tempdir()?;
+        let status = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", template, tmp.path().to_str().unwrap()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .status()?;
+
+        if !status.success() {
+            bail!("Failed to clone template from {}", template);
+        }
+
+        copy_dir_contents(tmp.path(), dir)?;
+    } else {
+        // Local directory template
+        let src = Path::new(template);
+        if !src.is_dir() {
+            bail!("Template directory not found: {}", template);
+        }
+
+        println!(
+            "  {} Copying template from {}",
+            style("→").blue(),
+            style(template).dim()
+        );
+
+        copy_dir_contents(src, dir)?;
+    }
+
+    // Load and display the generated config if it exists
+    let config_path = dir.join(config::CONFIG_FILE);
+    if config_path.exists() {
+        // Run postinit hook if defined in the template's package.toml
+        if let Ok(cfg) = config::load_config(&config_path) {
+            crate::scripts::run_script(&cfg.scripts, &cfg.env, "postinit", dir)?;
+        }
+    }
+
+    let dn = dir_name(dir);
+    println!();
+    println!(
+        "  {} Created project from custom template",
+        style("✓").green(),
+    );
+    println!();
+    println!("  Done! Next steps:");
+    if dir != std::env::current_dir().unwrap_or_default() {
+        println!("    cd {}", dn);
+    }
+    println!("    ym dev");
+    println!();
+
+    Ok(())
+}
+
+/// Recursively copy directory contents, skipping .git
+fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip .git directory
+        if name_str == ".git" {
+            continue;
+        }
+
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path)?;
+            copy_dir_contents(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write package.toml + create directories/files (default app template)
+fn write_project(dir: &Path, config: &YmConfig) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+
+    let config_path = dir.join(config::CONFIG_FILE);
+    config::save_config(&config_path, config)?;
+
+    let src_dir = dir.join("src").join("main").join("java");
+    std::fs::create_dir_all(&src_dir)?;
+    create_sample_main(&src_dir, config)?;
+
+    let resources_dir = dir.join("src").join("main").join("resources");
+    std::fs::create_dir_all(&resources_dir)?;
+
+    let test_dir = dir.join("src").join("test").join("java");
+    std::fs::create_dir_all(&test_dir)?;
+
+    write_gitignore(dir)?;
+
+    Ok(())
+}
+
+/// Write project with template-specific source files
+fn write_project_for_template(dir: &Path, config: &YmConfig, template: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+
+    let config_path = dir.join(config::CONFIG_FILE);
+    config::save_config(&config_path, config)?;
+
     let src_dir = dir.join("src").join("main").join("java");
     std::fs::create_dir_all(&src_dir)?;
 
@@ -484,73 +598,34 @@ fn execute_from_template(dir: &Path, template: &str) -> Result<()> {
     let test_java_dir = dir.join("src").join("test").join("java");
     std::fs::create_dir_all(&test_java_dir)?;
 
-    match template {
-        "spring" => {
-            deps.insert(
-                "org.springframework.boot:spring-boot-starter-web".to_string(),
-                "3.4.0".to_string(),
-            );
-            deps.insert(
-                "org.springframework.boot:spring-boot-starter".to_string(),
-                "3.4.0".to_string(),
-            );
-            dev_deps.insert(
-                "org.springframework.boot:spring-boot-starter-test".to_string(),
-                "3.4.0".to_string(),
-            );
-            config.package = Some("com.example".to_string());
-            config.main = Some("com.example.Application".to_string());
+    let pkg = config.package.as_deref().unwrap_or("com.example");
+    let pkg_dir = src_dir.join(pkg.replace('.', "/"));
+    std::fs::create_dir_all(&pkg_dir)?;
 
-            let pkg_dir = src_dir.join("com").join("example");
-            std::fs::create_dir_all(&pkg_dir)?;
-            let main_content = r#"package com.example;
+    match template {
+        "spring-boot" | "spring" => {
+            let main_content = format!(
+                r#"package {};
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication
-public class Application {
-    public static void main(String[] args) {
-        SpringApplication.run(Application.class, args);
-    }
-}
-"#;
-            std::fs::write(pkg_dir.join("Application.java"), main_content)?;
-        }
-        "cli" => {
-            let pkg = default_package(&dir_name);
-            config.package = Some(pkg.clone());
-            config.main = Some(format!("{}.Main", pkg));
-            let pkg_dir = src_dir.join(pkg.replace('.', "/"));
-            std::fs::create_dir_all(&pkg_dir)?;
-            let main_content = format!(
-                r#"package {};
-
-public class Main {{
+public class Application {{
     public static void main(String[] args) {{
-        if (args.length == 0) {{
-            System.out.println("Usage: {} <command>");
-            System.exit(1);
-        }}
-        System.out.println("Running: " + args[0]);
+        SpringApplication.run(Application.class, args);
     }}
 }}
 "#,
-                pkg, dir_name
+                pkg
             );
-            std::fs::write(pkg_dir.join("Main.java"), main_content)?;
+            std::fs::write(pkg_dir.join("Application.java"), main_content)?;
+
+            // Create application.yml
+            std::fs::write(resources_dir.join("application.yml"), "server:\n  port: 8080\n")?;
         }
         "lib" | "library" => {
-            dev_deps.insert(
-                "org.junit.jupiter:junit-jupiter".to_string(),
-                "5.11.0".to_string(),
-            );
-            let pkg = default_package(&dir_name);
-            config.package = Some(pkg.clone());
-            let class_name = to_class_name(&dir_name);
-            let pkg_path = pkg.replace('.', "/");
-            let pkg_dir = src_dir.join(&pkg_path);
-            std::fs::create_dir_all(&pkg_dir)?;
+            let class_name = to_class_name(&config.name);
             let lib_content = format!(
                 r#"package {};
 
@@ -564,7 +639,8 @@ public class {} {{
             );
             std::fs::write(pkg_dir.join(format!("{}.java", class_name)), lib_content)?;
 
-            let test_pkg_dir = test_java_dir.join(&pkg_path);
+            // Create test file
+            let test_pkg_dir = test_java_dir.join(pkg.replace('.', "/"));
             std::fs::create_dir_all(&test_pkg_dir)?;
             let test_content = format!(
                 r#"package {};
@@ -588,77 +664,21 @@ class {}Test {{
             )?;
         }
         _ => {
-            // Default "app" template
-            let pkg = default_package(&dir_name);
-            config.package = Some(pkg.clone());
-            config.main = Some(format!("{}.Main", pkg));
-            create_sample_main(&src_dir, &config)?;
+            // app (default)
+            create_sample_main(&src_dir, config)?;
         }
     }
 
-    if !deps.is_empty() {
-        config.dependencies = Some(deps);
-    } else {
-        config.dependencies = Some(BTreeMap::new());
-    }
-    if !dev_deps.is_empty() {
-        config.dev_dependencies = Some(dev_deps);
-    }
-
-    let config_path = dir.join(config::CONFIG_FILE);
-    config::save_config(&config_path, &config)?;
-
-    // Create .gitignore
-    let gitignore_path = dir.join(".gitignore");
-    if !gitignore_path.exists() {
-        std::fs::write(&gitignore_path, ".ym/\nout/\n*.class\n.idea/\n*.iml\n")?;
-    }
-
-    println!();
-    println!(
-        "  {} Created {} project from '{}' template",
-        style("✓").green(),
-        style(&dir_name).bold(),
-        style(template).cyan()
-    );
-    if let Some(ref d) = config.dependencies {
-        if !d.is_empty() {
-            println!(
-                "  {} {} dependencies pre-configured",
-                style("→").dim(),
-                d.len()
-            );
-        }
-    }
-    println!();
-    println!("  Run {} to start developing", style("ym dev").cyan());
+    write_gitignore(dir)?;
 
     Ok(())
 }
 
-/// Write package.json + create directories/files
-fn write_project(dir: &Path, config: &YmConfig) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-
-    let config_path = dir.join(config::CONFIG_FILE);
-    config::save_config(&config_path, config)?;
-
-    let src_dir = dir.join("src").join("main").join("java");
-    std::fs::create_dir_all(&src_dir)?;
-    create_sample_main(&src_dir, config)?;
-
-    let resources_dir = dir.join("src").join("main").join("resources");
-    std::fs::create_dir_all(&resources_dir)?;
-
-    let test_dir = dir.join("src").join("test").join("java");
-    std::fs::create_dir_all(&test_dir)?;
-
-    // Create .gitignore
+fn write_gitignore(dir: &Path) -> Result<()> {
     let gitignore_path = dir.join(".gitignore");
     if !gitignore_path.exists() {
-        std::fs::write(&gitignore_path, ".ym/\nout/\n*.class\n.idea/\n*.iml\n")?;
+        std::fs::write(&gitignore_path, "out/\n.ym/\n.ym-sources.txt\n*.class\n")?;
     }
-
     Ok(())
 }
 
@@ -682,21 +702,6 @@ fn dir_name(dir: &Path) -> String {
         .to_string()
 }
 
-fn git_user_name() -> Option<String> {
-    std::process::Command::new("git")
-        .args(["config", "user.name"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .filter(|s| !s.is_empty())
-}
-
 fn to_class_name(name: &str) -> String {
     name.split(['-', '_'])
         .map(|part| {
@@ -709,21 +714,9 @@ fn to_class_name(name: &str) -> String {
         .collect()
 }
 
-fn default_scripts() -> BTreeMap<String, String> {
-    let mut scripts = BTreeMap::new();
-    scripts.insert("dev".to_string(), "ymc dev".to_string());
-    scripts.insert("build".to_string(), "ymc build".to_string());
-    scripts.insert("test".to_string(), "ymc test".to_string());
-    scripts.insert("start".to_string(), "ymc run".to_string());
-    scripts.insert("docker:build".to_string(), "docker build -t $ARTIFACT .".to_string());
-    scripts.insert("docker:push".to_string(), "docker push $ARTIFACT".to_string());
-    scripts
-}
-
 fn create_sample_main(src_dir: &Path, config: &YmConfig) -> Result<()> {
     let main_class = config.main.as_deref().unwrap_or("Main");
 
-    // Determine package: from qualified main class name, or from config.package
     let (pkg, class_name) = if let Some(idx) = main_class.rfind('.') {
         (Some(&main_class[..idx]), &main_class[idx + 1..])
     } else {
@@ -751,7 +744,7 @@ fn create_sample_main(src_dir: &Path, config: &YmConfig) -> Result<()> {
     let content = format!(
         r#"{}public class {} {{
     public static void main(String[] args) {{
-        System.out.println("Hello World!");
+        System.out.println("Hello, World!");
     }}
 }}
 "#,
@@ -760,4 +753,49 @@ fn create_sample_main(src_dir: &Path, config: &YmConfig) -> Result<()> {
 
     std::fs::write(&main_file, content)?;
     Ok(())
+}
+
+/// Common dependency catalog for interactive selection
+const COMMON_DEPS: &[(&str, &str, &str, &str)] = &[
+    // (display_label, coordinate, version, scope)
+    ("Jackson (JSON)",                     "com.fasterxml.jackson.core:jackson-databind", "2.18.2", "compile"),
+    ("Lombok",                             "org.projectlombok:lombok",                    "1.18.36", "provided"),
+    ("SLF4J + Logback",                    "ch.qos.logback:logback-classic",              "1.5.16", "compile"),
+    ("Google Guava",                       "com.google.guava:guava",                      "33.4.0-jre", "compile"),
+    ("Apache Commons Lang",                "org.apache.commons:commons-lang3",            "3.17.0", "compile"),
+    ("JUnit Jupiter (test)",               "org.junit.jupiter:junit-jupiter",             "5.11.4", "test"),
+    ("Mockito (test)",                     "org.mockito:mockito-core",                    "5.14.2", "test"),
+    ("AssertJ (test)",                     "org.assertj:assertj-core",                    "3.27.3", "test"),
+];
+
+/// Interactive dependency selection via checkbox
+fn select_optional_deps(template: &str) -> Result<BTreeMap<String, DependencyValue>> {
+    // Skip for spring-boot (already has its own deps) and lib (already has test deps)
+    if template == "spring-boot" || template == "lib" {
+        return Ok(BTreeMap::new());
+    }
+
+    println!();
+    let labels: Vec<&str> = COMMON_DEPS.iter().map(|(l, _, _, _)| *l).collect();
+    let selections = MultiSelect::new()
+        .with_prompt("Add dependencies (space to select, enter to confirm)")
+        .items(&labels)
+        .interact()?;
+
+    let mut deps = BTreeMap::new();
+    for idx in selections {
+        let (_, coord, version, scope) = COMMON_DEPS[idx];
+        let value = if scope == "compile" {
+            DependencyValue::Simple(version.to_string())
+        } else {
+            DependencyValue::Detailed(crate::config::schema::DependencySpec {
+                version: Some(version.to_string()),
+                scope: Some(scope.to_string()),
+                ..Default::default()
+            })
+        };
+        deps.insert(coord.to_string(), value);
+    }
+
+    Ok(deps)
 }

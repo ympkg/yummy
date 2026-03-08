@@ -132,11 +132,14 @@ pub fn find_agent_jar() -> Option<PathBuf> {
 
 /// Build JVM arguments for launching with the agent.
 pub fn agent_jvm_args(agent_jar: &Path, port: u16) -> Vec<String> {
-    vec![format!(
-        "-javaagent:{}=port={}",
-        agent_jar.to_string_lossy(),
-        port
-    )]
+    vec![
+        format!(
+            "-javaagent:{}=port={}",
+            agent_jar.to_string_lossy(),
+            port
+        ),
+        format!("-Dym.agent.port={}", port),
+    ]
 }
 
 /// Find a free TCP port for agent communication.

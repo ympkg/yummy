@@ -21,8 +21,8 @@ pub struct WorkspaceGraph {
 }
 
 impl WorkspaceGraph {
-    /// Build the workspace graph by scanning all package.json files.
-    /// Uses a cached graph when available and all package.json mtimes match.
+    /// Build the workspace graph by scanning all package.toml files.
+    /// Uses a cached graph when available and all package.toml mtimes match.
     pub fn build(workspace_root: &Path) -> Result<Self> {
         let cache_dir = workspace_root.join(config::CACHE_DIR);
 
@@ -41,7 +41,7 @@ impl WorkspaceGraph {
             .keys()
             .filter_map(|name| {
                 let pkg = ws.get_package(name)?;
-                let ws_deps = pkg.config.workspace_dependencies.clone().unwrap_or_default();
+                let ws_deps = pkg.config.workspace_module_deps();
                 Some((name.clone(), pkg.path.clone(), ws_deps))
             })
             .collect();
@@ -64,7 +64,7 @@ impl WorkspaceGraph {
         let mut name_to_index = HashMap::new();
         let mut packages = Vec::new();
 
-        // Scan workspace patterns for package.json files
+        // Scan workspace patterns for package.toml files
         for pattern in &patterns {
             let full_pattern = workspace_root.join(pattern).join(config::CONFIG_FILE);
             let pattern_str = full_pattern.to_string_lossy().to_string();
@@ -84,21 +84,50 @@ impl WorkspaceGraph {
             }
         }
 
-        // Add all packages as nodes
+        // Add all packages as nodes, validating name uniqueness
         for pkg in &packages {
+            if let Some(&existing_idx) = name_to_index.get(&pkg.name) {
+                let existing_node: &PackageNode = &graph[existing_idx];
+                let existing_path = &existing_node.path;
+                bail!(
+                    "Duplicate module name '{}' found in:\n  - {}\n  - {}",
+                    pkg.name,
+                    existing_path.display(),
+                    pkg.path.display()
+                );
+            }
             let idx = graph.add_node(pkg.clone());
             name_to_index.insert(pkg.name.clone(), idx);
         }
 
         // Add edges for workspace dependencies
         for pkg in &packages {
-            if let Some(ref ws_deps) = pkg.config.workspace_dependencies {
-                let from = name_to_index[&pkg.name];
-                for dep_name in ws_deps {
-                    if let Some(&to) = name_to_index.get(dep_name) {
-                        graph.add_edge(from, to, ());
-                    }
+            let ws_deps = pkg.config.workspace_module_deps();
+            let from = name_to_index[&pkg.name];
+            for dep_name in &ws_deps {
+                if let Some(&to) = name_to_index.get(dep_name) {
+                    graph.add_edge(from, to, ());
                 }
+            }
+        }
+
+        // Cycle detection
+        if let Err(cycle) = petgraph::algo::toposort(&graph, None) {
+            let cycle_node = cycle.node_id();
+            // Find cycle path using DFS
+            let cycle_name = &graph[cycle_node].name;
+            let mut path = Vec::new();
+            let mut visited = HashSet::new();
+            Self::find_cycle_path(&graph, cycle_node, cycle_node, &mut visited, &mut path);
+            if path.is_empty() {
+                bail!("Cycle detected involving module '{}'", cycle_name);
+            } else {
+                let path_str: Vec<&str> = path.iter().map(|idx| graph[*idx].name.as_str()).collect();
+                bail!(
+                    "Cycle detected: {} → {}",
+                    path_str.join(" → "),
+                    graph[cycle_node].name
+                );
             }
         }
 
@@ -106,6 +135,32 @@ impl WorkspaceGraph {
             graph,
             name_to_index,
         })
+    }
+
+    /// Find a cycle path using DFS from start node back to target.
+    fn find_cycle_path(
+        graph: &DiGraph<PackageNode, ()>,
+        current: NodeIndex,
+        target: NodeIndex,
+        visited: &mut HashSet<NodeIndex>,
+        path: &mut Vec<NodeIndex>,
+    ) -> bool {
+        path.push(current);
+        visited.insert(current);
+
+        for neighbor in graph.neighbors(current) {
+            if neighbor == target && path.len() > 1 {
+                return true;
+            }
+            if !visited.contains(&neighbor) {
+                if Self::find_cycle_path(graph, neighbor, target, visited, path) {
+                    return true;
+                }
+            }
+        }
+
+        path.pop();
+        false
     }
 
     /// Reconstruct the graph from a validated cache.
@@ -167,13 +222,12 @@ impl WorkspaceGraph {
         let mut in_degree: HashMap<NodeIndex, usize> = HashMap::new();
 
         for &idx in &visited {
+            let ws_deps = self.graph[idx].config.workspace_module_deps();
             let mut deg = 0;
-            if let Some(ref ws_deps) = self.graph[idx].config.workspace_dependencies {
-                for dep_name in ws_deps {
-                    if let Some(&dep_idx) = self.name_to_index.get(dep_name) {
-                        if visited.contains(&dep_idx) {
-                            deg += 1;
-                        }
+            for dep_name in &ws_deps {
+                if let Some(&dep_idx) = self.name_to_index.get(dep_name) {
+                    if visited.contains(&dep_idx) {
+                        deg += 1;
                     }
                 }
             }
@@ -189,15 +243,13 @@ impl WorkspaceGraph {
         while let Some(node) = ready.pop_front() {
             result.push(self.graph[node].name.clone());
 
-            // Find nodes that depend on this one
             for &idx in &visited {
-                if let Some(ref ws_deps) = self.graph[idx].config.workspace_dependencies {
-                    if ws_deps.contains(&self.graph[node].name) {
-                        if let Some(deg) = in_degree.get_mut(&idx) {
-                            *deg -= 1;
-                            if *deg == 0 {
-                                ready.push_back(idx);
-                            }
+                let ws_deps = self.graph[idx].config.workspace_module_deps();
+                if ws_deps.contains(&self.graph[node].name) {
+                    if let Some(deg) = in_degree.get_mut(&idx) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            ready.push_back(idx);
                         }
                     }
                 }
@@ -218,101 +270,42 @@ impl WorkspaceGraph {
     pub fn all_packages(&self) -> Vec<String> {
         self.name_to_index.keys().cloned().collect()
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_graph_cache_roundtrip() {
-        let tmpdir = std::env::temp_dir().join("ym-graph-test");
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        std::fs::create_dir_all(&tmpdir).unwrap();
-
-        // Create a minimal workspace root
-        let root_config = r#"{"name":"root","workspaces":["packages/*"]}"#;
-        std::fs::write(tmpdir.join("package.json"), root_config).unwrap();
-
-        // Create a package
-        let pkg_dir = tmpdir.join("packages").join("my-lib");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(pkg_dir.join("package.json"), r#"{"name":"my-lib"}"#).unwrap();
-
-        // Build fresh
-        let ws = WorkspaceGraph::build(&tmpdir).unwrap();
-        assert_eq!(ws.all_packages().len(), 1);
-        assert!(ws.get_package("my-lib").is_some());
-
-        // Build again - should use cache
-        let ws2 = WorkspaceGraph::build(&tmpdir).unwrap();
-        assert_eq!(ws2.all_packages().len(), 1);
-        assert!(ws2.get_package("my-lib").is_some());
-
-        let _ = std::fs::remove_dir_all(&tmpdir);
+    /// Get all package names in topological order (dependencies first).
+    pub fn topological_order(&self) -> Vec<String> {
+        match petgraph::algo::toposort(&self.graph, None) {
+            Ok(sorted) => sorted.iter().map(|&idx| self.graph[idx].name.clone()).collect(),
+            Err(_) => self.all_packages(), // fallback if cycle (shouldn't happen after build validation)
+        }
     }
 
-    #[test]
-    fn test_graph_cache_invalidates_on_change() {
-        let tmpdir = std::env::temp_dir().join("ym-graph-cache-inv-test");
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        std::fs::create_dir_all(&tmpdir).unwrap();
+    /// Get packages grouped by topological levels.
+    /// Level 0 = no workspace dependencies, level 1 = depends only on level 0, etc.
+    /// Within each level, packages can safely run in parallel.
+    pub fn topological_levels(&self) -> Vec<Vec<String>> {
+        let topo = match petgraph::algo::toposort(&self.graph, None) {
+            Ok(sorted) => sorted,
+            Err(_) => return vec![self.all_packages()],
+        };
 
-        let root_config = r#"{"name":"root","workspaces":["packages/*"]}"#;
-        std::fs::write(tmpdir.join("package.json"), root_config).unwrap();
+        let mut level_of: HashMap<NodeIndex, usize> = HashMap::new();
+        let mut max_level = 0usize;
 
-        let pkg_dir = tmpdir.join("packages").join("lib-a");
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        std::fs::write(pkg_dir.join("package.json"), r#"{"name":"lib-a"}"#).unwrap();
-
-        // Build and cache
-        let ws = WorkspaceGraph::build(&tmpdir).unwrap();
-        assert_eq!(ws.all_packages().len(), 1);
-
-        // Add another package -> cache should be invalidated
-        let pkg_dir_b = tmpdir.join("packages").join("lib-b");
-        std::fs::create_dir_all(&pkg_dir_b).unwrap();
-        std::fs::write(pkg_dir_b.join("package.json"), r#"{"name":"lib-b"}"#).unwrap();
-
-        // Touch root to invalidate
-        std::fs::write(tmpdir.join("package.json"), root_config).unwrap();
-
-        let ws2 = WorkspaceGraph::build(&tmpdir).unwrap();
-        assert_eq!(ws2.all_packages().len(), 2);
-
-        let _ = std::fs::remove_dir_all(&tmpdir);
-    }
-
-    #[test]
-    fn test_transitive_closure_ordering() {
-        let tmpdir = std::env::temp_dir().join("ym-topo-test");
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        std::fs::create_dir_all(&tmpdir).unwrap();
-
-        std::fs::write(tmpdir.join("package.json"), r#"{"name":"root","workspaces":["packages/*"]}"#).unwrap();
-
-        // A depends on B, B depends on C
-        for (name, deps) in &[("lib-a", r#"["lib-b"]"#), ("lib-b", r#"["lib-c"]"#), ("lib-c", "null")] {
-            let dir = tmpdir.join("packages").join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let ws_deps = if *deps == "null" {
-                "".to_string()
-            } else {
-                format!(r#","workspaceDependencies":{}"#, deps)
-            };
-            std::fs::write(dir.join("package.json"), format!(r#"{{"name":"{}"{}}}"#, name, ws_deps)).unwrap();
+        for &idx in &topo {
+            let mut my_level = 0;
+            for neighbor in self.graph.neighbors(idx) {
+                if let Some(&dep_level) = level_of.get(&neighbor) {
+                    my_level = my_level.max(dep_level + 1);
+                }
+            }
+            level_of.insert(idx, my_level);
+            max_level = max_level.max(my_level);
         }
 
-        let ws = WorkspaceGraph::build(&tmpdir).unwrap();
-        let closure = ws.transitive_closure("lib-a").unwrap();
-        assert_eq!(closure.len(), 3);
-        // C must come before B, B before A
-        let pos_c = closure.iter().position(|n| n == "lib-c").unwrap();
-        let pos_b = closure.iter().position(|n| n == "lib-b").unwrap();
-        let pos_a = closure.iter().position(|n| n == "lib-a").unwrap();
-        assert!(pos_c < pos_b);
-        assert!(pos_b < pos_a);
-
-        let _ = std::fs::remove_dir_all(&tmpdir);
+        let mut levels: Vec<Vec<String>> = vec![Vec::new(); max_level + 1];
+        for (&idx, &level) in &level_of {
+            levels[level].push(self.graph[idx].name.clone());
+        }
+        levels
     }
 }

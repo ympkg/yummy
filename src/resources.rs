@@ -2,8 +2,22 @@ use anyhow::Result;
 use std::path::Path;
 
 /// Copy resource files (non-.java) from source directories to output directory.
-/// This includes .properties, .xml, .yml, .yaml, .json, .txt, .fxml, etc.
-pub fn copy_resources(src_dir: &Path, output_dir: &Path) -> Result<usize> {
+/// If `custom_extensions` is provided, uses that list instead of the default.
+/// Extensions can be with or without leading dot (e.g., ".xml" or "xml").
+pub fn copy_resources_with_extensions(
+    src_dir: &Path,
+    output_dir: &Path,
+    custom_extensions: Option<&[String]>,
+) -> Result<usize> {
+    copy_resources_inner(src_dir, output_dir, custom_extensions)
+}
+
+
+fn copy_resources_inner(
+    src_dir: &Path,
+    output_dir: &Path,
+    custom_extensions: Option<&[String]>,
+) -> Result<usize> {
     if !src_dir.exists() {
         return Ok(0);
     }
@@ -24,7 +38,17 @@ pub fn copy_resources(src_dir: &Path, output_dir: &Path) -> Result<usize> {
         }
 
         // Check if this is a resource file we should copy
-        if !is_resource_file(path) {
+        let is_resource = match custom_extensions {
+            Some(exts) => {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                exts.iter().any(|e| {
+                    let e = e.strip_prefix('.').unwrap_or(e);
+                    e == ext
+                })
+            }
+            None => is_resource_file(path),
+        };
+        if !is_resource {
             continue;
         }
 

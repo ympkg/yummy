@@ -19,17 +19,26 @@ pub fn execute(fix: bool) -> Result<()> {
     // Check JAVA_HOME
     check_java_home();
 
+    // Check JDK version matches target
+    check_jdk_version_match(fix);
+
     // Check jar
     ok &= check_command("jar", &["--version"], "JAR tool");
 
     // Check git
     check_command("git", &["--version"], "Git");
 
-    // Check package.json
+    // Check package.toml
     check_config();
 
     // Check Maven cache
     check_maven_cache();
+
+    // Check JAR integrity (SHA-256)
+    ok &= check_jar_integrity(fix);
+
+    // Check permissions
+    check_permissions(fix);
 
     // Check project structure
     check_project_structure(fix);
@@ -95,7 +104,7 @@ fn check_project_structure(fix: bool) {
     let gitignore = project.join(".gitignore");
     if !gitignore.exists() {
         if fix {
-            let _ = std::fs::write(&gitignore, ".ym/\nout/\n*.class\n.idea/\n*.iml\n");
+            let _ = std::fs::write(&gitignore, "out/\n.ym/\n.ym-sources.txt\n*.class\n");
             println!(
                 "  {} Created .gitignore",
                 style("✓").green()
@@ -190,21 +199,120 @@ fn check_java_home() {
     }
 }
 
+fn check_jdk_version_match(fix: bool) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config_path = crate::config::find_config(&cwd);
+    let target = config_path
+        .and_then(|p| crate::config::load_config(&p).ok())
+        .and_then(|cfg| cfg.target.clone());
+
+    if let Some(ref target) = target {
+        // Get current java version
+        let output = Command::new("java").arg("-version").output();
+        if let Ok(out) = output {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // Parse version from output like: openjdk version "21.0.1" or java version "1.8.0_xxx"
+            let detected = stderr.lines().next().and_then(|line| {
+                let start = line.find('"')?;
+                let end = line[start + 1..].find('"')?;
+                let ver = &line[start + 1..start + 1 + end];
+                // Extract major version: "21.0.1" → "21", "1.8.0_xxx" → "8"
+                if ver.starts_with("1.") {
+                    ver.split('.').nth(1).map(|s| s.to_string())
+                } else {
+                    ver.split('.').next().map(|s| s.to_string())
+                }
+            });
+
+            if let Some(ref major) = detected {
+                if major == target {
+                    println!(
+                        "  {} JDK version  {} (matches target {})",
+                        style("✓").green(),
+                        style(major).dim(),
+                        target
+                    );
+                } else if fix {
+                    println!(
+                        "  {} JDK version {} does not match target {}, downloading...",
+                        style("→").blue(),
+                        major,
+                        target
+                    );
+                    match crate::jvm::ensure_jdk(target, None, true) {
+                        Ok(path) => {
+                            println!(
+                                "  {} Downloaded JDK {} to {}",
+                                style("✓").green(),
+                                target,
+                                style(path.display()).dim()
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "  {} Failed to download JDK {}: {}",
+                                style("✗").red(),
+                                target,
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    println!(
+                        "  {} JDK version {} does not match target {} (run --fix to download)",
+                        style("!").yellow(),
+                        major,
+                        target
+                    );
+                }
+            }
+        } else if fix {
+            // No java found at all, try to download
+            println!(
+                "  {} No Java found, downloading JDK {}...",
+                style("→").blue(),
+                target
+            );
+            match crate::jvm::ensure_jdk(target, None, true) {
+                Ok(path) => {
+                    println!(
+                        "  {} Downloaded JDK {} to {}",
+                        style("✓").green(),
+                        target,
+                        style(path.display()).dim()
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "  {} Failed to download JDK {}: {}",
+                        style("✗").red(),
+                        target,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn check_config() {
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Some(path) = crate::config::find_config(&cwd) {
         match crate::config::load_config(&path) {
             Ok(cfg) => {
+                let project = crate::config::project_dir(&path);
                 println!(
-                    "  {} package.json  {} ({})",
+                    "  {} package.toml  {} ({})",
                     style("✓").green(),
                     style(&cfg.name).dim(),
                     style(path.display()).dim()
                 );
+                // Schema validation
+                validate_config_schema(&cfg, &project);
             }
             Err(e) => {
                 println!(
-                    "  {} package.json  {} ({})",
+                    "  {} package.toml  {} ({})",
                     style("✗").red(),
                     style("parse error").red(),
                     style(e).dim()
@@ -213,10 +321,103 @@ fn check_config() {
         }
     } else {
         println!(
-            "  {} package.json  {}",
+            "  {} package.toml  {}",
             style("-").dim(),
             style("not found in current directory tree").dim()
         );
+    }
+}
+
+fn validate_config_schema(cfg: &crate::config::schema::YmConfig, project: &std::path::Path) {
+    // Build workspace graph if this is a workspace root (for module existence checks)
+    let ws = if cfg.workspaces.is_some() {
+        crate::workspace::graph::WorkspaceGraph::build(project).ok()
+    } else {
+        None
+    };
+    let ws_packages: std::collections::HashSet<String> = ws
+        .as_ref()
+        .map(|w| w.all_packages().into_iter().collect())
+        .unwrap_or_default();
+
+    // Load root config for { workspace = true } Maven dep validation
+    let root_cfg = crate::config::find_workspace_root(project)
+        .and_then(|root| {
+            if root != project {
+                crate::config::load_config(&root.join(crate::config::CONFIG_FILE)).ok()
+            } else {
+                None
+            }
+        });
+
+    // Validate dependency coordinate format
+    if let Some(ref deps) = cfg.dependencies {
+        for (key, value) in deps {
+            if key.contains(':') {
+                // Maven coordinate: should be groupId:artifactId
+                let parts: Vec<&str> = key.split(':').collect();
+                if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                    println!(
+                        "  {} Invalid coordinate format: '{}' (expected groupId:artifactId)",
+                        style("!").yellow(),
+                        key
+                    );
+                }
+                // Validate scope value
+                let scope = value.scope();
+                if !["compile", "runtime", "provided", "test"].contains(&scope) {
+                    println!(
+                        "  {} Invalid scope '{}' for dependency '{}'",
+                        style("!").yellow(),
+                        scope,
+                        key
+                    );
+                }
+                // Validate { workspace = true } references root version
+                if value.is_workspace() {
+                    if let Some(ref root) = root_cfg {
+                        let found = root.dependencies.as_ref()
+                            .and_then(|d| d.get(key))
+                            .and_then(|v| v.version())
+                            .is_some();
+                        if !found {
+                            println!(
+                                "  {} Dependency '{}' uses {{workspace = true}} but root has no version for it",
+                                style("!").yellow(),
+                                key
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Module reference: must have workspace = true
+                if !value.is_workspace() {
+                    println!(
+                        "  {} Dependency '{}' has no colon but no workspace = true",
+                        style("!").yellow(),
+                        key
+                    );
+                } else if !ws_packages.is_empty() && !ws_packages.contains(key) {
+                    // Check if referenced module exists in workspace
+                    println!(
+                        "  {} Module dependency '{}' not found in workspace",
+                        style("!").yellow(),
+                        key
+                    );
+                }
+            }
+        }
+    }
+
+    // Validate target value
+    if let Some(ref target) = cfg.target {
+        if target.parse::<u32>().is_err() {
+            println!(
+                "  {} target '{}' is not a valid Java version number",
+                style("!").yellow(),
+                target
+            );
+        }
     }
 }
 
@@ -225,10 +426,12 @@ fn check_maven_cache() {
     let cache = crate::config::maven_cache_dir(&cwd);
     if cache.exists() {
         let size = dir_size(&cache);
+        let jar_count = count_files_with_ext(&cache, "jar");
         println!(
-            "  {} Maven cache  {}",
+            "  {} Maven cache  {} ({} JARs)",
             style("✓").green(),
-            style(format_size(size)).dim()
+            style(format_size(size)).dim(),
+            jar_count
         );
     } else {
         println!(
@@ -236,6 +439,171 @@ fn check_maven_cache() {
             style("-").dim(),
             style("empty").dim()
         );
+    }
+}
+
+fn check_jar_integrity(fix: bool) -> bool {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let resolved = match crate::config::load_resolved_cache(&cwd) {
+        Ok(r) => r,
+        Err(_) => return true, // No resolved.json, nothing to check
+    };
+
+    if resolved.dependencies.is_empty() {
+        return true;
+    }
+
+    let cache = crate::config::maven_cache_dir(&cwd);
+    let mut all_ok = true;
+    let mut missing = 0;
+    let mut corrupt = 0;
+
+    for (key, entry) in &resolved.dependencies {
+        let parts: Vec<&str> = key.split(':').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let jar_path = cache
+            .join(parts[0])
+            .join(parts[1])
+            .join(parts[2])
+            .join(format!("{}-{}.jar", parts[1], parts[2]));
+
+        if !jar_path.exists() {
+            missing += 1;
+            all_ok = false;
+            continue;
+        }
+
+        if let Some(ref expected_sha) = entry.sha256 {
+            if let Ok(data) = std::fs::read(&jar_path) {
+                let actual = crate::compiler::incremental::hash_bytes(&data);
+                if &actual != expected_sha {
+                    corrupt += 1;
+                    all_ok = false;
+                }
+            }
+        }
+    }
+
+    if all_ok {
+        println!(
+            "  {} Dependency integrity  {} deps verified",
+            style("✓").green(),
+            resolved.dependencies.len()
+        );
+    } else {
+        if fix {
+            // Delete corrupt/missing JARs and clear resolved cache so next build re-downloads
+            let resolved_path = cwd.join(".ym").join("resolved.json");
+            let _ = std::fs::remove_file(&resolved_path);
+            println!(
+                "  {} Cleared resolved cache ({} missing, {} corrupt). Next build will re-download.",
+                style("✓").green(),
+                missing,
+                corrupt
+            );
+        } else {
+            println!(
+                "  {} Dependency integrity  {} missing, {} corrupt (run --fix to re-download)",
+                style("!").yellow(),
+                missing,
+                corrupt
+            );
+        }
+    }
+
+    all_ok
+}
+
+fn count_files_with_ext(dir: &std::path::Path, ext: &str) -> usize {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(ext))
+        .count()
+}
+
+fn check_permissions(fix: bool) {
+    // Check ~/.ym/credentials.json permissions (should be 0o600)
+    let home = std::env::var("HOME").unwrap_or_default();
+    let creds_path = std::path::PathBuf::from(&home).join(".ym").join("credentials.json");
+    if creds_path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&creds_path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o600 {
+                    if fix {
+                        let _ = std::fs::set_permissions(
+                            &creds_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                        println!(
+                            "  {} Fixed credentials.json permissions (was {:o}, now 600)",
+                            style("✓").green(),
+                            mode
+                        );
+                    } else {
+                        println!(
+                            "  {} credentials.json permissions {:o} (should be 600, run --fix)",
+                            style("!").yellow(),
+                            mode
+                        );
+                    }
+                } else {
+                    println!(
+                        "  {} credentials.json permissions",
+                        style("✓").green()
+                    );
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!(
+                "  {} credentials.json exists",
+                style("✓").green()
+            );
+        }
+    }
+
+    // Check .ym/ directory permissions
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let ym_dir = cwd.join(".ym");
+    if ym_dir.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&ym_dir) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode != 0o755 {
+                    if fix {
+                        let _ = std::fs::set_permissions(
+                            &ym_dir,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                        println!(
+                            "  {} Fixed .ym/ directory permissions (was {:o}, now 755)",
+                            style("✓").green(),
+                            mode
+                        );
+                    } else {
+                        println!(
+                            "  {} .ym/ directory permissions {:o} (should be 755, run --fix)",
+                            style("!").yellow(),
+                            mode
+                        );
+                    }
+                } else {
+                    println!(
+                        "  {} .ym/ directory permissions",
+                        style("✓").green()
+                    );
+                }
+            }
+        }
     }
 }
 

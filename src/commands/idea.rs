@@ -12,21 +12,23 @@ pub fn execute(target: Option<String>, download_sources: bool) -> Result<()> {
     let java_version = cfg.target.as_deref().unwrap_or("21");
 
     if cfg.workspaces.is_some() {
-        // Workspace mode: generate for target and its dependencies
-        let target = target.as_deref().unwrap_or_else(|| {
-            eprintln!("  In workspace mode, specify a target: ym idea <module>");
-            std::process::exit(1);
-        });
-
         let ws = WorkspaceGraph::build(&project)?;
-        let packages = ws.transitive_closure(target)?;
+
+        let packages = if let Some(ref target) = target {
+            // Generate for target and its dependencies
+            ws.transitive_closure(target)?
+        } else {
+            // No target: generate for ALL modules
+            let mut all = ws.all_packages();
+            all.sort();
+            all
+        };
 
         generate_idea_project(&project, &packages, &ws, java_version, download_sources)?;
 
         println!(
-            "  {} Generated IDEA project for {} ({} modules)",
+            "  {} Generated IDEA project ({} modules)",
             style("✓").green(),
-            style(target).bold(),
             packages.len()
         );
     } else {
@@ -83,7 +85,7 @@ fn generate_idea_project(
         all_jars.extend(jars.clone());
 
         // Build module dependencies
-        let ws_deps = pkg.config.workspace_dependencies.as_ref().cloned().unwrap_or_default();
+        let ws_deps = pkg.config.workspace_module_deps();
 
         let mut dep_entries = String::new();
         for dep in &ws_deps {
@@ -93,12 +95,13 @@ fn generate_idea_project(
             ));
         }
 
-        // Add library dependencies
+        // Add library dependencies with scope mapping
         for jar in &jars {
             let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
+            let scope_attr = jar_to_idea_scope(jar, &pkg.config);
             dep_entries.push_str(&format!(
-                "    <orderEntry type=\"library\" name=\"{}\" level=\"project\" />\n",
-                jar_name
+                "    <orderEntry type=\"library\" name=\"{}\" level=\"project\"{} />\n",
+                jar_name, scope_attr
             ));
         }
 
@@ -151,6 +154,9 @@ fn generate_idea_project(
         )?;
     }
 
+    // compiler.xml — annotation processor config
+    generate_compiler_xml(&idea_dir, packages, ws)?;
+
     // modules.xml
     let modules_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -198,9 +204,10 @@ fn generate_single_project_idea(
     for jar in &jars {
         let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
         let jar_abs = to_idea_path(&jar.to_string_lossy());
+        let scope_attr = jar_to_idea_scope(jar, cfg);
         dep_entries.push_str(&format!(
-            "    <orderEntry type=\"library\" name=\"{}\" level=\"project\" />\n",
-            jar_name
+            "    <orderEntry type=\"library\" name=\"{}\" level=\"project\"{} />\n",
+            jar_name, scope_attr
         ));
 
         let sources_section = make_sources_section(jar, download_sources);
@@ -241,6 +248,9 @@ fn generate_single_project_idea(
         project.join(format!("{}.iml", cfg.name)),
         iml,
     )?;
+
+    // compiler.xml — annotation processor config
+    generate_compiler_xml_single(&idea_dir, project, cfg)?;
 
     let modules_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -284,6 +294,9 @@ fn make_sources_section(jar: &std::path::Path, download_sources: bool) -> String
                         group_id: group.to_string(),
                         artifact_id: artifact.to_string(),
                         version: version.to_string(),
+                        classifier: None,
+                        exclusions: Vec::new(),
+                        scope: None,
                     };
                     let url = format!(
                         "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}-sources.jar",
@@ -295,7 +308,7 @@ fn make_sources_section(jar: &std::path::Path, download_sources: bool) -> String
                     );
                     let _ = coord; // just used for context
                     if let Ok(client) = reqwest::blocking::Client::builder()
-                        .user_agent("ym/0.1.0")
+                        .user_agent(concat!("ym/", env!("CARGO_PKG_VERSION")))
                         .timeout(std::time::Duration::from_secs(15))
                         .build()
                     {
@@ -321,6 +334,140 @@ fn make_sources_section(jar: &std::path::Path, download_sources: bool) -> String
     } else {
         String::new()
     }
+}
+
+/// Generate `.idea/compiler.xml` with annotation processor config for workspace mode.
+fn generate_compiler_xml(
+    idea_dir: &Path,
+    packages: &[String],
+    ws: &WorkspaceGraph,
+) -> Result<()> {
+    let mut ap_entries = Vec::new();
+
+    for pkg_name in packages {
+        let pkg = ws.get_package(pkg_name).unwrap();
+        let jars = super::build::resolve_deps(&pkg.path, &pkg.config)?;
+        let ap_jars = collect_annotation_processor_jars(&pkg.config, &jars);
+        if !ap_jars.is_empty() {
+            ap_entries.push((pkg_name.clone(), ap_jars));
+        }
+    }
+
+    if ap_entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut profiles = String::new();
+    for (module_name, jars) in &ap_entries {
+        let mut processor_path = String::new();
+        for jar in jars {
+            let jar_abs = to_idea_path(&jar.to_string_lossy());
+            processor_path.push_str(&format!(
+                "        <entry name=\"{}\" />\n",
+                jar_abs
+            ));
+        }
+        profiles.push_str(&format!(
+            r#"    <profile name="{module_name}" enabled="true">
+      <processorPath useClasspath="false">
+{processor_path}      </processorPath>
+      <module name="{module_name}" />
+    </profile>
+"#
+        ));
+    }
+
+    let compiler_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+{profiles}    </annotationProcessing>
+  </component>
+</project>
+"#
+    );
+    std::fs::write(idea_dir.join("compiler.xml"), compiler_xml)?;
+    Ok(())
+}
+
+/// Generate `.idea/compiler.xml` with annotation processor config for single project mode.
+fn generate_compiler_xml_single(
+    idea_dir: &Path,
+    project: &Path,
+    cfg: &config::schema::YmConfig,
+) -> Result<()> {
+    let jars = super::build::resolve_deps(project, cfg)?;
+    let ap_jars = collect_annotation_processor_jars(cfg, &jars);
+
+    if ap_jars.is_empty() {
+        return Ok(());
+    }
+
+    let mut processor_path = String::new();
+    for jar in &ap_jars {
+        let jar_abs = to_idea_path(&jar.to_string_lossy());
+        processor_path.push_str(&format!(
+            "        <entry name=\"{}\" />\n",
+            jar_abs
+        ));
+    }
+
+    let compiler_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+    <profile name="Default" enabled="true">
+      <processorPath useClasspath="false">
+{processor_path}      </processorPath>
+    </profile>
+    </annotationProcessing>
+  </component>
+</project>
+"#
+    );
+    std::fs::write(idea_dir.join("compiler.xml"), compiler_xml)?;
+    Ok(())
+}
+
+/// Collect annotation processor JARs from config and classpath.
+/// Uses explicit `compiler.annotationProcessors` if set, otherwise auto-discovers.
+fn collect_annotation_processor_jars(
+    cfg: &config::schema::YmConfig,
+    classpath: &[PathBuf],
+) -> Vec<PathBuf> {
+    if let Some(coords) = cfg.compiler.as_ref().and_then(|c| c.annotation_processors.as_ref()) {
+        if !coords.is_empty() {
+            let deps = cfg.maven_dependencies();
+            let mut jars = Vec::new();
+            for coord in coords {
+                if let Some(version) = deps.get(coord) {
+                    // Find JAR in classpath by matching artifact ID
+                    let artifact_id = coord.split(':').last().unwrap_or("");
+                    for jar in classpath {
+                        let stem = jar.file_stem().unwrap_or_default().to_string_lossy();
+                        if stem.starts_with(artifact_id) && stem.contains(version) {
+                            jars.push(jar.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            return jars;
+        }
+    }
+
+    // Auto-discover: check for META-INF/services/javax.annotation.processing.Processor
+    classpath
+        .iter()
+        .filter(|jar| {
+            jar.extension().and_then(|e| e.to_str()) == Some("jar")
+                && jar.exists()
+                && super::build::has_annotation_processor(jar)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Detect source/test/resource folders for IDEA project generation.
@@ -362,6 +509,33 @@ fn detect_source_folders(project: &Path) -> String {
     }
 
     folders
+}
+
+/// Map a JAR file to its IDEA scope attribute based on the dependency's scope in config.
+/// Returns empty string for COMPILE (default), or ` scope="RUNTIME"` etc.
+fn jar_to_idea_scope(jar: &Path, cfg: &config::schema::YmConfig) -> String {
+    // Extract artifactId from JAR filename to match against dependencies
+    let jar_stem = jar.file_stem().unwrap_or_default().to_string_lossy();
+
+    if let Some(ref deps) = cfg.dependencies {
+        for (key, value) in deps {
+            if !key.contains(':') {
+                continue;
+            }
+            let artifact_id = key.split(':').last().unwrap_or("");
+            // Check if JAR filename starts with the artifactId
+            if jar_stem.starts_with(artifact_id) {
+                let scope = value.scope();
+                return match scope {
+                    "runtime" => " scope=\"RUNTIME\"".to_string(),
+                    "provided" => " scope=\"PROVIDED\"".to_string(),
+                    "test" => " scope=\"TEST\"".to_string(),
+                    _ => String::new(), // compile = default, no attribute needed
+                };
+            }
+        }
+    }
+    String::new() // transitive deps default to COMPILE
 }
 
 fn pathdiff(base: &Path, target: &Path) -> String {

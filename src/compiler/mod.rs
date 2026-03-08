@@ -46,7 +46,7 @@ pub fn colorize_errors(raw: &str) -> String {
                 result.push_str(&format!(
                     "{}: {}{}\n",
                     style(location).dim(),
-                    style("warning:").yellow().bold(),
+                    style("warning:").yellow(),
                     message
                 ));
                 continue;

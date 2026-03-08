@@ -4,15 +4,15 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::config;
-use crate::config::schema::YmConfig;
+use crate::config::schema::{DependencySpec, DependencyValue, YmConfig};
 
 /// Standalone `ym migrate` command
-pub fn execute() -> Result<()> {
+pub fn execute(verify: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join(config::CONFIG_FILE);
 
     if config_path.exists() {
-        bail!("package.json already exists. Remove it first to re-migrate.");
+        bail!("package.toml already exists. Remove it first to re-migrate.");
     }
 
     let pom = cwd.join("pom.xml");
@@ -35,7 +35,11 @@ pub fn execute() -> Result<()> {
                 style("→").blue(),
                 modules.len()
             );
-            return migrate_gradle_multimodule(&cwd, settings_path, &modules);
+            migrate_gradle_multimodule(&cwd, settings_path, &modules)?;
+            if verify {
+                run_post_migration_verify()?;
+            }
+            return Ok(());
         }
     }
 
@@ -50,7 +54,11 @@ pub fn execute() -> Result<()> {
                 style("→").blue(),
                 modules.len()
             );
-            return migrate_maven_multimodule(&cwd, &pom, &modules);
+            migrate_maven_multimodule(&cwd, &pom, &modules)?;
+            if verify {
+                run_post_migration_verify()?;
+            }
+            return Ok(());
         }
     }
 
@@ -74,21 +82,54 @@ pub fn execute() -> Result<()> {
     config::save_config(&config_path, &cfg)?;
     print_migration_summary(&cfg);
 
+    if verify {
+        run_post_migration_verify()?;
+    }
+
     Ok(())
 }
 
+/// Run post-migration verification: resolve deps + build
+fn run_post_migration_verify() -> Result<()> {
+    println!();
+    println!(
+        "  {} Verifying migration...",
+        style("→").blue()
+    );
+
+    match super::build::execute(None, false) {
+        Ok(()) => {
+            println!(
+                "  {} Migration verified — build succeeded",
+                style("✓").green()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} Migration verification failed: {}",
+                style("✗").red(),
+                e
+            );
+            eprintln!(
+                "  {} package.toml was generated but may need manual adjustments",
+                style("!").yellow()
+            );
+            Ok(()) // Don't fail the convert command itself
+        }
+    }
+}
+
 fn print_migration_summary(cfg: &YmConfig) {
-    println!("  {} Created package.json", style("✓").green());
+    println!("  {} Created package.toml", style("✓").green());
 
     let dep_count = cfg.dependencies.as_ref().map(|d| d.len()).unwrap_or(0);
-    let dev_count = cfg.dev_dependencies.as_ref().map(|d| d.len()).unwrap_or(0);
 
-    if dep_count > 0 || dev_count > 0 {
+    if dep_count > 0 {
         println!(
-            "  {} Migrated {} dependencies, {} devDependencies",
+            "  {} Migrated {} dependencies",
             style("✓").green(),
-            dep_count,
-            dev_count
+            dep_count
         );
     }
 
@@ -201,7 +242,7 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
 
     let root_config_path = root.join(config::CONFIG_FILE);
     config::save_config(&root_config_path, &root_cfg)?;
-    println!("  {} Created root package.json", style("✓").green());
+    println!("  {} Created root package.toml", style("✓").green());
 
     // All module names for inter-module dependency detection
     let all_module_names: Vec<String> = modules
@@ -268,24 +309,155 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
 }
 
 /// Parse a Gradle build file, detecting inter-module (project) dependencies.
+/// Parse Gradle Version Catalog (gradle/libs.versions.toml).
+/// Returns a map of alias → (groupId:artifactId, version).
+fn parse_version_catalog(project_dir: &Path) -> BTreeMap<String, (String, String)> {
+    let catalog_path = project_dir.join("gradle").join("libs.versions.toml");
+    let mut result = BTreeMap::new();
+    let content = match std::fs::read_to_string(&catalog_path) {
+        Ok(c) => c,
+        Err(_) => return result,
+    };
+    let doc: toml::Value = match content.parse() {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+
+    // Collect [versions]
+    let mut versions: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(vers) = doc.get("versions").and_then(|v| v.as_table()) {
+        for (k, v) in vers {
+            if let Some(s) = v.as_str() {
+                versions.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    // Collect [libraries]
+    if let Some(libs) = doc.get("libraries").and_then(|v| v.as_table()) {
+        for (alias, val) in libs {
+            let (module, version) = match val {
+                toml::Value::String(s) => {
+                    // "group:artifact:version" shorthand
+                    let parts: Vec<&str> = s.splitn(3, ':').collect();
+                    if parts.len() == 3 {
+                        (format!("{}:{}", parts[0], parts[1]), parts[2].to_string())
+                    } else {
+                        continue;
+                    }
+                }
+                toml::Value::Table(t) => {
+                    let module = t.get("module").and_then(|m| m.as_str()).unwrap_or("");
+                    if module.is_empty() {
+                        // Try group + name format
+                        let g = t.get("group").and_then(|v| v.as_str()).unwrap_or("");
+                        let n = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if g.is_empty() || n.is_empty() { continue; }
+                        let module = format!("{}:{}", g, n);
+                        let ver = resolve_catalog_version(t, &versions);
+                        if ver.is_empty() { continue; }
+                        (module, ver)
+                    } else {
+                        let ver = resolve_catalog_version(t, &versions);
+                        if ver.is_empty() { continue; }
+                        (module.to_string(), ver)
+                    }
+                }
+                _ => continue,
+            };
+            // Normalize alias: spring-boot-starter-web → spring.boot.starter.web (for Gradle accessor matching)
+            result.insert(alias.clone(), (module, version));
+        }
+    }
+
+    result
+}
+
+/// Resolve version from a catalog library entry.
+fn resolve_catalog_version(table: &toml::value::Table, versions: &BTreeMap<String, String>) -> String {
+    // Direct version string
+    if let Some(v) = table.get("version") {
+        if let Some(s) = v.as_str() {
+            return s.to_string();
+        }
+        // version.ref = "key"
+        if let Some(t) = v.as_table() {
+            if let Some(ref_key) = t.get("ref").and_then(|r| r.as_str()) {
+                return versions.get(ref_key).cloned().unwrap_or_default();
+            }
+        }
+    }
+    // version.ref at top level (TOML flattened: "version.ref" = "key")
+    if let Some(vr) = table.get("version.ref").and_then(|v| v.as_str()) {
+        return versions.get(vr).cloned().unwrap_or_default();
+    }
+    String::new()
+}
+
 fn migrate_from_gradle_with_projects(
     gradle_path: &Path,
     all_module_names: &[String],
 ) -> Result<YmConfig> {
     let content = std::fs::read_to_string(gradle_path)?;
 
+    // Load Version Catalog if available
+    let project_dir = gradle_path.parent().unwrap_or(Path::new("."));
+    let catalog = parse_version_catalog(project_dir);
+
     let mut config = YmConfig::default();
-    let mut dependencies = BTreeMap::new();
-    let mut dev_dependencies = BTreeMap::new();
-    let mut workspace_deps = Vec::new();
+    let mut dependencies: BTreeMap<String, DependencyValue> = BTreeMap::new();
+
+    // Pre-scan for Spring Boot plugin version (used for BOM-managed dependencies)
+    let mut spring_boot_version: Option<String> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        // id 'org.springframework.boot' version '3.4.0'
+        // id("org.springframework.boot") version "3.4.0"
+        if line.contains("org.springframework.boot") && line.contains("version") {
+            if let Some(start) = line.rfind('\'').or_else(|| line.rfind('"')) {
+                let before = &line[..start];
+                if let Some(vstart) = before.rfind('\'').or_else(|| before.rfind('"')) {
+                    let ver = &line[vstart + 1..start];
+                    if !ver.is_empty() && ver.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                        spring_boot_version = Some(ver.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-scan settings.gradle for rootProject.name
+    let settings_path = project_dir.join("settings.gradle");
+    let settings_kts_path = project_dir.join("settings.gradle.kts");
+    let settings = if settings_kts_path.exists() {
+        std::fs::read_to_string(&settings_kts_path).ok()
+    } else if settings_path.exists() {
+        std::fs::read_to_string(&settings_path).ok()
+    } else {
+        None
+    };
+    if let Some(ref settings_content) = settings {
+        for line in settings_content.lines() {
+            let line = line.trim();
+            if line.starts_with("rootProject.name") {
+                if let Some(val) = extract_string_value(line) {
+                    config.name = val;
+                }
+            }
+        }
+    }
 
     for line in content.lines() {
         let line = line.trim();
 
         // Extract group/version
-        if line.starts_with("group") && line.contains('=') {
+        if line.starts_with("group") && !line.starts_with("groupId") && line.contains('=') {
             if let Some(val) = extract_string_value(line) {
-                config.name = val;
+                config.group_id = val.clone();
+                // Also set package if not already set
+                if config.package.is_none() {
+                    config.package = Some(val);
+                }
             }
         }
         if line.starts_with("version") && line.contains('=') {
@@ -301,16 +473,27 @@ fn migrate_from_gradle_with_projects(
             }
         }
 
+        // java toolchain: languageVersion = JavaLanguageVersion.of(21)
+        if line.contains("languageVersion") && line.contains("JavaLanguageVersion.of") {
+            if let Some(start) = line.find("JavaLanguageVersion.of(") {
+                let rest = &line[start + "JavaLanguageVersion.of(".len()..];
+                if let Some(end) = rest.find(')') {
+                    let ver = rest[..end].trim();
+                    if config.target.is_none() {
+                        config.target = Some(ver.to_string());
+                    }
+                }
+            }
+        }
+
         // Detect inter-module project dependencies
-        // implementation project(':module-name')
-        // implementation(project(":module-name"))
         if let Some(proj_dep) = parse_gradle_project_dependency(line) {
             let dep_name = proj_dep.trim_start_matches(':').replace(':', "-");
-            // Check this is actually a known module
             if all_module_names.iter().any(|n| *n == dep_name) {
-                if !workspace_deps.contains(&dep_name) {
-                    workspace_deps.push(dep_name);
-                }
+                dependencies.entry(dep_name).or_insert(DependencyValue::Detailed(DependencySpec {
+                    workspace: Some(true),
+                    ..Default::default()
+                }));
                 continue;
             }
         }
@@ -320,14 +503,58 @@ fn migrate_from_gradle_with_projects(
             .or_else(|| parse_gradle_dependency(line, "api"))
             .or_else(|| parse_gradle_dependency(line, "compile"))
         {
-            dependencies.insert(dep.0, dep.1);
+            let version = resolve_bom_version(&dep.0, &dep.1, &spring_boot_version);
+            dependencies.insert(dep.0, DependencyValue::Simple(version));
         }
         if let Some(dep) = parse_gradle_dependency(line, "testImplementation")
             .or_else(|| parse_gradle_dependency(line, "testCompile"))
         {
-            dev_dependencies.insert(dep.0, dep.1);
+            let version = resolve_bom_version(&dep.0, &dep.1, &spring_boot_version);
+            dependencies.insert(dep.0, DependencyValue::Detailed(DependencySpec {
+                version: Some(version),
+                scope: Some("test".to_string()),
+                ..Default::default()
+            }));
+        }
+        if let Some(dep) = parse_gradle_dependency(line, "compileOnly") {
+            let version = resolve_bom_version(&dep.0, &dep.1, &spring_boot_version);
+            dependencies.insert(dep.0, DependencyValue::Detailed(DependencySpec {
+                version: Some(version),
+                scope: Some("provided".to_string()),
+                ..Default::default()
+            }));
+        }
+        if let Some(dep) = parse_gradle_dependency(line, "runtimeOnly") {
+            let version = resolve_bom_version(&dep.0, &dep.1, &spring_boot_version);
+            dependencies.insert(dep.0, DependencyValue::Detailed(DependencySpec {
+                version: Some(version),
+                scope: Some("runtime".to_string()),
+                ..Default::default()
+            }));
+        }
+
+        // Version Catalog references: implementation(libs.spring.boot.starter.web)
+        if !catalog.is_empty() {
+            if let Some((scope, alias)) = parse_catalog_reference(line) {
+                // Normalize: libs.spring.boot.starter.web → spring-boot-starter-web
+                let normalized = alias.replace('.', "-");
+                if let Some((module, version)) = catalog.get(&normalized) {
+                    let dep_val = match scope {
+                        "compile" => DependencyValue::Simple(version.clone()),
+                        _ => DependencyValue::Detailed(DependencySpec {
+                            version: Some(version.clone()),
+                            scope: Some(scope.to_string()),
+                            ..Default::default()
+                        }),
+                    };
+                    dependencies.insert(module.clone(), dep_val);
+                }
+            }
         }
     }
+
+    // Detect common Gradle plugins and map to ym config
+    detect_gradle_plugins(&content, &mut config, &dependencies);
 
     if config.name.is_empty() {
         config.name = gradle_path
@@ -341,14 +568,93 @@ fn migrate_from_gradle_with_projects(
     if !dependencies.is_empty() {
         config.dependencies = Some(dependencies);
     }
-    if !dev_dependencies.is_empty() {
-        config.dev_dependencies = Some(dev_dependencies);
-    }
-    if !workspace_deps.is_empty() {
-        config.workspace_dependencies = Some(workspace_deps);
-    }
 
     Ok(config)
+}
+
+/// Detect common Gradle plugins and map to ym compiler/config settings.
+fn detect_gradle_plugins(
+    content: &str,
+    config: &mut YmConfig,
+    deps: &BTreeMap<String, DependencyValue>,
+) {
+    let mut hints: Vec<String> = Vec::new();
+
+    // Spring Boot plugin
+    if content.contains("org.springframework.boot") || content.contains("spring-boot") {
+        // Detect main class from SpringBootApplication
+        if config.main.is_none() {
+            if let Some(pkg) = config.package.as_ref() {
+                config.main = Some(format!("{}.Application", pkg));
+            }
+        }
+        hints.push("Spring Boot plugin detected".to_string());
+    }
+
+    // Annotation processing (Lombok, MapStruct, etc.)
+    let has_lombok = deps.keys().any(|k| k.contains("lombok"));
+    let has_mapstruct = deps.keys().any(|k| k.contains("mapstruct"));
+    if has_lombok || has_mapstruct {
+        let mut ap = Vec::new();
+        if has_lombok {
+            ap.push("org.projectlombok:lombok".to_string());
+        }
+        if has_mapstruct {
+            ap.push("org.mapstruct:mapstruct-processor".to_string());
+        }
+        let compiler = config.compiler.get_or_insert_with(Default::default);
+        compiler.annotation_processors = Some(ap.clone());
+        hints.push(format!("Annotation processors: {}", ap.join(", ")));
+    }
+
+    // Java compilation target from plugins { java { targetCompatibility } }
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with("targetCompatibility") {
+            if let Some(val) = extract_string_value(line) {
+                let ver = val.trim_start_matches("JavaVersion.VERSION_").to_string();
+                if config.target.is_none() {
+                    config.target = Some(ver);
+                }
+            }
+        }
+    }
+
+    // Print detected plugin hints
+    for hint in &hints {
+        println!("  {} {}", style("→").blue(), style(hint).dim());
+    }
+}
+
+/// Parse Version Catalog reference from a Gradle dependency line.
+/// Returns (scope, alias) where alias is the dotted accessor after "libs."
+/// Examples:
+///   implementation(libs.spring.boot.starter.web) → ("compile", "spring.boot.starter.web")
+///   testImplementation libs.junit.jupiter → ("test", "junit.jupiter")
+fn parse_catalog_reference(line: &str) -> Option<(&str, String)> {
+    let line = line.trim();
+    let scope_prefixes: &[(&str, &str)] = &[
+        ("implementation", "compile"),
+        ("api", "compile"),
+        ("compile", "compile"),
+        ("testImplementation", "test"),
+        ("testCompile", "test"),
+        ("compileOnly", "provided"),
+        ("runtimeOnly", "runtime"),
+    ];
+    for &(prefix, scope) in scope_prefixes {
+        if !line.starts_with(prefix) { continue; }
+        let rest = line[prefix.len()..].trim();
+        // Match: (libs.xxx) or libs.xxx
+        let inner = rest.trim_start_matches('(').trim_end_matches(')').trim();
+        if let Some(alias) = inner.strip_prefix("libs.") {
+            let alias = alias.trim_end_matches(')').trim();
+            if !alias.is_empty() && !alias.contains('\'') && !alias.contains('"') {
+                return Some((scope, alias.to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// Parse project(':module-name') from a Gradle dependency line.
@@ -399,7 +705,7 @@ fn migrate_maven_multimodule(root: &Path, root_pom: &Path, modules: &[String]) -
 
     let root_config_path = root.join(config::CONFIG_FILE);
     config::save_config(&root_config_path, &root_cfg)?;
-    println!("  {} Created root package.json", style("✓").green());
+    println!("  {} Created root package.toml", style("✓").green());
 
     // Collect all module artifact IDs for inter-module dep detection
     let mut module_artifacts: BTreeMap<String, String> = BTreeMap::new(); // artifactId -> module_path
@@ -433,8 +739,7 @@ fn migrate_maven_multimodule(root: &Path, root_pom: &Path, modules: &[String]) -
         let mut module_cfg = migrate_from_pom(&module_pom)?;
 
         // Detect inter-module dependencies: if a dependency's artifactId matches
-        // a sibling module, convert it to a workspaceDependency
-        let mut workspace_deps = Vec::new();
+        // a sibling module, convert it to a workspace module ref
         if let Some(ref mut deps) = module_cfg.dependencies {
             let keys_to_remove: Vec<String> = deps
                 .keys()
@@ -448,15 +753,12 @@ fn migrate_maven_multimodule(root: &Path, root_pom: &Path, modules: &[String]) -
                 deps.remove(&key);
                 let parts: Vec<&str> = key.split(':').collect();
                 if parts.len() == 2 {
-                    workspace_deps.push(parts[1].to_string());
+                    deps.insert(parts[1].to_string(), DependencyValue::Detailed(DependencySpec {
+                        workspace: Some(true),
+                        ..Default::default()
+                    }));
                 }
             }
-            if deps.is_empty() {
-                module_cfg.dependencies = None;
-            }
-        }
-        if !workspace_deps.is_empty() {
-            module_cfg.workspace_dependencies = Some(workspace_deps);
         }
 
         // Clear workspaces on submodules (only root has workspaces)
@@ -496,8 +798,7 @@ pub fn migrate_from_pom(pom_path: &Path) -> Result<YmConfig> {
     let java_version = detect_java_version(&root);
 
     // Extract dependencies
-    let mut dependencies = BTreeMap::new();
-    let mut dev_dependencies = BTreeMap::new();
+    let mut dependencies: BTreeMap<String, DependencyValue> = BTreeMap::new();
 
     for node in root.descendants() {
         if node.tag_name().name() != "dependencies" {
@@ -519,6 +820,7 @@ pub fn migrate_from_pom(pom_path: &Path) -> Result<YmConfig> {
             let dep_artifact = find_child_text(&dep, "artifactId");
             let dep_version = find_child_text(&dep, "version");
             let dep_scope = find_child_text(&dep, "scope");
+            let dep_optional = find_child_text(&dep, "optional");
 
             if let (Some(g), Some(a)) = (dep_group, dep_artifact) {
                 let coord = format!("{}:{}", g, a);
@@ -529,15 +831,45 @@ pub fn migrate_from_pom(pom_path: &Path) -> Result<YmConfig> {
                     continue;
                 }
 
+                // Skip optional dependencies
+                if dep_optional.as_deref() == Some("true") {
+                    eprintln!(
+                        "  {} Skipped optional dependency: {} (add manually if needed)",
+                        console::style("!").yellow(), coord
+                    );
+                    continue;
+                }
+
                 match dep_scope.as_deref() {
                     Some("test") => {
-                        dev_dependencies.insert(coord, ver);
+                        dependencies.insert(coord, DependencyValue::Detailed(DependencySpec {
+                            version: Some(ver),
+                            scope: Some("test".to_string()),
+                            ..Default::default()
+                        }));
                     }
-                    Some("provided") | Some("system") => {
-                        // Skip provided/system scope
+                    Some("provided") => {
+                        dependencies.insert(coord, DependencyValue::Detailed(DependencySpec {
+                            version: Some(ver),
+                            scope: Some("provided".to_string()),
+                            ..Default::default()
+                        }));
+                    }
+                    Some("runtime") => {
+                        dependencies.insert(coord, DependencyValue::Detailed(DependencySpec {
+                            version: Some(ver),
+                            scope: Some("runtime".to_string()),
+                            ..Default::default()
+                        }));
+                    }
+                    Some("system") => {
+                        eprintln!(
+                            "  {} Skipped system-scoped dependency: {} (requires local JAR path, handle manually)",
+                            console::style("!").yellow(), coord
+                        );
                     }
                     _ => {
-                        dependencies.insert(coord, ver);
+                        dependencies.insert(coord, DependencyValue::Simple(ver));
                     }
                 }
             }
@@ -557,10 +889,9 @@ pub fn migrate_from_pom(pom_path: &Path) -> Result<YmConfig> {
     };
 
     if !dependencies.is_empty() {
+        // Detect Maven plugins and map to ym config
+        detect_maven_plugins(&root, &mut config, &dependencies);
         config.dependencies = Some(dependencies);
-    }
-    if !dev_dependencies.is_empty() {
-        config.dev_dependencies = Some(dev_dependencies);
     }
 
     // Detect if this is a multi-module project
@@ -576,6 +907,69 @@ pub fn migrate_from_pom(pom_path: &Path) -> Result<YmConfig> {
 /// Parse a build.gradle and extract basic info
 pub fn migrate_from_gradle(gradle_path: &Path) -> Result<YmConfig> {
     migrate_from_gradle_with_projects(gradle_path, &[])
+}
+
+/// Detect Maven plugins (spring-boot, annotation-processing, shade) and map to ym config.
+fn detect_maven_plugins(
+    root: &roxmltree::Node,
+    config: &mut YmConfig,
+    deps: &BTreeMap<String, DependencyValue>,
+) {
+    let mut hints: Vec<String> = Vec::new();
+
+    // Scan <build><plugins> for known plugins
+    for node in root.descendants() {
+        if node.tag_name().name() != "plugin" {
+            continue;
+        }
+        let artifact = find_child_text(&node, "artifactId").unwrap_or_default();
+
+        match artifact.as_str() {
+            "spring-boot-maven-plugin" => {
+                if config.main.is_none() {
+                    if let Some(pkg) = config.package.as_ref() {
+                        config.main = Some(format!("{}.Application", pkg));
+                    }
+                }
+                hints.push("Spring Boot Maven plugin detected".to_string());
+            }
+            "maven-compiler-plugin" => {
+                // Check for annotation processor configuration
+                for cfg_node in node.descendants() {
+                    if cfg_node.tag_name().name() == "annotationProcessorPaths" {
+                        let mut ap = Vec::new();
+                        for path_node in cfg_node.children() {
+                            if path_node.tag_name().name() == "path" || path_node.tag_name().name() == "annotationProcessorPath" {
+                                let g = find_child_text(&path_node, "groupId");
+                                let a = find_child_text(&path_node, "artifactId");
+                                if let (Some(g), Some(a)) = (g, a) {
+                                    ap.push(format!("{}:{}", g, a));
+                                }
+                            }
+                        }
+                        if !ap.is_empty() {
+                            let compiler = config.compiler.get_or_insert_with(Default::default);
+                            compiler.annotation_processors = Some(ap.clone());
+                            hints.push(format!("Annotation processors: {}", ap.join(", ")));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Auto-detect Lombok from dependencies
+    let has_lombok = deps.keys().any(|k| k.contains("lombok"));
+    if has_lombok && config.compiler.as_ref().and_then(|c| c.annotation_processors.as_ref()).is_none() {
+        let compiler = config.compiler.get_or_insert_with(Default::default);
+        compiler.annotation_processors = Some(vec!["org.projectlombok:lombok".to_string()]);
+        hints.push("Lombok auto-detected as annotation processor".to_string());
+    }
+
+    for hint in &hints {
+        println!("  {} {}", style("→").blue(), style(hint).dim());
+    }
 }
 
 fn find_child_text(node: &roxmltree::Node, name: &str) -> Option<String> {
@@ -639,6 +1033,27 @@ fn find_modules(root: &roxmltree::Node) -> Vec<String> {
     modules
 }
 
+/// Resolve version for BOM-managed dependencies.
+/// If version is empty and we know the Spring Boot version, use it for Spring Boot starters.
+/// Otherwise warn and use "FIXME" placeholder.
+fn resolve_bom_version(coord: &str, version: &str, spring_boot_version: &Option<String>) -> String {
+    if !version.is_empty() {
+        return version.to_string();
+    }
+    // Spring Boot BOM-managed dependencies
+    if coord.starts_with("org.springframework.boot:") || coord.starts_with("org.springframework:") {
+        if let Some(sb_ver) = spring_boot_version {
+            return sb_ver.clone();
+        }
+    }
+    eprintln!(
+        "  {} No version for {} — add version manually",
+        console::style("!").yellow(),
+        coord
+    );
+    "FIXME".to_string()
+}
+
 fn extract_string_value(line: &str) -> Option<String> {
     // Handle: key = 'value' or key = "value" or key = value
     let parts: Vec<&str> = line.splitn(2, '=').collect();
@@ -676,6 +1091,10 @@ fn parse_gradle_dependency(line: &str, prefix: &str) -> Option<(String, String)>
         let coord = format!("{}:{}", parts[0], parts[1]);
         let version = parts[2].to_string();
         Some((coord, version))
+    } else if parts.len() == 2 {
+        // No version specified (e.g., Spring Boot BOM-managed dependency)
+        let coord = format!("{}:{}", parts[0], parts[1]);
+        Some((coord, String::new()))
     } else {
         None
     }
@@ -784,8 +1203,12 @@ mod tests {
         assert_eq!(cfg.target.as_deref(), Some("17"));
         let deps = cfg.dependencies.unwrap();
         assert!(deps.contains_key("com.google.guava:guava"));
-        let dev_deps = cfg.dev_dependencies.unwrap();
-        assert!(dev_deps.contains_key("junit:junit"));
+        assert!(deps.contains_key("junit:junit"));
+        // junit should have test scope
+        match deps.get("junit:junit").unwrap() {
+            DependencyValue::Detailed(spec) => assert_eq!(spec.scope.as_deref(), Some("test")),
+            _ => panic!("Expected detailed dep for test scope"),
+        }
 
         let _ = std::fs::remove_dir_all(&tmpdir);
     }
@@ -810,7 +1233,8 @@ dependencies {
         std::fs::write(&gradle_path, gradle).unwrap();
 
         let cfg = migrate_from_gradle(&gradle_path).unwrap();
-        assert_eq!(cfg.name, "com.example");
+        assert_eq!(cfg.name, "ym-gradle-migrate-test"); // name from dir (no settings.gradle rootProject.name)
+        assert_eq!(cfg.group_id, "com.example");
         assert_eq!(cfg.version.as_deref(), Some("2.0.0"));
         assert_eq!(cfg.target.as_deref(), Some("21"));
         let deps = cfg.dependencies.unwrap();

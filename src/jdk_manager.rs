@@ -296,46 +296,6 @@ pub fn download_jdk(vendor: &str, major_version: &str) -> Result<PathBuf> {
     Ok(install_path)
 }
 
-/// Download a JDK from a user-provided URL. Returns the installed path.
-pub fn download_jdk_from_url(url: &str, dir_name: &str) -> Result<PathBuf> {
-    let target_dir = jdk_dir();
-    std::fs::create_dir_all(&target_dir)?;
-
-    let install_path = target_dir.join(dir_name);
-    if install_path.exists() {
-        return Ok(install_path);
-    }
-
-    println!("  Downloading...");
-    println!("  {}", url);
-
-    let tmp_archive = target_dir.join("_download.tar.gz");
-    download_with_progress(url, &tmp_archive)?;
-
-    let status = std::process::Command::new("tar")
-        .args(["xzf", &tmp_archive.to_string_lossy(), "-C", &target_dir.to_string_lossy()])
-        .status()?;
-
-    std::fs::remove_file(&tmp_archive).ok();
-
-    if !status.success() {
-        anyhow::bail!("Failed to extract JDK archive");
-    }
-
-    if !install_path.exists() {
-        if let Some(extracted) = find_extracted_jdk_dir(&target_dir, dir_name)? {
-            std::fs::rename(&extracted, &install_path)?;
-        }
-    }
-
-    if !install_path.exists() {
-        anyhow::bail!("JDK installation failed: {} not found", install_path.display());
-    }
-
-    println!("  Installed: {}", install_path.display());
-    Ok(install_path)
-}
-
 /// Resolve download URL for a JDK vendor and version.
 fn resolve_download_url(vendor: &str, major: &str) -> Result<(String, String)> {
     let os = if cfg!(target_os = "macos") { "mac" } else { "linux" };
@@ -383,7 +343,7 @@ fn resolve_jbr_url(major: &str, os: &str, arch: &str) -> Result<String> {
     let api_url = "https://api.github.com/repos/JetBrains/JetBrainsRuntime/releases?per_page=30";
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("ym-build")
+        .user_agent(concat!("ym/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -462,19 +422,6 @@ pub const DOWNLOAD_VENDORS: &[(&str, &str)] = &[
     ("JetBrains Runtime", "jbr"),
     ("GraalVM", "graalvm"),
     ("Amazon Corretto", "corretto"),
-];
-
-/// Available versions.
-pub const JDK_VERSIONS: &[(&str, &str)] = &[
-    ("25", "25"),
-    ("24", "24"),
-    ("23", "23"),
-    ("22", "22"),
-    ("21 (LTS)", "21"),
-    ("20", "20"),
-    ("19", "19"),
-    ("18", "18"),
-    ("17 (LTS)", "17"),
 ];
 
 /// Download a file with progress bar. Respects HTTP_PROXY/HTTPS_PROXY env vars.

@@ -136,7 +136,7 @@ fn download_jdk(version: &str, _vendor: &str, jdk_dir: &Path) -> Result<PathBuf>
     );
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("ym/0.1.0")
+        .user_agent(concat!("ym/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
