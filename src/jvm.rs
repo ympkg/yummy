@@ -45,7 +45,7 @@ pub fn ensure_jdk(version: &str, vendor: Option<&str>, auto_download: bool) -> R
     download_jdk(version, vendor.unwrap_or("temurin"), &jdk_dir)
 }
 
-fn which_javac() -> Option<PathBuf> {
+pub fn which_javac() -> Option<PathBuf> {
     let cmd = if cfg!(windows) { "where" } else { "which" };
     std::process::Command::new(cmd)
         .arg("javac")
@@ -130,8 +130,8 @@ fn download_jdk(version: &str, _vendor: &str, jdk_dir: &Path) -> Result<PathBuf>
     );
 
     println!(
-        "  {} Downloading JDK {}...",
-        style("→").blue(),
+        "  {} downloading JDK {}...",
+        style("➜").green(),
         version
     );
 
@@ -167,8 +167,8 @@ fn download_jdk(version: &str, _vendor: &str, jdk_dir: &Path) -> Result<PathBuf>
     std::fs::write(&archive_path, &bytes)?;
 
     println!(
-        "  {} Extracting JDK {}...",
-        style("→").blue(),
+        "  {} extracting JDK {}...",
+        style("➜").green(),
         version
     );
 

@@ -75,7 +75,7 @@ pub fn foreach(args: Vec<String>, parallel: bool, jobs: Option<usize>, keep_goin
         let pkg = ws.get_package(name).unwrap();
         println!(
             "  {} {} in {}",
-            style("→").blue(),
+            style("➜").green(),
             style(args.join(" ")).bold(),
             style(name).cyan()
         );
@@ -145,7 +145,7 @@ fn foreach_parallel(
 
     println!(
         "  {} Running '{}' in {} packages in parallel (by topological level)...",
-        style("→").blue(),
+        style("➜").green(),
         style(format!("{} {}", cmd_name, cmd_args.join(" "))).bold(),
         packages.len()
     );

@@ -6,7 +6,113 @@ use crate::config;
 use crate::config::schema::{DependencySpec, DependencyValue};
 use crate::workspace::resolver;
 
+pub fn execute_interactive() -> Result<()> {
+    use std::io::{self, BufRead, Write};
+    print!("  Paste dependency: ");
+    io::stdout().flush()?;
+
+    let stdin = io::stdin();
+    let mut lines = Vec::new();
+    let mut in_xml = false;
+
+    for line_result in stdin.lock().lines() {
+        let line = line_result?;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.contains("<dependency") {
+            in_xml = true;
+        }
+
+        lines.push(trimmed.to_string());
+
+        if trimmed.contains("</dependency>") {
+            break;
+        }
+        // Single-line formats: stop after first non-comment line
+        if !in_xml && !is_comment_line(trimmed) {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        bail!("No dependency provided");
+    }
+
+    let joined = lines.join("\n");
+
+    // Try Maven XML
+    if let Some((dep, scope)) = try_parse_maven_xml(&joined) {
+        return execute(&dep, scope.as_deref(), None);
+    }
+
+    // Find first non-comment line, strip trailing <!-- ... -->
+    let meaningful = lines.iter()
+        .find(|l| !is_comment_line(l))
+        .map(|l| strip_trailing_xml_comment(l))
+        .unwrap_or_default();
+
+    if meaningful.is_empty() {
+        bail!("No dependency provided");
+    }
+
+    let (dep, scope) = match try_parse_gradle_notation(&meaningful) {
+        Some((d, s)) => (d, s),
+        None => (meaningful, None),
+    };
+    execute(&dep, scope.as_deref(), None)
+}
+
+fn is_comment_line(line: &str) -> bool {
+    line.starts_with("//") || line.starts_with("<!--")
+}
+
+fn strip_trailing_xml_comment(line: &str) -> String {
+    if let Some(idx) = line.find("<!--") {
+        line[..idx].trim().to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+/// Parse Maven XML `<dependency>` block.
+fn try_parse_maven_xml(text: &str) -> Option<(String, Option<String>)> {
+    let group = extract_xml_tag(text, "groupId")?;
+    let artifact = extract_xml_tag(text, "artifactId")?;
+    let version = extract_xml_tag(text, "version");
+    let scope = extract_xml_tag(text, "scope");
+
+    let dep = match version {
+        Some(v) => format!("{}:{}@{}", group, artifact, v),
+        None => format!("{}:{}", group, artifact),
+    };
+    let ym_scope = scope.and_then(|s| match s.as_str() {
+        "compile" => None,
+        "test" => Some("test".to_string()),
+        "runtime" => Some("runtime".to_string()),
+        "provided" | "system" => Some("provided".to_string()),
+        _ => None,
+    });
+
+    Some((dep, ym_scope))
+}
+
+fn extract_xml_tag(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = text.find(&open)? + open.len();
+    let end = text.find(&close)?;
+    Some(text[start..end].trim().to_string())
+}
+
 pub fn execute(dep: &str, scope: Option<&str>, classifier: Option<&str>) -> Result<()> {
+    // Normalize Gradle-style notation: implementation("g:a:v") → g:a@v with scope
+    let gradle = try_parse_gradle_notation(dep);
+    let dep = gradle.as_ref().map(|(d, _)| d.as_str()).unwrap_or(dep);
+    let scope = scope.or_else(|| gradle.as_ref().and_then(|(_, s)| s.as_deref()));
+
     let (config_path, mut cfg) = config::load_or_find_config()?;
 
     // Handle URL dependencies
@@ -132,8 +238,12 @@ fn parse_dep_spec(dep: &str) -> Result<(String, String, String)> {
         };
 
         let parts: Vec<&str> = coord.split(':').collect();
+        // Support bare Maven coordinate: groupId:artifactId:version (3 colons, no @)
+        if parts.len() == 3 && version.is_none() {
+            return Ok((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+        }
         if parts.len() != 2 {
-            bail!("Invalid coordinate: '{}'. Expected groupId:artifactId", coord);
+            bail!("Invalid coordinate: '{}'. Expected groupId:artifactId[@version] or groupId:artifactId:version", coord);
         }
 
         let group_id = parts[0].to_string();
@@ -180,6 +290,35 @@ fn parse_dep_spec(dep: &str) -> Result<(String, String, String)> {
         let (g, a, v) = &results[selection];
         Ok((g.clone(), a.clone(), v.clone()))
     }
+}
+
+/// Parse Gradle-style dependency notation.
+/// Examples:
+///   implementation("g:a:v") → ("g:a@v", None)
+///   testImplementation("g:a:v") → ("g:a@v", Some("test"))
+///   runtimeOnly("g:a:v") → ("g:a@v", Some("runtime"))
+fn try_parse_gradle_notation(dep: &str) -> Option<(String, Option<String>)> {
+    let (func, rest) = dep.split_once('(')?;
+    let rest = rest.strip_suffix(')')?;
+    let inner = rest.trim_matches('"').trim_matches('\'');
+
+    let scope = match func.trim() {
+        "implementation" | "api" => None,
+        "compileOnly" => Some("provided".to_string()),
+        "runtimeOnly" => Some("runtime".to_string()),
+        "testImplementation" | "testRuntimeOnly" | "testCompileOnly" => Some("test".to_string()),
+        "annotationProcessor" => None,
+        _ => return None,
+    };
+
+    let parts: Vec<&str> = inner.split(':').collect();
+    let normalized = match parts.len() {
+        3 => format!("{}:{}@{}", parts[0], parts[1], parts[2]),
+        2 => inner.to_string(),
+        _ => return None,
+    };
+
+    Some((normalized, scope))
 }
 
 fn atty_is_interactive() -> bool {

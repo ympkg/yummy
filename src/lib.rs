@@ -14,6 +14,20 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 
 // ============================================================
+//  JSON quiet mode — suppress human-readable stdout in --json
+// ============================================================
+
+use std::sync::atomic::AtomicBool;
+
+/// When true, all human-readable progress/status output to stdout is suppressed.
+/// Used by `--json` commands to ensure stdout contains only valid JSON.
+pub static JSON_QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn is_json_quiet() -> bool {
+    JSON_QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ============================================================
 //  Color mode — shared by ym and ymc
 // ============================================================
 
@@ -49,7 +63,7 @@ fn apply_color_mode(mode: &ColorMode) {
 // ============================================================
 
 #[derive(Parser)]
-#[command(name = "ym", about = "Yummy - A modern Java package manager", version)]
+#[command(name = "ym", about = format!("Yummy v{} - A modern Java package manager", env!("CARGO_PKG_VERSION")), version)]
 struct YmCli {
     /// Color output: auto, always, never
     #[arg(long, global = true, default_value = "auto")]
@@ -77,8 +91,10 @@ enum YmCommands {
     },
     /// Add a dependency to package.toml
     Add {
-        /// Dependency (e.g., guava or com.google.guava:guava@33.0)
-        dep: String,
+        /// Dependency (e.g., guava, com.google.guava:guava@33.0, or Gradle scope)
+        dep: Option<String>,
+        /// Coordinate (when first arg is a Gradle scope like implementation)
+        coord: Option<String>,
         /// Dependency scope: compile (default), runtime, provided, test
         #[arg(long)]
         scope: Option<String>,
@@ -208,7 +224,7 @@ enum WorkspaceAction {
 // ============================================================
 
 #[derive(Parser)]
-#[command(name = "ymc", about = "Yummy - Java compiler and runtime engine", version)]
+#[command(name = "ymc", about = format!("Yummy v{} - Java compiler and runtime engine", env!("CARGO_PKG_VERSION")), version)]
 struct YmcCli {
     /// Color output: auto, always, never
     #[arg(long, global = true, default_value = "auto")]
@@ -220,13 +236,10 @@ struct YmcCli {
 
 #[derive(Subcommand)]
 enum YmcCommands {
-    /// Compile the project
+    /// Compile the project and package release JAR
     Build {
         /// Target module name (workspace mode)
         target: Option<String>,
-        /// Build release fat JAR
-        #[arg(long)]
-        release: bool,
         /// Number of parallel compilation threads (default: CPU cores)
         #[arg(long, short = 'j')]
         parallel: Option<usize>,
@@ -341,6 +354,21 @@ enum YmcCommands {
         /// Target module name (workspace mode)
         target: Option<String>,
     },
+    /// Compile to native binary using GraalVM native-image
+    Native {
+        /// Use Docker container (no local GraalVM needed)
+        #[arg(long)]
+        docker: bool,
+        /// Custom output binary name (default: project name)
+        #[arg(long)]
+        out: Option<String>,
+        /// Target platform for Docker (e.g., linux/amd64, linux/arm64)
+        #[arg(long)]
+        platform: Option<String>,
+        /// Install the native binary to ~/.ym/bin/ after building
+        #[arg(long)]
+        install: bool,
+    },
 }
 
 // ============================================================
@@ -373,7 +401,29 @@ fn ym_main() -> Result<()> {
         YmCommands::Init { name, interactive, template, yes } => {
             commands::init::execute(name, interactive, template, yes)
         }
-        YmCommands::Add { dep, scope, classifier } => commands::add::execute(&dep, scope.as_deref(), classifier.as_deref()),
+        YmCommands::Add { dep, coord, scope, classifier } => {
+            let dep = match dep {
+                Some(d) => d,
+                None => return commands::add::execute_interactive(),
+            };
+            // Support: ym add implementation org.projectlombok:lombok:1.18.42
+            let (dep, scope) = if let Some(coord) = coord {
+                let ym_scope = match dep.as_str() {
+                    "implementation" | "api" | "annotationProcessor" => scope,
+                    "compileOnly" => scope.or(Some("provided".into())),
+                    "runtimeOnly" => scope.or(Some("runtime".into())),
+                    "testImplementation" | "testRuntimeOnly" | "testCompileOnly" => scope.or(Some("test".into())),
+                    other => anyhow::bail!(
+                        "Unknown Gradle scope '{}'. Use: ym add groupId:artifactId@version",
+                        other
+                    ),
+                };
+                (coord, ym_scope)
+            } else {
+                (dep, scope)
+            };
+            commands::add::execute(&dep, scope.as_deref(), classifier.as_deref())
+        }
         YmCommands::Remove { dep } => commands::remove::execute(&dep),
         YmCommands::Upgrade { interactive, yes, json } => {
             commands::upgrade::execute(interactive, yes, json)
@@ -445,11 +495,11 @@ fn run_script_external(args: &[String]) -> Result<()> {
     match script_map.and_then(|s| s.get(&name)) {
         Some(_) => {
             let extra_args: Vec<String> = args.iter().skip(1).cloned().collect();
-            scripts::run_script_with_args(&cfg.scripts, &cfg.env, &name, &project, &extra_args)
+            scripts::run_script_with_args(&cfg, &name, &project, &extra_args)
         }
         None => {
             // Fallback: delegate known ymc commands so they work without scripts
-            let ymc_commands = ["build", "dev", "test", "idea", "clean", "vscode"];
+            let ymc_commands = ["build", "dev", "test", "idea", "clean", "vscode", "native"];
             if ymc_commands.contains(&name.as_str()) {
                 let mut ymc_args = vec![name.clone()];
                 ymc_args.extend(args.iter().skip(1).cloned());
@@ -501,8 +551,8 @@ fn run_scripts(script_names: &[String], parallel: bool) -> Result<()> {
     if parallel && script_names.len() > 1 {
         use console::style;
         println!(
-            "  {} Running {} scripts in parallel...",
-            style("→").blue(),
+            "  {} running {} scripts in parallel...",
+            style("➜").green(),
             script_names.len()
         );
 
@@ -510,11 +560,10 @@ fn run_scripts(script_names: &[String], parallel: bool) -> Result<()> {
             .iter()
             .map(|name| {
                 let name = name.clone();
-                let cfg_scripts = cfg.scripts.clone();
-                let cfg_env = cfg.env.clone();
+                let cfg = cfg.clone();
                 let project = project.clone();
                 std::thread::spawn(move || {
-                    scripts::run_script_with_args(&cfg_scripts, &cfg_env, &name, &project, &[])
+                    scripts::run_script_with_args(&cfg, &name, &project, &[])
                 })
             })
             .collect();
@@ -534,7 +583,7 @@ fn run_scripts(script_names: &[String], parallel: bool) -> Result<()> {
     } else {
         // Sequential execution
         for name in script_names {
-            scripts::run_script_with_args(&cfg.scripts, &cfg.env, name, &project, &[])?;
+            scripts::run_script_with_args(&cfg, name, &project, &[])?;
         }
     }
 
@@ -554,10 +603,35 @@ fn dispatch_ymc_args(args: &[String]) -> Result<()> {
     dispatch_ymc(cli)
 }
 
+fn print_version_banner(context: &str) {
+    let version = env!("CARGO_PKG_VERSION");
+    println!(
+        "\n  {}  {}\n",
+        console::style(format!("ym v{}", version)).green().bold(),
+        console::style(context).green(),
+    );
+}
+
 fn dispatch_ymc(cli: YmcCli) -> Result<()> {
     apply_color_mode(&cli.color);
+
+    // Print version banner (skip for JSON output modes)
+    let is_json = matches!(&cli.command, YmcCommands::Idea { json: true, .. });
+    if !is_json && !is_json_quiet() {
+        let context = match &cli.command {
+            YmcCommands::Build { .. } => "building...",
+            YmcCommands::Dev { .. } => "dev server starting...",
+            YmcCommands::Test { .. } => "running tests...",
+            YmcCommands::Clean { .. } => "cleaning...",
+            YmcCommands::Idea { .. } => "generating IDEA project...",
+            YmcCommands::Vscode { .. } => "generating VSCode settings...",
+            YmcCommands::Native { .. } => "compiling native binary...",
+        };
+        print_version_banner(context);
+    }
+
     match cli.command {
-        YmcCommands::Build { target, release, parallel, profile, verbose, clean, output, keep_going, strict } => {
+        YmcCommands::Build { target, parallel, profile, verbose, clean, output, keep_going, strict } => {
             if let Some(n) = parallel {
                 commands::build::set_parallelism(n);
             }
@@ -574,11 +648,11 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
                 commands::build::set_strict(true);
             }
             if profile {
-                commands::build::execute_with_profile(target, release)
+                commands::build::execute_with_profile(target)
             } else if keep_going {
-                commands::build::execute_keep_going(target, release)
+                commands::build::execute_keep_going(target)
             } else {
-                commands::build::execute(target, release)
+                commands::build::execute(target)
             }
         }
         YmcCommands::Dev { target, no_reload, debug, debug_port, suspend, args } => {
@@ -596,6 +670,7 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
         YmcCommands::Clean { all, yes } => commands::clean::execute(all, yes),
         YmcCommands::Idea { target, sources, json } => commands::idea::execute(target, sources, json),
         YmcCommands::Vscode { target } => commands::vscode::execute(target),
+        YmcCommands::Native { docker, out, platform, install } => commands::native_cmd::execute(docker, out, platform, install),
     }
 }
 

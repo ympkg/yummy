@@ -10,6 +10,7 @@ pub mod login;
 pub mod migrate;
 pub mod publish;
 pub mod remove;
+pub mod native_cmd;
 pub mod test_cmd;
 pub mod tree;
 pub mod upgrade;

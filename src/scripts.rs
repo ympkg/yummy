@@ -1,9 +1,8 @@
 use anyhow::Result;
 use console::style;
-use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::config::schema::ScriptValue;
+use crate::config::schema::YmConfig;
 
 /// Execute a named script from [scripts] in package.toml.
 ///
@@ -11,18 +10,16 @@ use crate::config::schema::ScriptValue;
 /// recursive triggering. When a hook script calls ymc again, the
 /// child process inherits YM_LIFECYCLE=1, so its hooks are skipped.
 pub fn run_script(
-    scripts: &Option<BTreeMap<String, ScriptValue>>,
-    env: &Option<BTreeMap<String, String>>,
+    cfg: &YmConfig,
     name: &str,
     project_dir: &Path,
 ) -> Result<()> {
-    run_script_with_args(scripts, env, name, project_dir, &[])
+    run_script_with_args(cfg, name, project_dir, &[])
 }
 
 /// Execute a named script, appending extra_args (from `--` separator) to the command.
 pub fn run_script_with_args(
-    scripts: &Option<BTreeMap<String, ScriptValue>>,
-    env: &Option<BTreeMap<String, String>>,
+    cfg: &YmConfig,
     name: &str,
     project_dir: &Path,
     extra_args: &[String],
@@ -34,10 +31,11 @@ pub fn run_script_with_args(
         return Ok(());
     }
 
-    let scripts = match scripts {
+    let scripts = match &cfg.scripts {
         Some(s) => s,
         None => return Ok(()),
     };
+    let env = &cfg.env;
 
     let script_value = match scripts.get(name) {
         Some(v) => v,
@@ -48,17 +46,20 @@ pub fn run_script_with_args(
     let timeout_secs = script_value.timeout_secs();
 
     println!(
-        "  {} Running script: {}",
-        style("→").blue(),
+        "  {} running script: {}",
+        style("➜").green(),
         style(name).dim()
     );
 
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let flag = if cfg!(windows) { "/C" } else { "-c" };
 
+    // Substitute ${project.*} variables
+    let cmd = substitute_vars(cmd, cfg);
+
     // Append extra_args (from `--` separator) to the script command
     let full_cmd = if extra_args.is_empty() {
-        cmd.to_string()
+        cmd.clone()
     } else {
         let escaped: Vec<String> = extra_args.iter().map(|a| {
             if a.contains(' ') {
@@ -78,6 +79,10 @@ pub fn run_script_with_args(
     if is_hook {
         command.env("YM_LIFECYCLE", "1");
     }
+
+    // Inject package metadata so scripts can reference $YM_NAME / $YM_VERSION
+    command.env("YM_NAME", &cfg.name);
+    command.env("YM_VERSION", cfg.version.as_deref().unwrap_or("0.0.0"));
 
     if let Some(env_map) = env {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -128,4 +133,11 @@ pub fn run_script_with_args(
     }
 
     Ok(())
+}
+
+/// Replace `${project.name}`, `${project.version}`, `${project.groupId}` in script commands.
+fn substitute_vars(cmd: &str, cfg: &YmConfig) -> String {
+    cmd.replace("${project.name}", &cfg.name)
+        .replace("${project.version}", cfg.version.as_deref().unwrap_or("0.0.0"))
+        .replace("${project.groupId}", &cfg.group_id)
 }

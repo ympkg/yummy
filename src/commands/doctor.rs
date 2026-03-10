@@ -235,7 +235,7 @@ fn check_jdk_version_match(fix: bool) {
                 } else if fix {
                     println!(
                         "  {} JDK version {} does not match target {}, downloading...",
-                        style("→").blue(),
+                        style("➜").green(),
                         major,
                         target
                     );
@@ -270,7 +270,7 @@ fn check_jdk_version_match(fix: bool) {
             // No java found at all, try to download
             println!(
                 "  {} No Java found, downloading JDK {}...",
-                style("→").blue(),
+                style("➜").green(),
                 target
             );
             match crate::jvm::ensure_jdk(target, None, true) {

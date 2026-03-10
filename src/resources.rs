@@ -2,25 +2,37 @@ use anyhow::Result;
 use std::path::Path;
 
 /// Copy resource files (non-.java) from source directories to output directory.
-/// If `custom_extensions` is provided, uses that list instead of the default.
-/// Extensions can be with or without leading dot (e.g., ".xml" or "xml").
+///
+/// Mode selection:
+/// - If `custom_extensions` is provided → whitelist mode (only copy matching extensions)
+/// - Otherwise → copy all non-`.java` files, applying `exclude_patterns` if provided
+///
+/// `exclude_patterns` are regexes matched against the file's relative path (from `src_dir`).
 pub fn copy_resources_with_extensions(
     src_dir: &Path,
     output_dir: &Path,
     custom_extensions: Option<&[String]>,
-) -> Result<usize> {
-    copy_resources_inner(src_dir, output_dir, custom_extensions)
-}
-
-
-fn copy_resources_inner(
-    src_dir: &Path,
-    output_dir: &Path,
-    custom_extensions: Option<&[String]>,
+    exclude_patterns: Option<&[String]>,
 ) -> Result<usize> {
     if !src_dir.exists() {
         return Ok(0);
     }
+
+    // Pre-compile exclude regexes (only used when custom_extensions is None)
+    let exclude_regexes = if custom_extensions.is_none() {
+        match exclude_patterns {
+            Some(patterns) => {
+                let mut regexes = Vec::with_capacity(patterns.len());
+                for p in patterns {
+                    regexes.push(regex::Regex::new(p)?);
+                }
+                Some(regexes)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let mut count = 0;
 
@@ -37,18 +49,28 @@ fn copy_resources_inner(
             continue;
         }
 
-        // Check if this is a resource file we should copy
-        let is_resource = match custom_extensions {
+        let should_copy = match custom_extensions {
             Some(exts) => {
+                // Whitelist mode: only copy files matching given extensions
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 exts.iter().any(|e| {
                     let e = e.strip_prefix('.').unwrap_or(e);
                     e == ext
                 })
             }
-            None => is_resource_file(path),
+            None => {
+                // Default mode: copy all non-.java, check exclude patterns
+                if let Some(ref regexes) = exclude_regexes {
+                    let rel = path.strip_prefix(src_dir).unwrap_or(path);
+                    let rel_str = rel.to_string_lossy();
+                    !regexes.iter().any(|re| re.is_match(&rel_str))
+                } else {
+                    true
+                }
+            }
         };
-        if !is_resource {
+
+        if !should_copy {
             continue;
         }
 
@@ -60,7 +82,7 @@ fn copy_resources_inner(
         }
 
         // Only copy if source is newer than dest
-        let should_copy = if dest.exists() {
+        let needs_copy = if dest.exists() {
             let src_mtime = std::fs::metadata(path)?.modified()?;
             let dst_mtime = std::fs::metadata(&dest)?.modified()?;
             src_mtime > dst_mtime
@@ -68,42 +90,11 @@ fn copy_resources_inner(
             true
         };
 
-        if should_copy {
+        if needs_copy {
             std::fs::copy(path, &dest)?;
             count += 1;
         }
     }
 
     Ok(count)
-}
-
-fn is_resource_file(path: &Path) -> bool {
-    let ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => e,
-        None => return false,
-    };
-
-    matches!(
-        ext,
-        "properties"
-            | "xml"
-            | "yml"
-            | "yaml"
-            | "json"
-            | "txt"
-            | "csv"
-            | "sql"
-            | "fxml"
-            | "css"
-            | "html"
-            | "conf"
-            | "cfg"
-            | "ini"
-            | "toml"
-            | "graphql"
-            | "graphqls"
-            | "proto"
-            | "ftl"
-            | "mustache"
-    )
 }

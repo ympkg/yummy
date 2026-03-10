@@ -75,11 +75,12 @@ pub fn execute(
     let src = config::source_dir(&project);
     let out = config::output_classes_dir(&project);
     let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
-    resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()))?;
+    let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
+    resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
 
     let resources_dir = project.join("src").join("main").join("resources");
     if resources_dir.exists() {
-        resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()))?;
+        resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
 
     println!(

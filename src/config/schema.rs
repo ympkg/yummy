@@ -244,6 +244,10 @@ pub struct YmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
 
+    /// Environment variables for scripts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+
     /// Unified dependencies with scope support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<BTreeMap<String, DependencyValue>>,
@@ -255,10 +259,6 @@ pub struct YmConfig {
     /// JVM arguments for runtime
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jvm_args: Option<Vec<String>>,
-
-    /// Environment variables for scripts
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
 
     /// Named scripts (ym <script-name> → executes command)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -296,6 +296,9 @@ pub struct YmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_dir: Option<String>,
 
+    /// Native image configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeConfig>,
 }
 
 fn default_group_id() -> String {
@@ -612,6 +615,9 @@ pub struct CompilerConfig {
     /// Resource file extensions to copy (replaces default list)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_extensions: Option<Vec<String>>,
+    /// Regex patterns to exclude resource files (matched against relative path)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_exclude: Option<Vec<String>>,
     /// JaCoCo version for code coverage
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jacoco_version: Option<String>,
@@ -627,6 +633,17 @@ pub struct HotReloadConfig {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watch_extensions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeConfig {
+    /// Extra args passed to native-image
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// Docker image override (default: ghcr.io/graalvm/native-image-community:{target})
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_image: Option<String>,
 }
 
 /// Internal resolved dependency cache (.ym/resolved.json)

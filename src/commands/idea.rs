@@ -6,6 +6,50 @@ use std::path::{Path, PathBuf};
 use crate::config;
 use crate::workspace::graph::WorkspaceGraph;
 
+/// Auto-sync IDEA project files when `.idea/` exists but `.iml` is missing.
+/// Called by build/dev/test so users get IDEA support without manual `ym idea`.
+pub(crate) fn auto_sync_idea(project: &Path, cfg: &config::schema::YmConfig) {
+    if crate::is_json_quiet() {
+        return;
+    }
+    let idea_dir = project.join(".idea");
+    if !idea_dir.is_dir() {
+        return;
+    }
+    let modules_dir = idea_dir.join("modules");
+    let iml_path = modules_dir.join(format!("{}.iml", cfg.name));
+    if iml_path.exists() {
+        return;
+    }
+
+    let java_version = cfg.target.as_deref().unwrap_or("21");
+    let result = if cfg.workspaces.is_some() {
+        WorkspaceGraph::build(project).and_then(|ws| {
+            let mut all = ws.all_packages();
+            all.sort();
+            generate_idea_project(project, &all, &ws, java_version, false)
+        })
+    } else {
+        generate_single_project_idea(project, cfg, java_version, false)
+    };
+
+    match result {
+        Ok(()) => {
+            eprintln!(
+                "  {} Auto-synced IDEA project (detected .idea/ without .iml)",
+                style("✓").green()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to auto-sync IDEA project: {}",
+                style("⚠").yellow(),
+                e
+            );
+        }
+    }
+}
+
 pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
@@ -106,6 +150,8 @@ fn execute_json(
     target: Option<&str>,
     java_version: &str,
 ) -> Result<()> {
+    // Suppress all human-readable progress output — stdout must be pure JSON
+    crate::JSON_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
     let modules = if cfg.workspaces.is_some() {
         let ws = WorkspaceGraph::build(project)?;
         let packages = if let Some(t) = target {
@@ -141,7 +187,7 @@ fn build_modules_workspace(
     let mut modules = Vec::new();
     for pkg_name in packages {
         let pkg = ws.get_package(pkg_name).unwrap();
-        let jars = super::build::resolve_deps(&pkg.path, &pkg.config)?;
+        let jars = super::build::resolve_deps_no_download(&pkg.path, &pkg.config)?;
         let ap_jars = collect_annotation_processor_jars(&pkg.config, &jars);
         let ws_deps = pkg.config.workspace_module_deps();
 
@@ -189,7 +235,7 @@ fn build_module_single(
     project: &Path,
     cfg: &config::schema::YmConfig,
 ) -> Result<IdeaModuleModel> {
-    let jars = super::build::resolve_deps(project, cfg)?;
+    let jars = super::build::resolve_deps_no_download(project, cfg)?;
     let ap_jars = collect_annotation_processor_jars(cfg, &jars);
 
     let mut dependencies = Vec::new();
@@ -312,16 +358,18 @@ fn generate_idea_project(
     let mut module_refs = Vec::new();
     let libraries_dir = idea_dir.join("libraries");
     std::fs::create_dir_all(&libraries_dir)?;
+    let modules_dir = idea_dir.join("modules");
+    std::fs::create_dir_all(&modules_dir)?;
 
     let mut all_jars: Vec<PathBuf> = Vec::new();
 
     for pkg_name in packages {
         let pkg = ws.get_package(pkg_name).unwrap();
         let rel_path = pathdiff(root, &pkg.path);
-        let iml_path = pkg.path.join(format!("{}.iml", pkg_name));
+        let iml_path = modules_dir.join(format!("{}.iml", pkg_name));
 
         // Resolve Maven deps for this package
-        let jars = super::build::resolve_deps(&pkg.path, &pkg.config)?;
+        let jars = super::build::resolve_deps_no_download(&pkg.path, &pkg.config)?;
         all_jars.extend(jars.clone());
 
         // Build module dependencies
@@ -345,16 +393,17 @@ fn generate_idea_project(
             ));
         }
 
-            let source_folders = detect_source_folders(&pkg.path);
+        let base_url = format!("$PROJECT_DIR$/{}", rel_path);
+            let source_folders = detect_source_folders(&pkg.path, &base_url);
 
         let iml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <module type="JAVA_MODULE" version="4">
   <component name="NewModuleRootManager" inherit-compiler-output="false">
-    <output url="file://$MODULE_DIR$/out/classes" />
-    <output-test url="file://$MODULE_DIR$/out/test-classes" />
-    <content url="file://$MODULE_DIR$">
-{source_folders}      <excludeFolder url="file://$MODULE_DIR$/out" />
+    <output url="file://{base_url}/out/classes" />
+    <output-test url="file://{base_url}/out/test-classes" />
+    <content url="file://{base_url}">
+{source_folders}      <excludeFolder url="file://{base_url}/out" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
@@ -365,8 +414,7 @@ fn generate_idea_project(
         std::fs::write(&iml_path, iml)?;
 
         module_refs.push(format!(
-            "      <module fileurl=\"file://$PROJECT_DIR$/{rel}/{name}.iml\" filepath=\"$PROJECT_DIR$/{rel}/{name}.iml\" />",
-            rel = rel_path,
+            "      <module fileurl=\"file://$PROJECT_DIR$/.idea/modules/{name}.iml\" filepath=\"$PROJECT_DIR$/.idea/modules/{name}.iml\" />",
             name = pkg_name
         ));
     }
@@ -436,7 +484,7 @@ fn generate_single_project_idea(
     std::fs::write(idea_dir.join("misc.xml"), misc)?;
 
     // Resolve deps for library references
-    let jars = super::build::resolve_deps(project, cfg)?;
+    let jars = super::build::resolve_deps_no_download(project, cfg)?;
     let libraries_dir = idea_dir.join("libraries");
     std::fs::create_dir_all(&libraries_dir)?;
 
@@ -467,16 +515,17 @@ fn generate_single_project_idea(
         )?;
     }
 
-    let source_folders = detect_source_folders(project);
+    let base_url = "$PROJECT_DIR$";
+    let source_folders = detect_source_folders(project, base_url);
 
     let iml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <module type="JAVA_MODULE" version="4">
   <component name="NewModuleRootManager" inherit-compiler-output="false">
-    <output url="file://$MODULE_DIR$/out/classes" />
-    <output-test url="file://$MODULE_DIR$/out/test-classes" />
-    <content url="file://$MODULE_DIR$">
-{source_folders}      <excludeFolder url="file://$MODULE_DIR$/out" />
+    <output url="file://{base_url}/out/classes" />
+    <output-test url="file://{base_url}/out/test-classes" />
+    <content url="file://{base_url}">
+{source_folders}      <excludeFolder url="file://{base_url}/out" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
@@ -484,8 +533,10 @@ fn generate_single_project_idea(
 </module>
 "#
     );
+    let modules_dir = idea_dir.join("modules");
+    std::fs::create_dir_all(&modules_dir)?;
     std::fs::write(
-        project.join(format!("{}.iml", cfg.name)),
+        modules_dir.join(format!("{}.iml", cfg.name)),
         iml,
     )?;
 
@@ -497,7 +548,7 @@ fn generate_single_project_idea(
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/{name}.iml" filepath="$PROJECT_DIR$/{name}.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/{name}.iml" filepath="$PROJECT_DIR$/.idea/modules/{name}.iml" />
     </modules>
   </component>
 </project>
@@ -586,7 +637,7 @@ fn generate_compiler_xml(
 
     for pkg_name in packages {
         let pkg = ws.get_package(pkg_name).unwrap();
-        let jars = super::build::resolve_deps(&pkg.path, &pkg.config)?;
+        let jars = super::build::resolve_deps_no_download(&pkg.path, &pkg.config)?;
         let ap_jars = collect_annotation_processor_jars(&pkg.config, &jars);
         if !ap_jars.is_empty() {
             ap_entries.push((pkg_name.clone(), ap_jars));
@@ -637,7 +688,7 @@ fn generate_compiler_xml_single(
     project: &Path,
     cfg: &config::schema::YmConfig,
 ) -> Result<()> {
-    let jars = super::build::resolve_deps(project, cfg)?;
+    let jars = super::build::resolve_deps_no_download(project, cfg)?;
     let ap_jars = collect_annotation_processor_jars(cfg, &jars);
 
     if ap_jars.is_empty() {
@@ -712,40 +763,41 @@ fn collect_annotation_processor_jars(
 
 /// Detect source/test/resource folders for IDEA project generation.
 /// Supports both Maven convention (src/main/java, src/test/java) and flat (src/, test/).
-fn detect_source_folders(project: &Path) -> String {
+/// `base_url` is the IDEA URL prefix for the module root (e.g. "$PROJECT_DIR$" or "$PROJECT_DIR$/submodule").
+fn detect_source_folders(project: &Path, base_url: &str) -> String {
     let mut folders = String::new();
 
     // Main sources
     let maven_src = project.join("src").join("main").join("java");
     if maven_src.exists() {
-        folders.push_str("      <sourceFolder url=\"file://$MODULE_DIR$/src/main/java\" isTestSource=\"false\" />\n");
+        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/main/java\" isTestSource=\"false\" />\n", base_url));
     } else if project.join("src").exists() {
-        folders.push_str("      <sourceFolder url=\"file://$MODULE_DIR$/src\" isTestSource=\"false\" />\n");
+        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src\" isTestSource=\"false\" />\n", base_url));
     }
 
     // Main resources
     let maven_res = project.join("src").join("main").join("resources");
     if maven_res.exists() {
-        folders.push_str("      <sourceFolder url=\"file://$MODULE_DIR$/src/main/resources\" type=\"java-resource\" />\n");
+        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/main/resources\" type=\"java-resource\" />\n", base_url));
     }
 
     // Test sources
     let maven_test = project.join("src").join("test").join("java");
     if maven_test.exists() {
-        folders.push_str("      <sourceFolder url=\"file://$MODULE_DIR$/src/test/java\" isTestSource=\"true\" />\n");
+        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/test/java\" isTestSource=\"true\" />\n", base_url));
     } else if project.join("test").exists() {
-        folders.push_str("      <sourceFolder url=\"file://$MODULE_DIR$/test\" isTestSource=\"true\" />\n");
+        folders.push_str(&format!("      <sourceFolder url=\"file://{}/test\" isTestSource=\"true\" />\n", base_url));
     }
 
     // Test resources
     let maven_test_res = project.join("src").join("test").join("resources");
     if maven_test_res.exists() {
-        folders.push_str("      <sourceFolder url=\"file://$MODULE_DIR$/src/test/resources\" type=\"java-test-resource\" />\n");
+        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/test/resources\" type=\"java-test-resource\" />\n", base_url));
     }
 
     // Fallback if nothing detected
     if folders.is_empty() {
-        folders.push_str("      <sourceFolder url=\"file://$MODULE_DIR$/src\" isTestSource=\"false\" />\n");
+        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src\" isTestSource=\"false\" />\n", base_url));
     }
 
     folders
@@ -844,7 +896,7 @@ mod tests {
         std::fs::create_dir_all(&tmpdir).unwrap();
 
         // No src dir at all -> fallback
-        let folders = detect_source_folders(&tmpdir);
+        let folders = detect_source_folders(&tmpdir, "$MODULE_DIR$");
         assert!(folders.contains("$MODULE_DIR$/src"));
 
         let _ = std::fs::remove_dir_all(&tmpdir);
@@ -858,7 +910,7 @@ mod tests {
         std::fs::create_dir_all(tmpdir.join("src/test/java")).unwrap();
         std::fs::create_dir_all(tmpdir.join("src/main/resources")).unwrap();
 
-        let folders = detect_source_folders(&tmpdir);
+        let folders = detect_source_folders(&tmpdir, "$MODULE_DIR$");
         assert!(folders.contains("src/main/java"));
         assert!(folders.contains("src/test/java"));
         assert!(folders.contains("src/main/resources"));

@@ -240,6 +240,33 @@ pub fn resolve_and_download_with_scopes(
     resolutions: &BTreeMap<String, String>,
     dep_scopes: &HashMap<String, String>,
 ) -> Result<Vec<PathBuf>> {
+    resolve_inner(dependencies, cache_dir, lock, registries, exclusions, resolutions, dep_scopes, true)
+}
+
+/// Resolve dependency graph and return expected JAR paths without downloading.
+/// Used by `ym idea --json` to avoid blocking on network I/O.
+pub fn resolve_no_download(
+    dependencies: &BTreeMap<String, String>,
+    cache_dir: &Path,
+    lock: &mut ResolvedCache,
+    registries: &[RegistryEntry],
+    exclusions: &[String],
+    resolutions: &BTreeMap<String, String>,
+    dep_scopes: &HashMap<String, String>,
+) -> Result<Vec<PathBuf>> {
+    resolve_inner(dependencies, cache_dir, lock, registries, exclusions, resolutions, dep_scopes, false)
+}
+
+fn resolve_inner(
+    dependencies: &BTreeMap<String, String>,
+    cache_dir: &Path,
+    lock: &mut ResolvedCache,
+    registries: &[RegistryEntry],
+    exclusions: &[String],
+    resolutions: &BTreeMap<String, String>,
+    dep_scopes: &HashMap<String, String>,
+    download: bool,
+) -> Result<Vec<PathBuf>> {
     let exclusion_set: HashSet<String> = exclusions.iter().cloned().collect();
     // Fast path: try to resolve entirely from lock file + local cache
     if resolutions.is_empty() {
@@ -429,13 +456,25 @@ pub fn resolve_and_download_with_scopes(
         }
     }
 
-    // Phase 2: parallel JAR downloads
-    if !coords_to_download.is_empty() {
-        println!(
-            "  {} Downloading {} artifact(s)...",
-            style("↓").blue(),
-            coords_to_download.len()
-        );
+    // Phase 2: parallel JAR downloads (skipped in resolve-only mode)
+    if download && !coords_to_download.is_empty() {
+        let total = coords_to_download.len();
+        let is_tty = console::Term::stdout().is_term();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        if !crate::is_json_quiet() {
+            if is_tty {
+                eprint!(
+                    "  {}  downloading dependencies (0/{})...",
+                    style("➜").green(), total
+                );
+            } else {
+                println!(
+                    "  {}  downloading {} dependencies...",
+                    style("➜").green(), total
+                );
+            }
+        }
 
         let download_results: Vec<(String, Result<String>)> = coords_to_download
             .into_par_iter()
@@ -456,27 +495,56 @@ pub fn resolve_and_download_with_scopes(
                 if hash_result.is_ok() {
                     verify_gpg_signature(&client, &coord, &jar_path, registries);
                 }
-                println!(
-                    "  {} {}:{}:{}",
-                    style("✓").green(),
-                    coord.group_id,
-                    coord.artifact_id,
-                    coord.version
-                );
+                // Update single-line progress (TTY only)
+                if !crate::is_json_quiet() && is_tty {
+                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    eprint!(
+                        "\r  {}  downloading dependencies ({}/{})...   ",
+                        style("➜").green(), done, total
+                    );
+                }
                 (key, hash_result)
             })
             .collect();
 
+        // Clear progress line
+        if !crate::is_json_quiet() && is_tty {
+            eprint!("\r{}\r", " ".repeat(60));
+        }
+
+        // Print final summary
+        if !crate::is_json_quiet() {
+            let ok_count = download_results.iter().filter(|(_, r)| r.is_ok()).count();
+            println!(
+                "  {} downloaded {} dependencies",
+                style("✓").green(), ok_count
+            );
+        }
+
+        // Print only failures
+        for (key, result) in &download_results {
+            if let Err(e) = result {
+                eprintln!("  {} {} — {}", style("✗").red(), key, e);
+            }
+        }
+
         // Print GPG verification summary (if any failures)
         print_gpg_summary();
 
-        // Record hashes in lock
+        // Record hashes in lock; collect failures
+        let mut failures = Vec::new();
         for (key, hash_result) in download_results {
-            if let Ok(hash) = hash_result {
-                if let Some(entry) = lock.dependencies.get_mut(&key) {
-                    entry.sha256 = Some(hash);
+            match hash_result {
+                Ok(hash) => {
+                    if let Some(entry) = lock.dependencies.get_mut(&key) {
+                        entry.sha256 = Some(hash);
+                    }
                 }
+                Err(e) => failures.push(format!("{}: {}", key, e)),
             }
+        }
+        if !failures.is_empty() {
+            bail!("Failed to download {} artifact(s):\n  {}", failures.len(), failures.join("\n  "));
         }
     }
 
@@ -1346,7 +1414,7 @@ fn print_gpg_summary() {
     if count > 0 && !GPG_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
             "  {} {} artifact(s) failed GPG signature verification (missing public keys?)",
-            console::style("⚠").yellow(),
+            console::style("!").yellow(),
             count
         );
     }

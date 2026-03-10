@@ -32,10 +32,11 @@ pub fn execute(docker: bool, out: Option<String>, platform: Option<String>, inst
     let src_dir = config::source_dir(&project);
     let out_dir = config::output_classes_dir(&project);
     let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
-    crate::resources::copy_resources_with_extensions(&src_dir, &out_dir, custom_res_ext.map(|v| v.as_slice()))?;
+    let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
+    crate::resources::copy_resources_with_extensions(&src_dir, &out_dir, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     let resources_dir = project.join("src").join("main").join("resources");
     if resources_dir.exists() {
-        crate::resources::copy_resources_with_extensions(&resources_dir, &out_dir, custom_res_ext.map(|v| v.as_slice()))?;
+        crate::resources::copy_resources_with_extensions(&resources_dir, &out_dir, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
 
     let runtime_jars = build::resolve_deps_with_scopes(&project, &cfg, &["compile", "runtime"])?;

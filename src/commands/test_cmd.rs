@@ -310,15 +310,16 @@ fn run_tests(
 
     // Copy main resources (src/main/resources → out/classes)
     let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
+    let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
     let main_resources = project.join("src").join("main").join("resources");
     if main_resources.exists() {
-        crate::resources::copy_resources_with_extensions(&main_resources, &out_dir, custom_res_ext.map(|v| v.as_slice()))?;
+        crate::resources::copy_resources_with_extensions(&main_resources, &out_dir, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
 
     // Copy test resources (src/test/resources → out/test-classes)
     let test_resources = project.join("src").join("test").join("resources");
     if test_resources.exists() {
-        crate::resources::copy_resources_with_extensions(&test_resources, &test_out_dir, custom_res_ext.map(|v| v.as_slice()))?;
+        crate::resources::copy_resources_with_extensions(&test_resources, &test_out_dir, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
 
     // Find test classes based on mode

@@ -57,7 +57,7 @@ pub fn is_strict() -> bool {
 }
 
 /// Build with per-phase timing breakdown
-pub fn execute_with_profile(_target: Option<String>, release: bool) -> Result<()> {
+pub fn execute_with_profile(_target: Option<String>) -> Result<()> {
     let total_start = Instant::now();
 
     let (config_path, cfg) = config::load_or_find_config()?;
@@ -69,8 +69,8 @@ pub fn execute_with_profile(_target: Option<String>, release: bool) -> Result<()
 
     let config_time = total_start.elapsed();
     println!(
-        "  {} Config loading                               {:>6}ms",
-        style("■").dim(),
+        "  {} config loading                               {:>6}ms",
+        style("·").dim(),
         config_time.as_millis()
     );
 
@@ -79,7 +79,7 @@ pub fn execute_with_profile(_target: Option<String>, release: bool) -> Result<()
     let jdk_time = jdk_start.elapsed();
     println!(
         "  {} JDK verification                             {:>6}ms",
-        style("■").dim(),
+        style("·").dim(),
         jdk_time.as_millis()
     );
 
@@ -88,8 +88,8 @@ pub fn execute_with_profile(_target: Option<String>, release: bool) -> Result<()
     let compile_jars = resolve_deps_with_scopes(&project, &cfg, &["compile", "provided"])?;
     let dep_time = dep_start.elapsed();
     println!(
-        "  {} Dependency resolution ({} jars)            {:>6}ms",
-        style("■").dim(),
+        "  {} dependency resolution ({} jars)            {:>6}ms",
+        style("·").dim(),
         compile_jars.len(),
         dep_time.as_millis()
     );
@@ -104,31 +104,31 @@ pub fn execute_with_profile(_target: Option<String>, release: bool) -> Result<()
     }
 
     println!(
-        "  {} Compilation ({} files)                     {:>6}ms",
-        style("■").dim(),
+        "  {} compilation ({} files)                     {:>6}ms",
+        style("·").dim(),
         result.files_compiled,
         compile_time.as_millis()
     );
 
-    if release {
+    if cfg.main.is_some() {
         let jar_start = Instant::now();
         let runtime_jars = resolve_deps_with_scopes(&project, &cfg, &["compile", "runtime"])?;
-        build_release_jar(&project, &cfg, &runtime_jars)?;
+        build_release_jar(&project, &cfg, &runtime_jars, None)?;
         let jar_time = jar_start.elapsed();
         println!(
-            "  {} Release JAR packaging                        {:>6}ms",
-            style("■").dim(),
+            "  {} JAR packaging                                {:>6}ms",
+            style("·").dim(),
             jar_time.as_millis()
         );
     }
 
-    scripts::run_script(&cfg.scripts, &cfg.env, "postbuild", &project)?;
+    scripts::run_script(&cfg, "postbuild", &project)?;
 
     let total = total_start.elapsed();
     println!();
     println!(
-        "  {} Total                                        {:>6}ms",
-        style("■").cyan().bold(),
+        "  {} total                                        {:>6}ms",
+        style("✓").green().bold(),
         total.as_millis()
     );
     println!();
@@ -136,29 +136,36 @@ pub fn execute_with_profile(_target: Option<String>, release: bool) -> Result<()
     Ok(())
 }
 
-pub fn execute(target: Option<String>, release: bool) -> Result<()> {
-    execute_inner(target, release, false)
+/// Compile only (no JAR packaging). Used by dev/test commands.
+pub fn compile_only(target: Option<String>) -> Result<()> {
+    build_impl(target, false, false)
 }
 
-pub fn execute_keep_going(target: Option<String>, release: bool) -> Result<()> {
-    execute_inner(target, release, true)
+pub fn execute(target: Option<String>) -> Result<()> {
+    build_impl(target, true, false)
 }
 
-fn execute_inner(target: Option<String>, release: bool, keep_going: bool) -> Result<()> {
+pub fn execute_keep_going(target: Option<String>) -> Result<()> {
+    build_impl(target, true, true)
+}
+
+fn build_impl(target: Option<String>, package: bool, keep_going: bool) -> Result<()> {
     let total_start = Instant::now();
 
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
+    super::idea::auto_sync_idea(&project, &cfg);
+
     // Run prebuild script
-    scripts::run_script(&cfg.scripts, &cfg.env, "prebuild", &project)?;
+    scripts::run_script(&cfg, "prebuild", &project)?;
 
     // Ensure JDK is available
     ensure_jdk_for_config(&cfg)?;
 
     if cfg.workspaces.is_some() {
-        let result = build_workspace(&project, &cfg, target.as_deref(), release, keep_going);
-        scripts::run_script(&cfg.scripts, &cfg.env, "postbuild", &project)?;
+        let result = build_workspace(&project, &cfg, target.as_deref(), package, keep_going);
+        scripts::run_script(&cfg, "postbuild", &project)?;
         print_total_time(total_start);
         return result;
     }
@@ -185,43 +192,21 @@ fn execute_inner(target: Option<String>, release: bool, keep_going: bool) -> Res
     }
 
     println!(
-        "  {} Resolved dependencies                          {:>6}ms",
+        "  {} resolved dependencies {:>38}ms",
         style("✓").green(),
         resolve_time.as_millis()
     );
 
-    if result.files_compiled == 0 {
-        if result.errors.contains("restored from build cache") {
-            println!(
-                "  {} {} restored from build cache                  {:>6}ms",
-                style("✓").green(),
-                style(&cfg.name).bold(),
-                compile_time.as_millis()
-            );
-        } else {
-            println!(
-                "  {} {} is up to date",
-                style("✓").green(),
-                style(&cfg.name).bold()
-            );
-        }
-    } else {
-        println!(
-            "  {} Compiled {} ({} files)                         {:>6}ms",
-            style("✓").green(),
-            style(&cfg.name).bold(),
-            result.files_compiled,
-            compile_time.as_millis()
-        );
-    }
+    let out_dir = config::output_classes_dir(&project);
+    print_compile_result(&cfg.name, &result, compile_time, &out_dir);
 
-    if release {
+    if package && cfg.main.is_some() {
         // Fat JAR: compile + runtime (exclude provided and test)
         let runtime_jars = resolve_deps_with_scopes(&project, &cfg, &["compile", "runtime"])?;
-        build_release_jar(&project, &cfg, &runtime_jars)?;
+        build_release_jar(&project, &cfg, &runtime_jars, None)?;
     }
 
-    scripts::run_script(&cfg.scripts, &cfg.env, "postbuild", &project)?;
+    scripts::run_script(&cfg, "postbuild", &project)?;
 
     print_total_time(total_start);
     Ok(())
@@ -232,20 +217,20 @@ fn print_total_time(start: Instant) {
     let ms = elapsed.as_millis();
     if ms > 1000 {
         println!(
-            "\n  {} Done in {:.1}s",
-            style("⚡").cyan(),
+            "\n  {} built in {:.2}s",
+            style("✓").green(),
             elapsed.as_secs_f64()
         );
     } else {
         println!(
-            "\n  {} Done in {}ms",
-            style("⚡").cyan(),
+            "\n  {} built in {}ms",
+            style("✓").green(),
             ms
         );
     }
 }
 
-fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, release: bool, keep_going: bool) -> Result<()> {
+fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, package: bool, keep_going: bool) -> Result<()> {
     let ws = WorkspaceGraph::build(root)?;
 
     let packages = if let Some(target) = target {
@@ -312,7 +297,7 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, relea
     let dep_time = dep_start.elapsed();
     let total_jars: usize = per_module_jars.values().next().map(|v| v.len()).unwrap_or(0);
     println!(
-        "  {} Resolved workspace dependencies ({} jars)        {:>6}ms",
+        "  {} resolved workspace dependencies ({} jars) {:>11}ms",
         style("✓").green(),
         total_jars,
         dep_time.as_millis()
@@ -332,8 +317,8 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, relea
             if keep_going && has_failed_dependency(pkg_name, &failed_modules, &ws) {
                 failed_modules.push(pkg_name.clone());
                 println!(
-                    "  {} Skipped '{}' (depends on failed module)",
-                    style("→").dim(),
+                    "{} {} (depends on failed module)",
+                    style(format!("{:>12}", "Skipping")).yellow().bold(),
                     pkg_name
                 );
                 continue;
@@ -358,8 +343,9 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, relea
                 bail!("Compilation of '{}' failed", pkg_name);
             }
 
-            print_compile_result(pkg_name, &result, elapsed);
-            workspace_classpath.push(config::output_classes_dir(&pkg.path));
+            let out_dir = config::output_classes_dir(&pkg.path);
+            print_compile_result(pkg_name, &result, elapsed, &out_dir);
+            workspace_classpath.push(out_dir);
         } else {
             let start = Instant::now();
             let cp_snapshot = workspace_classpath.clone();
@@ -388,7 +374,8 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, relea
             for (pkg_name, result) in &results {
                 match result {
                     Ok(r) if r.success => {
-                        print_compile_result(pkg_name, r, elapsed);
+                        let pkg = ws.get_package(pkg_name.as_str()).unwrap();
+                        print_compile_result(pkg_name, r, elapsed, &config::output_classes_dir(&pkg.path));
                     }
                     Ok(r) => {
                         eprint!("{}", compiler::colorize_errors(&r.errors));
@@ -429,8 +416,8 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, relea
         bail!("Workspace build failed ({} module(s))", failed_modules.len());
     }
 
-    if release {
-        // Determine which modules get a fat JAR:
+    if package {
+        // Package fat JARs for modules with a `main` field
         // - If target specified: only that module
         // - If no target: all modules with a `main` field
         let jar_targets: Vec<&str> = if let Some(target) = target {
@@ -456,10 +443,17 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, relea
                     all_deps.push(config::output_classes_dir(&p.path));
                 }
             }
-            // Release JAR uses compile + runtime scope only (not provided/test)
             let runtime_jars = resolve_deps_with_scopes(&pkg.path, &pkg.config, &["compile", "runtime"])?;
             all_deps.extend(runtime_jars);
-            build_release_jar(&pkg.path, &pkg.config, &all_deps)?;
+            build_release_jar(&pkg.path, &pkg.config, &all_deps, Some(root))?;
+        }
+
+        if !jar_targets.is_empty() {
+            println!(
+                "{} {}",
+                style(format!("{:>12}", "→")).dim(),
+                style(root.join("out").join("release").display()).dim()
+            );
         }
     }
 
@@ -506,27 +500,27 @@ fn compute_parallel_levels(topo_sorted: &[String], ws: &WorkspaceGraph) -> Vec<V
     levels
 }
 
-fn print_compile_result(name: &str, result: &compiler::CompileResult, elapsed: std::time::Duration) {
+fn print_compile_result(name: &str, result: &compiler::CompileResult, elapsed: std::time::Duration, _output_dir: &Path) {
     if result.files_compiled == 0 {
         if result.errors.contains("restored from build cache") {
             println!(
-                "  {} {} restored from build cache              {:>6}ms",
-                style("✓").green(),
-                style(name).bold(),
+                "{} {} (cached) {:>30}ms",
+                style(format!("{:>12}", "Compiling")).green().bold(),
+                name,
                 elapsed.as_millis()
             );
         } else {
             println!(
-                "  {} {} is up to date",
-                style("✓").green(),
-                style(name).bold()
+                "{} {} (up to date)",
+                style(format!("{:>12}", "Compiling")).green().bold(),
+                name,
             );
         }
     } else {
         println!(
-            "  {} Compiled {} ({} files)                     {:>6}ms",
-            style("✓").green(),
-            style(name).bold(),
+            "{} {} ({} files) {:>27}ms",
+            style(format!("{:>12}", "Compiling")).green().bold(),
+            name,
             result.files_compiled,
             elapsed.as_millis()
         );
@@ -534,9 +528,10 @@ fn print_compile_result(name: &str, result: &compiler::CompileResult, elapsed: s
 }
 
 /// Build a fat/executable JAR containing all classes and dependencies.
-fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]) -> Result<()> {
+pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf], output_base: Option<&Path>) -> Result<()> {
     let out = config::output_classes_dir(project);
-    let release_dir = project.join("out");
+    let base = output_base.unwrap_or(project);
+    let release_dir = base.join("out").join("release");
     std::fs::create_dir_all(&release_dir)?;
 
     let jar_name = format!("{}-{}.jar", cfg.name, cfg.version.as_deref().unwrap_or("0.0.0"));
@@ -650,9 +645,9 @@ fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]) -> Result
     }
 
     println!(
-        "  {} Created release JAR: {}",
-        style("✓").green(),
-        style(jar_path.display()).bold()
+        "{} {}",
+        style(format!("{:>12}", "Packaging")).green().bold(),
+        jar_name
     );
 
     Ok(())
@@ -720,7 +715,7 @@ fn detect_fat_jar_conflicts(jars: &[PathBuf]) {
     let total = conflicts.len();
     println!(
         "  {} fat JAR: {} duplicate class(es) detected across dependency JARs",
-        style("⚠").yellow(),
+        style("!").yellow(),
         total
     );
 
@@ -996,6 +991,72 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     Ok(all_jars)
 }
 
+/// Like resolve_deps but skip JAR downloads. Returns expected cache paths.
+/// Used by `ym idea --json` so importing is never blocked by network I/O.
+pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
+    use crate::workspace::resolver::RegistryEntry;
+    let mut registries: Vec<RegistryEntry> = Vec::new();
+    let mut resolutions = cfg.resolutions.as_ref().cloned().unwrap_or_default();
+
+    let deps = if let Some(ws_root) = config::find_workspace_root(project) {
+        if ws_root != project {
+            let root_config_path = ws_root.join(config::CONFIG_FILE);
+            if let Ok(root_cfg) = config::load_config(&root_config_path) {
+                let errors = cfg.validate_workspace_deps(&root_cfg);
+                if !errors.is_empty() {
+                    anyhow::bail!("{}", errors.join("; "));
+                }
+                let mut d = cfg.maven_dependencies_with_root(&root_cfg);
+                if let Some(ref root_resolutions) = root_cfg.resolutions {
+                    for (k, v) in root_resolutions {
+                        if d.contains_key(k.as_str()) {
+                            d.insert(k.clone(), v.clone());
+                        }
+                        resolutions.insert(k.clone(), v.clone());
+                    }
+                }
+                registries.extend(root_cfg.registry_entries());
+                d
+            } else {
+                cfg.maven_dependencies()
+            }
+        } else {
+            cfg.maven_dependencies()
+        }
+    } else {
+        cfg.maven_dependencies()
+    };
+
+    let current_entries = cfg.registry_entries();
+    for entry in current_entries {
+        if !registries.iter().any(|e| e.url == entry.url) {
+            registries.insert(0, entry);
+        }
+    }
+
+    let cache = config::maven_cache_dir(project);
+
+    if deps.is_empty() {
+        let jars = resolve_lib_dirs(project, cfg);
+        return Ok(jars);
+    }
+
+    let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
+    let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
+    exclusions.extend(cfg.per_dependency_exclusions());
+
+    let dep_scopes = build_dep_scope_map(cfg, &["compile", "provided", "runtime", "test"]);
+    let jars = crate::workspace::resolver::resolve_no_download(
+        &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &dep_scopes,
+    )?;
+    config::save_resolved_cache(project, &resolved)?;
+
+    let mut all_jars = jars;
+    all_jars.extend(resolve_lib_dirs(project, cfg));
+
+    Ok(all_jars)
+}
+
 pub fn compile_project(
     project: &Path,
     cfg: &YmConfig,
@@ -1032,11 +1093,12 @@ pub fn compile_project(
     };
 
     let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
-    resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()))?;
+    let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
+    resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
 
     let resources_dir = project.join("src").join("main").join("resources");
     if resources_dir.exists() {
-        resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()))?;
+        resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
 
     let engine = compiler::CompilerEngine::from_config(
@@ -1130,6 +1192,19 @@ pub fn ensure_jdk_for_config(cfg: &YmConfig) -> Result<()> {
     let java_home = jvm::ensure_jdk(&version, vendor, auto_download)?;
 
     if java_home != Path::new("system") && java_home.exists() {
+        if !crate::is_json_quiet() {
+            // Print JDK info: extract name from path (e.g. "jdk-21.0.2" from the directory name)
+            let jdk_name = java_home.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("JDK {}", version));
+            println!(
+                "  {}  {}  {} ({})",
+                style("➜").green(),
+                style("JDK:").bold(),
+                &jdk_name,
+                style(java_home.display()).dim()
+            );
+        }
         unsafe {
             std::env::set_var("JAVA_HOME", &java_home);
             let bin_dir = java_home.join("bin");
@@ -1140,6 +1215,22 @@ pub fn ensure_jdk_for_config(cfg: &YmConfig) -> Result<()> {
                     format!("{}{}{}", bin_dir.display(), sep, current_path),
                 );
             }
+        }
+    } else if !crate::is_json_quiet() {
+        // System JDK — get path from which javac
+        let javac_path = jvm::which_javac()
+            .and_then(|p| p.parent().and_then(|b| b.parent()).map(|h| h.to_path_buf()));
+        if let Some(home) = javac_path {
+            let jdk_name = home.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "System JDK".to_string());
+            println!(
+                "  {}  {}  {} ({})",
+                style("➜").green(),
+                style("JDK:").bold(),
+                &jdk_name,
+                style(home.display()).dim()
+            );
         }
     }
 
@@ -1202,11 +1293,13 @@ fn resolve_url_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
         let jar_path = jar_dir.join(filename);
 
         if !jar_path.exists() {
-            println!(
-                "  {} Downloading {}...",
-                console::style("↓").blue(),
-                filename
-            );
+            if !crate::is_json_quiet() {
+                println!(
+                    "  {} downloading {}...",
+                    console::style("➜").green(),
+                    filename
+                );
+            }
             let client = reqwest::blocking::Client::builder()
                 .user_agent(format!("ym/{}", env!("CARGO_PKG_VERSION")))
                 .build()?;
@@ -1222,11 +1315,13 @@ fn resolve_url_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
             }
             let bytes = response.bytes()?;
             std::fs::write(&jar_path, &bytes)?;
-            println!(
-                "  {} Downloaded {}",
-                console::style("✓").green(),
-                filename
-            );
+            if !crate::is_json_quiet() {
+                println!(
+                    "  {} downloaded {}",
+                    console::style("✓").green(),
+                    filename
+                );
+            }
         }
 
         jars.push(jar_path);
@@ -1251,11 +1346,13 @@ fn resolve_git_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
 
         // Clone or update
         if !repo_dir.exists() {
-            println!(
-                "  {} Cloning {}...",
-                console::style("↓").blue(),
-                name
-            );
+            if !crate::is_json_quiet() {
+                println!(
+                    "  {} cloning {}...",
+                    console::style("➜").green(),
+                    name
+                );
+            }
             let mut cmd = std::process::Command::new("git");
             cmd.arg("clone").arg("--depth").arg("1");
             if let Some(r) = git_ref {
@@ -1277,11 +1374,13 @@ fn resolve_git_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
         let pkg_toml = repo_dir.join("package.toml");
         if pkg_toml.exists() {
             // Build with ym
-            println!(
-                "  {} Building Git dependency {}...",
-                console::style("→").blue(),
-                name
-            );
+            if !crate::is_json_quiet() {
+                println!(
+                    "  {} building Git dependency {}...",
+                    console::style("➜").green(),
+                    name
+                );
+            }
             let status = std::process::Command::new("ymc")
                 .arg("build")
                 .current_dir(&repo_dir)

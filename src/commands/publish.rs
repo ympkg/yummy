@@ -26,10 +26,10 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
         .unwrap_or("0.0.0");
 
     // Run prepublish script
-    crate::scripts::run_script(&cfg.scripts, &cfg.env, "prepublish", &project)?;
+    crate::scripts::run_script(&cfg, "prepublish", &project)?;
 
     // Build first
-    super::build::execute(None, true)?;
+    super::build::execute(None)?;
 
     // Generate POM
     let pom_path = project.join("out").join("pom.xml");
@@ -80,7 +80,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
 
     if dry_run {
         println!();
-        println!("  {} Dry run — would publish:", style("→").blue());
+        println!("  {} dry run — would publish:", style("➜").green());
         println!("    Package:  {}@{}", style(&cfg.name).bold(), version);
         println!("    Registry: {}", style(&registry_url).dim());
         let sources_size = std::fs::metadata(&sources_jar).map(|m| m.len()).unwrap_or(0);
@@ -110,8 +110,8 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
     let creds = load_credentials_for_registry(&creds_path, &registry_url)?;
 
     println!(
-        "  {} Publishing {} to {}",
-        style("→").blue(),
+        "  {} publishing {} to {}",
+        style("➜").green(),
         style(&cfg.name).bold(),
         style(&registry_url).dim()
     );
@@ -123,7 +123,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
     if is_sonatype_url(&registry_url) {
         println!(
             "  {} Detected Sonatype OSSRH — attempting staging close + release",
-            style("→").blue()
+            style("➜").green()
         );
         match sonatype_close_and_release(&registry_url, &cfg, &creds) {
             Ok(()) => {
@@ -148,7 +148,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
     );
 
     // Run postpublish script
-    crate::scripts::run_script(&cfg.scripts, &cfg.env, "postpublish", &project)?;
+    crate::scripts::run_script(&cfg, "postpublish", &project)?;
 
     Ok(())
 }
@@ -174,7 +174,7 @@ fn publish_workspace_module(
     let module_path = &pkg.path;
 
     // Build the module
-    super::build::execute(Some(module_name.to_string()), false)?;
+    super::build::execute(Some(module_name.to_string()))?;
 
     // Generate POM for the module
     let pom_path = module_path.join("out").join("pom.xml");
@@ -222,7 +222,7 @@ fn publish_workspace_module(
     if dry_run {
         let jar_size = std::fs::metadata(&jar_path).map(|m| m.len()).unwrap_or(0);
         println!();
-        println!("  {} Dry run — would publish module:", style("→").blue());
+        println!("  {} dry run — would publish module:", style("➜").green());
         println!("    Package:  {}@{}", style(&module_cfg.name).bold(), version);
         println!("    GroupId:  {}", module_cfg.group_id);
         println!("    Registry: {}", style(&registry_url).dim());
@@ -236,8 +236,8 @@ fn publish_workspace_module(
     let creds = load_credentials_for_registry(&creds_path, &registry_url)?;
 
     println!(
-        "  {} Publishing module {} to {}",
-        style("→").blue(),
+        "  {} publishing module {} to {}",
+        style("➜").green(),
         style(&module_cfg.name).bold(),
         style(&registry_url).dim()
     );
@@ -854,7 +854,7 @@ fn sonatype_close_and_release(
         bail!("Failed to close staging repo: HTTP {} — {}", status, text);
     }
 
-    println!("  {} Staging repo closed, waiting for validation...", style("→").blue());
+    println!("  {} Staging repo closed, waiting for validation...", style("➜").green());
 
     // Poll for close completion (up to 2 minutes)
     let activity_url = format!(

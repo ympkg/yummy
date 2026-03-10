@@ -31,8 +31,8 @@ pub fn execute(verify: bool) -> Result<()> {
         let modules = parse_settings_gradle(settings_path)?;
         if !modules.is_empty() {
             println!(
-                "  {} Migrating multi-module Gradle project ({} modules)...",
-                style("→").blue(),
+                "  {} migrating multi-module Gradle project ({} modules)...",
+                style("➜").green(),
                 modules.len()
             );
             migrate_gradle_multimodule(&cwd, settings_path, &modules)?;
@@ -50,8 +50,8 @@ pub fn execute(verify: bool) -> Result<()> {
         let modules = find_modules(&doc.root_element());
         if !modules.is_empty() {
             println!(
-                "  {} Migrating multi-module Maven project ({} modules)...",
-                style("→").blue(),
+                "  {} migrating multi-module Maven project ({} modules)...",
+                style("➜").green(),
                 modules.len()
             );
             migrate_maven_multimodule(&cwd, &pom, &modules)?;
@@ -64,15 +64,15 @@ pub fn execute(verify: bool) -> Result<()> {
 
     // Single-project migration
     let cfg = if pom.exists() {
-        println!("  {} Migrating from pom.xml...", style("→").blue());
+        println!("  {} migrating from pom.xml...", style("➜").green());
         migrate_from_pom(&pom)?
     } else if gradle.exists() {
-        println!("  {} Migrating from build.gradle...", style("→").blue());
+        println!("  {} migrating from build.gradle...", style("➜").green());
         migrate_from_gradle(&gradle)?
     } else if gradle_kts.exists() {
         println!(
-            "  {} Migrating from build.gradle.kts...",
-            style("→").blue()
+            "  {} migrating from build.gradle.kts...",
+            style("➜").green()
         );
         migrate_from_gradle(&gradle_kts)?
     } else {
@@ -94,10 +94,10 @@ fn run_post_migration_verify() -> Result<()> {
     println!();
     println!(
         "  {} Verifying migration...",
-        style("→").blue()
+        style("➜").green()
     );
 
-    match super::build::execute(None, false) {
+    match super::build::compile_only(None) {
         Ok(()) => {
             println!(
                 "  {} Migration verified — build succeeded",
@@ -622,7 +622,7 @@ fn detect_gradle_plugins(
 
     // Print detected plugin hints
     for hint in &hints {
-        println!("  {} {}", style("→").blue(), style(hint).dim());
+        println!("  {} {}", style("➜").green(), style(hint).dim());
     }
 }
 
@@ -968,7 +968,7 @@ fn detect_maven_plugins(
     }
 
     for hint in &hints {
-        println!("  {} {}", style("→").blue(), style(hint).dim());
+        println!("  {} {}", style("➜").green(), style(hint).dim());
     }
 }
 

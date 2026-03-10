@@ -65,7 +65,7 @@ fn execute_defaults(dir: &Path) -> Result<()> {
     write_project(dir, &config)?;
 
     // Run postinit hook if defined
-    crate::scripts::run_script(&config.scripts, &config.env, "postinit", dir)?;
+    crate::scripts::run_script(&config, "postinit", dir)?;
 
     let main_class = config.main.as_deref().unwrap_or("Main");
     let main_path = main_class.replace('.', "/");
@@ -96,7 +96,7 @@ fn execute_interactive(dir: &Path) -> Result<()> {
     // 2. Java version — scan installed JDKs
     println!();
     let term = console::Term::stderr();
-    let _ = term.write_line(&format!("  {} Scanning JDKs...", style("→").blue()));
+    let _ = term.write_line(&format!("  {} scanning JDKs...", style("➜").green()));
     let jdks = jdk_manager::scan_jdks();
     let _ = term.clear_last_lines(1);
 
@@ -127,18 +127,16 @@ fn execute_interactive(dir: &Path) -> Result<()> {
         ..Default::default()
     };
 
-    // Set up env with DEV_JAVA_HOME if JDK was selected
+    // Set up env
+    let env = config.env.get_or_insert_with(BTreeMap::new);
+    env.insert("APP_PORT".to_string(), "8080".to_string());
     if let Some(ref path) = dev_jdk_path {
-        let mut env = BTreeMap::new();
         env.insert("DEV_JAVA_HOME".to_string(), shorten_home(path));
-        config.env = Some(env);
-        // Update scripts to use DEV_JAVA_HOME
-        use config::schema::ScriptValue;
-        let mut scripts = BTreeMap::new();
-        scripts.insert("dev".to_string(), ScriptValue::Simple("JAVA_HOME=$DEV_JAVA_HOME ymc dev".to_string()));
-        scripts.insert("build".to_string(), ScriptValue::Simple("ymc build".to_string()));
-        scripts.insert("test".to_string(), ScriptValue::Simple("ymc test".to_string()));
-        config.scripts = Some(scripts);
+        // Update dev script to use DEV_JAVA_HOME
+        if let Some(ref mut scripts) = config.scripts {
+            use config::schema::ScriptValue;
+            scripts.insert("dev".to_string(), ScriptValue::Simple("JAVA_HOME=$DEV_JAVA_HOME ymc dev".to_string()));
+        }
     }
 
     // Apply template-specific config
@@ -191,7 +189,7 @@ fn execute_interactive(dir: &Path) -> Result<()> {
     write_project_for_template(dir, &config, template)?;
 
     // Run postinit hook if defined
-    crate::scripts::run_script(&config.scripts, &config.env, "postinit", dir)?;
+    crate::scripts::run_script(&config, "postinit", dir)?;
 
     println!();
     println!(
@@ -371,11 +369,79 @@ fn shorten_home(path: &Path) -> String {
 /// Default scripts for package.toml
 fn default_scripts() -> BTreeMap<String, config::schema::ScriptValue> {
     use config::schema::ScriptValue;
-    let mut scripts = BTreeMap::new();
-    scripts.insert("dev".to_string(), ScriptValue::Simple("ymc dev".to_string()));
-    scripts.insert("build".to_string(), ScriptValue::Simple("ymc build".to_string()));
-    scripts.insert("test".to_string(), ScriptValue::Simple("ymc test".to_string()));
-    scripts
+    let mut s = BTreeMap::new();
+    // Build
+    s.insert("build".into(), ScriptValue::Simple("ymc build".into()));
+    s.insert("build:clean".into(), ScriptValue::Simple("ymc build --clean".into()));
+    // Dev
+    s.insert("dev".into(), ScriptValue::Simple("ymc dev".into()));
+    s.insert("dev:debug".into(), ScriptValue::Simple("ymc dev --debug".into()));
+    // Test
+    s.insert("test".into(), ScriptValue::Simple("ymc test".into()));
+    s.insert("test:watch".into(), ScriptValue::Simple("ymc test --watch".into()));
+    s.insert("test:coverage".into(), ScriptValue::Simple("ymc test --coverage".into()));
+    // Clean
+    s.insert("clean".into(), ScriptValue::Simple("ymc clean -y".into()));
+    s.insert("clean:all".into(), ScriptValue::Simple("ymc clean --all -y".into()));
+    // IDE
+    s.insert("idea".into(), ScriptValue::Simple("ymc idea --sources".into()));
+    // Native
+    s.insert("native".into(), ScriptValue::Simple("ymc native".into()));
+    s.insert("native:docker".into(), ScriptValue::Simple("ymc native --docker".into()));
+    s.insert("native:install".into(), ScriptValue::Simple("ymc native --install".into()));
+    // Docker — jar
+    s.insert("docker:jar".into(), ScriptValue::Simple("ymc build && docker build -f docker/jar/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} .".into()));
+    s.insert("docker:jar:publish".into(), ScriptValue::Simple("ymc build && docker build -f docker/jar/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} -t ${project.name}:latest . && docker push ${project.name}:${project.version} && docker push ${project.name}:latest".into()));
+    // Docker — native
+    s.insert("docker:native".into(), ScriptValue::Simple("ymc native && docker build -f docker/native/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} .".into()));
+    s.insert("docker:native:publish".into(), ScriptValue::Simple("ymc native && docker build -f docker/native/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} -t ${project.name}:latest . && docker push ${project.name}:${project.version} && docker push ${project.name}:latest".into()));
+    s
+}
+
+/// Formatted [scripts] block for package.toml (matches yummy-demo best practices)
+fn default_scripts_block() -> &'static str {
+    r#"[scripts]
+# Build
+build = "ymc build"
+"build:clean" = "ymc build --clean"               # full rebuild
+
+# Dev
+dev = "ymc dev"                                    # hot reload
+"dev:debug" = "ymc dev --debug"                    # JDWP on :5005
+
+# Test
+test = "ymc test"
+"test:watch" = "ymc test --watch"                  # watch mode
+"test:coverage" = "ymc test --coverage"            # JaCoCo coverage
+
+# Clean
+clean = "ymc clean -y"
+"clean:all" = "ymc clean --all -y"                 # +dependency cache
+
+# IDE
+idea = "ymc idea --sources"                        # IntelliJ + source JARs
+
+# Native
+native = "ymc native"                              # local GraalVM
+"native:docker" = "ymc native --docker"            # via Docker container
+"native:install" = "ymc native --install"          # build & install to ~/.ym/bin/
+
+# Docker — jar
+"docker:jar" = "ymc build && docker build -f docker/jar/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} ."
+"docker:jar:publish" = "ymc build && docker build -f docker/jar/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} -t ${project.name}:latest . && docker push ${project.name}:${project.version} && docker push ${project.name}:latest"
+
+# Docker — native
+"docker:native" = "ymc native && docker build -f docker/native/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} ."
+"docker:native:publish" = "ymc native && docker build -f docker/native/Dockerfile --build-arg APP_NAME=${project.name} --build-arg APP_VERSION=${project.version} --build-arg APP_PORT=$APP_PORT -t ${project.name}:${project.version} -t ${project.name}:latest . && docker push ${project.name}:${project.version} && docker push ${project.name}:latest"
+"#
+}
+
+/// Replace the auto-generated [scripts] section with the formatted block
+fn replace_scripts_section(content: &mut String) {
+    if let Some(start) = content.find("\n[scripts]\n") {
+        content.truncate(start + 1);
+        content.push_str(default_scripts_block());
+    }
 }
 
 /// Non-interactive init from template
@@ -388,6 +454,9 @@ fn execute_from_template(dir: &Path, template: &str) -> Result<()> {
     let dir_name = dir_name(dir);
     let pkg = default_package(&dir_name);
 
+    let mut env = BTreeMap::new();
+    env.insert("APP_PORT".to_string(), "8080".to_string());
+
     let mut config = YmConfig {
         name: dir_name.clone(),
         group_id: "com.example".to_string(),
@@ -396,6 +465,7 @@ fn execute_from_template(dir: &Path, template: &str) -> Result<()> {
         package: Some(pkg.clone()),
         dependencies: Some(BTreeMap::new()),
         scripts: Some(default_scripts()),
+        env: Some(env),
         ..Default::default()
     };
 
@@ -439,7 +509,7 @@ fn execute_from_template(dir: &Path, template: &str) -> Result<()> {
     write_project_for_template(dir, &config, template)?;
 
     // Run postinit hook if defined
-    crate::scripts::run_script(&config.scripts, &config.env, "postinit", dir)?;
+    crate::scripts::run_script(&config, "postinit", dir)?;
 
     println!();
     println!(
@@ -476,8 +546,8 @@ fn execute_from_custom_template(dir: &Path, template: &str) -> Result<()> {
     if template.starts_with("https://") || template.starts_with("http://") || template.starts_with("git@") {
         // Clone Git repo to temp dir, then copy contents
         println!(
-            "  {} Cloning template from {}",
-            style("→").blue(),
+            "  {} cloning template from {}",
+            style("➜").green(),
             style(template).dim()
         );
 
@@ -501,8 +571,8 @@ fn execute_from_custom_template(dir: &Path, template: &str) -> Result<()> {
         }
 
         println!(
-            "  {} Copying template from {}",
-            style("→").blue(),
+            "  {} copying template from {}",
+            style("➜").green(),
             style(template).dim()
         );
 
@@ -514,7 +584,7 @@ fn execute_from_custom_template(dir: &Path, template: &str) -> Result<()> {
     if config_path.exists() {
         // Run postinit hook if defined in the template's package.toml
         if let Ok(cfg) = config::load_config(&config_path) {
-            crate::scripts::run_script(&cfg.scripts, &cfg.env, "postinit", dir)?;
+            crate::scripts::run_script(&cfg, "postinit", dir)?;
         }
     }
 
@@ -567,6 +637,23 @@ fn write_project(dir: &Path, config: &YmConfig) -> Result<()> {
     let config_path = dir.join(config::CONFIG_FILE);
     config::save_config(&config_path, config)?;
 
+    // Insert [env] block before [dependencies] and append dev hint at the end
+    let env_block = r#"
+[env]
+APP_PORT = "8080"
+#JBR_HOME = "/usr/lib/jdk/jbr-25"
+#GRAALVM_HOME = "/usr/lib/jdk/graalvm-jdk-25"
+
+"#;
+    let suffix = "\n#dev = \"JAVA_HOME=$JBR_HOME ymc dev\"\n";
+    let mut content = std::fs::read_to_string(&config_path)?;
+    if let Some(pos) = content.find("\n[dependencies]") {
+        content.insert_str(pos + 1, env_block);
+    }
+    replace_scripts_section(&mut content);
+    content.push_str(suffix);
+    std::fs::write(&config_path, content)?;
+
     let src_dir = dir.join("src").join("main").join("java");
     std::fs::create_dir_all(&src_dir)?;
     create_sample_main(&src_dir, config)?;
@@ -577,6 +664,8 @@ fn write_project(dir: &Path, config: &YmConfig) -> Result<()> {
     let test_dir = dir.join("src").join("test").join("java");
     std::fs::create_dir_all(&test_dir)?;
 
+    let target = config.target.as_deref().unwrap_or("21");
+    write_dockerfiles(dir, target)?;
     write_gitignore(dir)?;
 
     Ok(())
@@ -588,6 +677,23 @@ fn write_project_for_template(dir: &Path, config: &YmConfig, template: &str) -> 
 
     let config_path = dir.join(config::CONFIG_FILE);
     config::save_config(&config_path, config)?;
+
+    // Replace [scripts] with the formatted block
+    let mut content = std::fs::read_to_string(&config_path)?;
+    replace_scripts_section(&mut content);
+    // If config has a non-default dev command (e.g. DEV_JAVA_HOME), patch it in
+    if let Some(ref scripts) = config.scripts {
+        if let Some(config::schema::ScriptValue::Simple(dev_cmd)) = scripts.get("dev") {
+            if dev_cmd != "ymc dev" {
+                content = content.replace(
+                    "dev = \"ymc dev\"                                    # hot reload",
+                    &format!("dev = \"{}\"", dev_cmd),
+                );
+            }
+        }
+    }
+    content.push_str("\n#dev = \"JAVA_HOME=$JBR_HOME ymc dev\"\n");
+    std::fs::write(&config_path, content)?;
 
     let src_dir = dir.join("src").join("main").join("java");
     std::fs::create_dir_all(&src_dir)?;
@@ -669,7 +775,45 @@ class {}Test {{
         }
     }
 
+    let target = config.target.as_deref().unwrap_or("21");
+    write_dockerfiles(dir, target)?;
     write_gitignore(dir)?;
+
+    Ok(())
+}
+
+/// Create docker/jar/Dockerfile and docker/native/Dockerfile
+fn write_dockerfiles(dir: &Path, target: &str) -> Result<()> {
+    let jar_dir = dir.join("docker").join("jar");
+    std::fs::create_dir_all(&jar_dir)?;
+    std::fs::write(
+        jar_dir.join("Dockerfile"),
+        format!(
+            r#"FROM eclipse-temurin:{}-jre-alpine
+ARG APP_NAME
+ARG APP_VERSION
+ARG APP_PORT=8080
+COPY out/release/${{APP_NAME}}-${{APP_VERSION}}.jar /app.jar
+EXPOSE ${{APP_PORT}}
+ENTRYPOINT ["java", "-jar", "/app.jar"]
+"#,
+            target
+        ),
+    )?;
+
+    let native_dir = dir.join("docker").join("native");
+    std::fs::create_dir_all(&native_dir)?;
+    std::fs::write(
+        native_dir.join("Dockerfile"),
+        r#"FROM alpine:3
+ARG APP_NAME
+ARG APP_VERSION
+ARG APP_PORT=8080
+COPY out/release/${APP_NAME} /app
+EXPOSE ${APP_PORT}
+ENTRYPOINT ["/app"]
+"#,
+    )?;
 
     Ok(())
 }
