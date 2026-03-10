@@ -7,6 +7,8 @@ use crate::config;
 use crate::scripts;
 use crate::watcher::FileWatcher;
 
+extern crate walkdir;
+
 #[derive(Clone, Copy)]
 enum TestMode {
     Unit,
@@ -189,7 +191,36 @@ pub fn execute(
                 }
             }
 
-            match run_tests(&project, &cfg, current_filter.as_deref(), verbose, fail_fast, timeout, coverage, &test_mode, tag.as_deref(), exclude_tag.as_deref(), None, parallel) {
+            // Smart affected test detection (spec 06-testing P2)
+            let src_dir = config::source_dir(&project);
+            let test_dir = config::test_dir(&project);
+            let src_root = src_dir.clone();
+            let test_root = test_dir.clone();
+
+            let effective_filter = if current_filter.is_some() {
+                // User set explicit filter — respect it
+                current_filter.clone()
+            } else {
+                // Try smart detection
+                match find_affected_tests(&changed, &src_root, &test_root, &test_dir) {
+                    Some(affected) => {
+                        println!(
+                            "  {} {} affected test(s): {}",
+                            style("·").dim(),
+                            affected.len(),
+                            affected.iter().map(|c| c.rsplit('.').next().unwrap_or(c)).collect::<Vec<_>>().join(", ")
+                        );
+                        // Join as filter — JUnit accepts class name patterns
+                        Some(affected.join("|"))
+                    }
+                    None => {
+                        // Can't determine — run all
+                        None
+                    }
+                }
+            };
+
+            match run_tests(&project, &cfg, effective_filter.as_deref(), verbose, fail_fast, timeout, coverage, &test_mode, tag.as_deref(), exclude_tag.as_deref(), None, parallel) {
                 Ok(()) => { failed_tests.clear(); }
                 Err(e) => {
                     collect_failed_from_error(&e, &mut failed_tests);
@@ -1235,4 +1266,191 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
     let start = tag.find(&pattern)? + pattern.len();
     let end = tag[start..].find('"')? + start;
     Some(tag[start..end].to_string())
+}
+
+// ── Affected test detection ─────────────────────────────────────────
+
+/// Parse import statements from a Java source file.
+/// Returns fully qualified class names (e.g., "com.example.UserService").
+fn parse_imports(content: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            // Skip static imports for now — they reference methods, not classes directly
+            if rest.starts_with("static ") {
+                // Extract class part: "static com.example.Foo.method;" → "com.example.Foo"
+                let static_rest = rest.strip_prefix("static ").unwrap();
+                if let Some(semi) = static_rest.strip_suffix(';') {
+                    // Remove last segment (method/field name)
+                    if let Some(dot_pos) = semi.rfind('.') {
+                        imports.push(semi[..dot_pos].to_string());
+                    }
+                }
+            } else if let Some(class_name) = rest.strip_suffix(';') {
+                if !class_name.ends_with(".*") {
+                    imports.push(class_name.to_string());
+                }
+            }
+        }
+        // Stop scanning after class/interface/enum declaration (imports are before that)
+        if trimmed.starts_with("public ") || trimmed.starts_with("class ")
+            || trimmed.starts_with("interface ") || trimmed.starts_with("enum ")
+            || trimmed.starts_with("abstract ") || trimmed.starts_with("final class ")
+        {
+            break;
+        }
+    }
+    imports
+}
+
+/// Convert a file path under a source root to a fully qualified class name.
+/// e.g., src/test/java/com/example/UserServiceTest.java → "com.example.UserServiceTest"
+fn path_to_class_name(file: &std::path::Path, source_root: &std::path::Path) -> Option<String> {
+    let relative = file.strip_prefix(source_root).ok()?;
+    let s = relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, ".");
+    s.strip_suffix(".java").map(|s| s.to_string())
+}
+
+/// Build a reverse index: source class → list of test classes that import it.
+/// Scans all .java files in the test directory.
+fn build_import_index(
+    test_dir: &std::path::Path,
+    test_root: &std::path::Path,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut index: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    if !test_dir.exists() {
+        return index;
+    }
+
+    let walker = walkdir::WalkDir::new(test_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension().and_then(|ext| ext.to_str()) == Some("java")
+        });
+
+    for entry in walker {
+        let path = entry.path();
+        let test_class = match path_to_class_name(path, test_root) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for imported in parse_imports(&content) {
+            index
+                .entry(imported)
+                .or_default()
+                .push(test_class.clone());
+        }
+    }
+
+    index
+}
+
+/// Given changed file paths, determine which test classes to run.
+/// Returns None if all tests should run (can't determine affected tests).
+/// Returns Some(vec) with specific test class filters.
+fn find_affected_tests(
+    changed_files: &[std::path::PathBuf],
+    src_root: &std::path::Path,
+    test_root: &std::path::Path,
+    test_dir: &std::path::Path,
+) -> Option<Vec<String>> {
+    let import_index = build_import_index(test_dir, test_root);
+    let mut affected: Vec<String> = Vec::new();
+
+    for file in changed_files {
+        // Case 1: Test file changed → run that test directly
+        if file.starts_with(test_dir) {
+            if let Some(class_name) = path_to_class_name(file, test_root) {
+                if !affected.contains(&class_name) {
+                    affected.push(class_name);
+                }
+            }
+            continue;
+        }
+
+        // Case 2: Main source changed → find tests that import this class
+        if file.starts_with(src_root) {
+            if let Some(class_name) = path_to_class_name(file, src_root) {
+                if let Some(test_classes) = import_index.get(&class_name) {
+                    for tc in test_classes {
+                        if !affected.contains(tc) {
+                            affected.push(tc.clone());
+                        }
+                    }
+                } else {
+                    // Changed class not imported by any test → run all (conservative)
+                    return None;
+                }
+            }
+        }
+    }
+
+    if affected.is_empty() {
+        None
+    } else {
+        Some(affected)
+    }
+}
+
+#[cfg(test)]
+mod affected_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_imports_basic() {
+        let content = r#"
+package com.example;
+
+import com.example.UserService;
+import com.example.OrderService;
+import java.util.List;
+
+public class UserServiceTest {
+}
+"#;
+        let imports = parse_imports(content);
+        assert_eq!(imports, vec![
+            "com.example.UserService",
+            "com.example.OrderService",
+            "java.util.List",
+        ]);
+    }
+
+    #[test]
+    fn test_parse_imports_static() {
+        let content = r#"
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import com.example.Foo;
+
+public class FooTest {}
+"#;
+        let imports = parse_imports(content);
+        assert_eq!(imports, vec![
+            "org.junit.jupiter.api.Assertions",
+            "com.example.Foo",
+        ]);
+    }
+
+    #[test]
+    fn test_parse_imports_skips_wildcard() {
+        let content = "import java.util.*;\nimport com.example.Foo;\npublic class X {}";
+        let imports = parse_imports(content);
+        assert_eq!(imports, vec!["com.example.Foo"]);
+    }
+
+    #[test]
+    fn test_path_to_class_name() {
+        let root = std::path::Path::new("src/test/java");
+        let file = std::path::Path::new("src/test/java/com/example/FooTest.java");
+        assert_eq!(path_to_class_name(file, root), Some("com.example.FooTest".to_string()));
+    }
 }
