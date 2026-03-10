@@ -1,0 +1,104 @@
+name: 'Setup Yummy (ym)'
+description: 'Install Yummy Java build tool for GitHub Actions'
+branding:
+  icon: 'package'
+  color: 'orange'
+
+inputs:
+  version:
+    description: 'ym version to install (latest, dev, or specific version like 0.6.0)'
+    required: false
+    default: 'latest'
+  cache:
+    description: 'Whether to cache ym binary'
+    required: false
+    default: 'true'
+
+outputs:
+  ym-version:
+    description: 'Installed ym version'
+    value: ${{ steps.install.outputs.version }}
+  ym-path:
+    description: 'Path to ym binary'
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect platform
+      id: platform
+      shell: bash
+      run: |
+        case "$RUNNER_OS" in
+          Linux)  TARGET="x86_64-unknown-linux-gnu"; EXT="tar.gz" ;;
+          Windows) TARGET="x86_64-pc-windows-msvc"; EXT="zip" ;;
+          macOS)
+            case "$(uname -m)" in
+              arm64) TARGET="aarch64-apple-darwin" ;;
+              *)     TARGET="x86_64-apple-darwin" ;;
+            esac
+            EXT="tar.gz"
+            ;;
+        esac
+        echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+        echo "ext=$EXT" >> "$GITHUB_OUTPUT"
+
+    - name: Resolve version
+      id: resolve
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(curl -fsSL https://api.github.com/repos/ympkg/yummy/releases/latest | grep '"tag_name"' | sed 's/.*"v\(.*\)".*/\1/')
+        elif [ "$VERSION" = "dev" ]; then
+          VERSION=$(curl -fsSL https://api.github.com/repos/ympkg/yummy/releases | grep '"tag_name".*dev' | head -1 | sed 's/.*"v\(.*\)".*/\1/')
+        fi
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Cache ym binary
+      if: inputs.cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.ym/bin
+        key: ym-${{ steps.resolve.outputs.version }}-${{ steps.platform.outputs.target }}
+
+    - name: Install ym
+      id: install
+      shell: bash
+      run: |
+        VERSION="${{ steps.resolve.outputs.version }}"
+        TARGET="${{ steps.platform.outputs.target }}"
+        EXT="${{ steps.platform.outputs.ext }}"
+        INSTALL_DIR="$HOME/.ym/bin"
+        mkdir -p "$INSTALL_DIR"
+
+        # Skip download if cached
+        if [ -f "$INSTALL_DIR/ym" ] || [ -f "$INSTALL_DIR/ym.exe" ]; then
+          echo "ym already installed (cached)"
+        else
+          URL="https://github.com/ympkg/yummy/releases/download/v${VERSION}/ym-${VERSION}-${TARGET}.${EXT}"
+          echo "Downloading ym ${VERSION} from ${URL}"
+          curl -fsSL "$URL" -o "ym-archive.${EXT}"
+
+          if [ "$EXT" = "tar.gz" ]; then
+            tar xzf "ym-archive.${EXT}"
+          else
+            unzip -q "ym-archive.${EXT}"
+          fi
+
+          cp "ym-${VERSION}-${TARGET}/ym"* "$INSTALL_DIR/"
+          cp "ym-${VERSION}-${TARGET}/ym-agent.jar" "$INSTALL_DIR/" 2>/dev/null || true
+
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            chmod +x "$INSTALL_DIR/ym"
+            cp "$INSTALL_DIR/ym" "$INSTALL_DIR/ymc"
+          else
+            cp "$INSTALL_DIR/ym.exe" "$INSTALL_DIR/ymc.exe"
+          fi
+
+          rm -rf "ym-archive.${EXT}" "ym-${VERSION}-${TARGET}"
+        fi
+
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "path=$INSTALL_DIR" >> "$GITHUB_OUTPUT"

@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: dev-release
@@ -178,3 +179,40 @@ jobs:
             SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-docker:
+    name: Publish Docker Dev Image
+    needs: [get-version, build-agent, build-binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Docker context
+        run: |
+          cp artifacts/ym-x86_64-unknown-linux-gnu/ym .
+          cp artifacts/ym-agent/ym-agent.jar .
+          chmod +x ym
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ympkg/yummy:dev
+            ghcr.io/ympkg/yummy:dev

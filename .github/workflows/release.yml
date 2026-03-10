@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release
@@ -212,3 +213,42 @@ jobs:
 
       - name: Publish
         run: cargo publish --token ${{ secrets.YUMMY_CRATES_TOKEN }}
+
+  publish-docker:
+    name: Publish Docker Image
+    needs: [check-version, build-agent, build-binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare Docker context
+        run: |
+          cp artifacts/ym-x86_64-unknown-linux-gnu/ym .
+          cp artifacts/ym-agent/ym-agent.jar .
+          chmod +x ym
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ympkg/yummy:latest
+            ympkg/yummy:${{ needs.check-version.outputs.version }}
+            ghcr.io/ympkg/yummy:latest
+            ghcr.io/ympkg/yummy:${{ needs.check-version.outputs.version }}
