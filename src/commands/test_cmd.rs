@@ -34,6 +34,8 @@ pub fn execute(
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
+    super::idea::auto_sync_idea(&project, &cfg);
+
     // Ensure JDK is available
     super::build::ensure_jdk_for_config(&cfg)?;
 
@@ -51,15 +53,15 @@ pub fn execute(
             if list {
                 return list_test_classes_workspace(&project, target, filter.as_deref());
             }
-            scripts::run_script(&cfg.scripts, &cfg.env, "pretest", &project)?;
+            scripts::run_script(&cfg, "pretest", &project)?;
             let result = test_workspace(&project, target, watch, filter, verbose, fail_fast, &test_mode, parallel);
-            scripts::run_script(&cfg.scripts, &cfg.env, "posttest", &project)?;
+            scripts::run_script(&cfg, "posttest", &project)?;
             return result;
         }
         // No target: test all modules
-        scripts::run_script(&cfg.scripts, &cfg.env, "pretest", &project)?;
+        scripts::run_script(&cfg, "pretest", &project)?;
         let result = test_all_workspace_modules(&project, &cfg, filter, verbose, fail_fast, keep_going, &test_mode, parallel);
-        scripts::run_script(&cfg.scripts, &cfg.env, "posttest", &project)?;
+        scripts::run_script(&cfg, "posttest", &project)?;
         return result;
     }
 
@@ -70,7 +72,7 @@ pub fn execute(
     }
 
     // Run pretest script
-    scripts::run_script(&cfg.scripts, &cfg.env, "pretest", &project)?;
+    scripts::run_script(&cfg, "pretest", &project)?;
 
     run_tests(&project, &cfg, filter.as_deref(), verbose, fail_fast, timeout, coverage,
               &test_mode, tag.as_deref(), exclude_tag.as_deref(), report.as_deref(), parallel)?;
@@ -123,7 +125,7 @@ pub fn execute(
                 match ch {
                     'q' | 'Q' => break,
                     'a' | 'A' => {
-                        println!("  {} Running all tests...", style("→").blue());
+                        println!("  {} running all tests...", style("➜").green());
                         current_filter = None;
                         match run_tests(&project, &cfg, None, verbose, fail_fast, timeout, coverage, &test_mode, tag.as_deref(), exclude_tag.as_deref(), None, parallel) {
                             Ok(()) => { failed_tests.clear(); }
@@ -138,7 +140,7 @@ pub fn execute(
                         if failed_tests.is_empty() {
                             println!("  {} No failed tests to re-run", style("!").yellow());
                         } else {
-                            println!("  {} Re-running {} failed test(s)...", style("→").blue(), failed_tests.len());
+                            println!("  {} re-running {} failed test(s)...", style("➜").green(), failed_tests.len());
                             // Run with each failed test as filter
                             for class in &failed_tests {
                                 let _ = run_tests(&project, &cfg, Some(class), verbose, fail_fast, timeout, coverage, &test_mode, tag.as_deref(), exclude_tag.as_deref(), None, parallel);
@@ -154,7 +156,7 @@ pub fn execute(
                                 .interact_text()
                                 .unwrap_or_default();
                             current_filter = if input.is_empty() { None } else { Some(input) };
-                            println!("  {} Running with filter: {}", style("→").blue(),
+                            println!("  {} running with filter: {}", style("➜").green(),
                                 current_filter.as_deref().unwrap_or("(none)"));
                             match run_tests(&project, &cfg, current_filter.as_deref(), verbose, fail_fast, timeout, coverage, &test_mode, tag.as_deref(), exclude_tag.as_deref(), None, parallel) {
                                 Ok(()) => {}
@@ -181,7 +183,7 @@ pub fn execute(
                 if let Some(name) = path.file_name() {
                     println!(
                         "  {} Changed: {}",
-                        style("↻").blue(),
+                        style("➜").green(),
                         style(name.to_string_lossy()).yellow()
                     );
                 }
@@ -199,7 +201,7 @@ pub fn execute(
     }
 
     // Run posttest script
-    scripts::run_script(&cfg.scripts, &cfg.env, "posttest", &project)?;
+    scripts::run_script(&cfg, "posttest", &project)?;
 
     Ok(())
 }
@@ -306,10 +308,16 @@ fn run_tests(
         }
     }
 
+    // Copy main resources (src/main/resources → out/classes)
+    let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
+    let main_resources = project.join("src").join("main").join("resources");
+    if main_resources.exists() {
+        crate::resources::copy_resources_with_extensions(&main_resources, &out_dir, custom_res_ext.map(|v| v.as_slice()))?;
+    }
+
     // Copy test resources (src/test/resources → out/test-classes)
     let test_resources = project.join("src").join("test").join("resources");
     if test_resources.exists() {
-        let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
         crate::resources::copy_resources_with_extensions(&test_resources, &test_out_dir, custom_res_ext.map(|v| v.as_slice()))?;
     }
 
@@ -335,8 +343,8 @@ fn run_tests(
     }
 
     println!(
-        "  {} Running {} test class(es)...",
-        style("→").blue(),
+        "  {} running {} test class(es)...",
+        style("➜").green(),
         test_classes.len()
     );
 
@@ -505,7 +513,7 @@ fn run_tests(
         // Fallback: run test classes directly
         let mut failures = 0;
         for class in &test_classes {
-            println!("  Running {}...", style(class).cyan());
+            println!("  running {}...", style(class).cyan());
             let status = Command::new("java")
                 .arg("-cp")
                 .arg(&cp)
@@ -595,8 +603,8 @@ fn ensure_junit_launcher(
 
     // Download
     println!(
-        "  {} Downloading junit-platform-console-standalone {}...",
-        style("↓").blue(),
+        "  {} downloading junit-platform-console-standalone {}...",
+        style("➜").green(),
         version
     );
 
@@ -657,8 +665,8 @@ fn find_jacoco_agent(
 
     // Download JaCoCo
     println!(
-        "  {} Downloading JaCoCo agent {}...",
-        style("↓").blue(),
+        "  {} downloading JaCoCo agent {}...",
+        style("➜").green(),
         version
     );
 
@@ -784,7 +792,7 @@ fn test_workspace(
     use crate::workspace::graph::WorkspaceGraph;
 
     // Build the target and its dependencies first
-    super::build::execute(Some(target.to_string()), false)?;
+    super::build::compile_only(Some(target.to_string()))?;
 
     let ws = WorkspaceGraph::build(root)?;
     let packages = ws.transitive_closure(target)?;
@@ -856,8 +864,8 @@ fn test_workspace(
     }
 
     println!(
-        "  {} Running {} test class(es) in {}...",
-        style("→").blue(),
+        "  {} running {} test class(es) in {}...",
+        style("➜").green(),
         test_classes.len(),
         style(target).bold()
     );
@@ -905,7 +913,7 @@ fn test_workspace(
         }
     } else {
         for class in &test_classes {
-            println!("  Running {}...", style(class).cyan());
+            println!("  running {}...", style(class).cyan());
             let status = std::process::Command::new("java")
                 .arg("-cp")
                 .arg(&cp)
@@ -942,7 +950,7 @@ fn test_workspace(
             }
             for path in &changed {
                 if let Some(name) = path.file_name() {
-                    println!("  {} Changed: {}", style("↻").blue(), style(name.to_string_lossy()).yellow());
+                    println!("  {} Changed: {}", style("➜").green(), style(name.to_string_lossy()).yellow());
                 }
             }
             if let Err(e) = test_workspace(root, target, false, filter.clone(), verbose, fail_fast, &TestMode::Unit, parallel) {
@@ -995,7 +1003,7 @@ fn test_all_workspace_modules(
     packages.sort();
 
     // Build all modules first
-    super::build::execute(None, false)?;
+    super::build::compile_only(None)?;
 
     let mut failures = Vec::new();
 
@@ -1012,7 +1020,7 @@ fn test_all_workspace_modules(
 
         println!(
             "\n  {} Testing {}...",
-            style("→").blue(),
+            style("➜").green(),
             style(pkg_name).cyan()
         );
 
