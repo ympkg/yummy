@@ -213,7 +213,11 @@ pub struct YmConfig {
     #[serde(default = "default_group_id")]
     pub group_id: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_version_or_workspace",
+        default
+    )]
     pub version: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -689,7 +693,7 @@ where
         type Value = Option<String>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a string or integer")
+            formatter.write_str("a string, integer, or { workspace = true }")
         }
 
         fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
@@ -716,6 +720,17 @@ where
             Ok(None)
         }
 
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: de::MapAccess<'de>,
+        {
+            // { workspace = true } → None (inherited from root)
+            while let Some((key, _value)) = map.next_entry::<String, toml::Value>()? {
+                let _ = key;
+            }
+            Ok(None)
+        }
+
         fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
         where
             D2: Deserializer<'de>,
@@ -725,4 +740,57 @@ where
     }
 
     deserializer.deserialize_any(StringOrInt)
+}
+
+/// Deserialize version field: accepts a string or { workspace = true } (returns None).
+fn deserialize_version_or_workspace<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    struct VersionOrWorkspace;
+
+    impl<'de> de::Visitor<'de> for VersionOrWorkspace {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a version string or { workspace = true }")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: de::MapAccess<'de>,
+        {
+            while let Some((key, _value)) = map.next_entry::<String, toml::Value>()? {
+                let _ = key;
+            }
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(VersionOrWorkspace)
+        }
+    }
+
+    deserializer.deserialize_any(VersionOrWorkspace)
 }

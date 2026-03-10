@@ -70,16 +70,28 @@ impl WorkspaceGraph {
             let pattern_str = full_pattern.to_string_lossy().to_string();
 
             for config_path in glob::glob(&pattern_str).unwrap_or_else(|_| glob::glob("").unwrap()).flatten() {
-                if let Ok(cfg) = config::load_config(&config_path) {
-                    let pkg_dir = config_path.parent().unwrap().to_path_buf();
-                    let node = PackageNode {
-                        name: cfg.name.clone(),
-                        path: pkg_dir,
-                        config: cfg,
-                    };
-                    packages.push(node);
+                match config::load_config(&config_path) {
+                    Ok(cfg) => {
+                        let pkg_dir = config_path.parent().unwrap().to_path_buf();
+                        let node = PackageNode {
+                            name: cfg.name.clone(),
+                            path: pkg_dir,
+                            config: cfg,
+                        };
+                        packages.push(node);
+                    }
+                    Err(e) => {
+                        bail!("Failed to parse {}: {}", config_path.display(), e);
+                    }
                 }
             }
+        }
+        if !crate::is_json_quiet() && packages.len() > 10 {
+            eprintln!(
+                "  {} scanned {} workspace modules",
+                console::style("✓").green(),
+                packages.len()
+            );
         }
 
         // Add all packages as nodes, validating name uniqueness

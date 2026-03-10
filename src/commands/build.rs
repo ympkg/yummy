@@ -265,17 +265,37 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, packa
     // Workspace-level dependency resolution
     let dep_start = Instant::now();
 
-    let all_module_deps: Vec<(String, std::collections::BTreeMap<String, String>)> = packages
+    // Collect each module's own Maven deps
+    let own_module_deps: std::collections::HashMap<String, std::collections::BTreeMap<String, String>> = packages
         .iter()
         .map(|name| {
             let pkg = ws.get_package(name).unwrap();
-            // Resolve { workspace = true } Maven deps from root, don't auto-inherit
             let mut deps = pkg.config.maven_dependencies_with_root(root_cfg);
-            // Apply root resolutions
             if let Some(ref resolutions) = root_cfg.resolutions {
                 for (k, v) in resolutions {
                     if deps.contains_key(k) {
                         deps.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            (name.clone(), deps)
+        })
+        .collect();
+
+    // Propagate Maven deps from workspace module dependencies (transitive)
+    let all_module_deps: Vec<(String, std::collections::BTreeMap<String, String>)> = packages
+        .iter()
+        .map(|name| {
+            let mut deps = own_module_deps.get(name).cloned().unwrap_or_default();
+            // Walk workspace dep graph to include transitive Maven deps
+            if let Ok(closure) = ws.transitive_closure(name) {
+                for ws_dep in &closure {
+                    if ws_dep != name {
+                        if let Some(ws_dep_deps) = own_module_deps.get(ws_dep) {
+                            for (k, v) in ws_dep_deps {
+                                deps.entry(k.clone()).or_insert(v.clone());
+                            }
+                        }
                     }
                 }
             }

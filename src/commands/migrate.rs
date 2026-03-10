@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use console::style;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use crate::config;
@@ -145,6 +145,193 @@ fn print_migration_summary(cfg: &YmConfig) {
     println!("  Run {} to start developing", style("ym dev").cyan());
 }
 
+// --- Gradle ext variable parsing ---
+
+/// Parse `ext { key = 'value' }` block from a Gradle build file.
+/// Returns a map of variable name → resolved value.
+fn parse_ext_variables(content: &str) -> BTreeMap<String, String> {
+    let mut variables = BTreeMap::new();
+    let mut in_ext = false;
+    let mut brace_depth = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if !in_ext {
+            if trimmed.starts_with("ext {") || trimmed == "ext {" || trimmed.starts_with("ext{") {
+                in_ext = true;
+                brace_depth = 1;
+                continue;
+            }
+            continue;
+        }
+
+        brace_depth += trimmed.chars().filter(|&c| c == '{').count() as i32;
+        brace_depth -= trimmed.chars().filter(|&c| c == '}').count() as i32;
+        if brace_depth <= 0 {
+            in_ext = false;
+            continue;
+        }
+
+        if trimmed.starts_with("//") {
+            continue;
+        }
+
+        // Match: key = 'value' or key = "value"
+        if let Some(eq_pos) = trimmed.find('=') {
+            let key = trimmed[..eq_pos].trim();
+            let val_part = trimmed[eq_pos + 1..].trim();
+
+            // Extract quoted value
+            if let Some(val) = extract_quoted_value(val_part) {
+                if key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    variables.insert(key.to_string(), val);
+                }
+            }
+            // Handle: applicationVersion = version (bare identifier referencing project version)
+            else if val_part == "version" && key == "applicationVersion" {
+                variables.insert(key.to_string(), "PROJECT_VERSION".to_string());
+            }
+        }
+    }
+
+    variables
+}
+
+/// Extract a quoted string value from a Gradle expression.
+fn extract_quoted_value(s: &str) -> Option<String> {
+    let s = s.trim();
+    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
+        Some(s[1..s.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve `${variableName}` references in a string using the ext variables map.
+fn resolve_ext_refs(s: &str, ext_vars: &BTreeMap<String, String>, project_version: &str) -> String {
+    let mut result = s.to_string();
+    // Resolve all ${...} references
+    while let Some(start) = result.find("${") {
+        if let Some(end) = result[start..].find('}') {
+            let var_name = &result[start + 2..start + end];
+            let replacement = if var_name == "applicationVersion"
+                || var_name == "rootProject.version"
+                || var_name == "project.version"
+            {
+                project_version.to_string()
+            } else if let Some(val) = ext_vars.get(var_name) {
+                if val == "PROJECT_VERSION" {
+                    project_version.to_string()
+                } else {
+                    val.clone()
+                }
+            } else {
+                // Unresolved variable
+                return result;
+            };
+            result = format!("{}{}{}", &result[..start], replacement, &result[start + end + 1..]);
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Parse `allprojects { group "xxx" }` or `allprojects { group = "xxx" }` from root build.gradle.
+/// Returns (group_id, version, compiler_args).
+fn parse_allprojects(content: &str) -> (Option<String>, Option<String>, Vec<String>) {
+    let mut group_id = None;
+    let version = None;
+    let mut compiler_args = Vec::new();
+    let mut in_allprojects = false;
+    let mut brace_depth = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if !in_allprojects {
+            if trimmed.starts_with("allprojects") && trimmed.contains('{') {
+                in_allprojects = true;
+                brace_depth = 1;
+                continue;
+            }
+            // Also check subprojects block
+            if trimmed.starts_with("subprojects") && trimmed.contains('{') {
+                in_allprojects = true;
+                brace_depth = 1;
+                continue;
+            }
+            continue;
+        }
+
+        brace_depth += trimmed.chars().filter(|&c| c == '{').count() as i32;
+        brace_depth -= trimmed.chars().filter(|&c| c == '}').count() as i32;
+        if brace_depth <= 0 {
+            in_allprojects = false;
+            continue;
+        }
+
+        // group "xxx" or group = "xxx" or group 'xxx'
+        if trimmed.starts_with("group") && !trimmed.starts_with("groupId") {
+            if let Some(val) = extract_string_value(trimmed) {
+                group_id = Some(val);
+            } else if let Some(val) = extract_string_arg(trimmed) {
+                group_id = Some(val);
+            }
+        }
+
+        // compilerArgs.add('-parameters') or compilerArgs << '-parameters'
+        if trimmed.contains("compilerArgs") && trimmed.contains("-parameters") {
+            compiler_args.push("-parameters".to_string());
+        }
+    }
+
+    (group_id, version, compiler_args)
+}
+
+/// Scan filesystem for build.gradle files when settings.gradle uses dynamic fileTree discovery.
+fn scan_gradle_modules(root: &Path) -> Vec<String> {
+    let mut modules = Vec::new();
+    scan_gradle_modules_recursive(root, root, &mut modules);
+    modules
+}
+
+fn scan_gradle_modules_recursive(root: &Path, dir: &Path, modules: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Skip common non-module directories
+        if matches!(
+            name.as_str(),
+            "build" | ".gradle" | ".idea" | "buildSrc" | "gradle" | ".git" | "node_modules" | "specs"
+        ) {
+            continue;
+        }
+
+        let gradle_file = path.join("build.gradle");
+        let gradle_kts_file = path.join("build.gradle.kts");
+        if gradle_file.exists() || gradle_kts_file.exists() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                modules.push(rel_str);
+            }
+        }
+
+        // Recurse into subdirectories
+        scan_gradle_modules_recursive(root, &path, modules);
+    }
+}
+
 // --- Gradle multi-module migration ---
 
 /// Parse settings.gradle(.kts) to extract included module paths.
@@ -152,17 +339,37 @@ fn parse_settings_gradle(path: &Path) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(path)?;
     let mut modules = Vec::new();
 
+    // Track brace depth to skip fileTree/pluginManagement blocks
+    let mut skip_depth: i32 = 0;
+    let mut in_skippable_block = false;
+
     for line in content.lines() {
-        let line = line.trim();
+        let trimmed = line.trim();
+
+        // Detect blocks we should skip (fileTree, pluginManagement, etc.)
+        if !in_skippable_block && (trimmed.starts_with("fileTree") || trimmed.starts_with("pluginManagement")) {
+            in_skippable_block = true;
+            skip_depth = 0;
+        }
+
+        if in_skippable_block {
+            skip_depth += trimmed.chars().filter(|&c| c == '{').count() as i32;
+            skip_depth -= trimmed.chars().filter(|&c| c == '}').count() as i32;
+            if skip_depth <= 0 && trimmed.contains('}') {
+                in_skippable_block = false;
+            }
+            continue;
+        }
+
         // Match: include 'module-a', ':module-b', ':parent:child'
         // Match: include("module-a", ":module-b")
-        if !line.starts_with("include") {
+        if !trimmed.starts_with("include") {
             continue;
         }
 
         // Extract all quoted strings from the line
         let mut i = 0;
-        let chars: Vec<char> = line.chars().collect();
+        let chars: Vec<char> = trimmed.chars().collect();
         while i < chars.len() {
             if chars[i] == '\'' || chars[i] == '"' {
                 let quote = chars[i];
@@ -172,15 +379,31 @@ fn parse_settings_gradle(path: &Path) -> Result<Vec<String>> {
                     i += 1;
                 }
                 if i < chars.len() {
-                    let module = &line[start..i];
+                    let module = &trimmed[start..i];
                     // Strip leading colon and convert : to /
                     let module_path = module.trim_start_matches(':').replace(':', "/");
-                    if !module_path.is_empty() {
+                    // Skip glob patterns (these are file includes, not module includes)
+                    if !module_path.is_empty() && !module_path.contains('*') {
                         modules.push(module_path);
                     }
                 }
             }
             i += 1;
+        }
+    }
+
+    // Fallback: if no module include statements found, check for dynamic fileTree scanning
+    if modules.is_empty() && content.contains("fileTree") {
+        if let Some(root_dir) = path.parent() {
+            let scanned = scan_gradle_modules(root_dir);
+            if !scanned.is_empty() {
+                println!(
+                    "  {} Detected dynamic fileTree module discovery, scanning filesystem ({} modules found)",
+                    style("➜").green(),
+                    scanned.len()
+                );
+                return Ok(scanned);
+            }
         }
     }
 
@@ -199,7 +422,40 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
         None
     };
 
-    // Parse root build.gradle for shared settings
+    // Parse root build.gradle for ext variables, allprojects, and shared settings
+    let root_content = root_gradle_path
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
+    let ext_vars = parse_ext_variables(&root_content);
+    let (all_group, _all_version, compiler_args) = parse_allprojects(&root_content);
+
+    // Extract project version from root build.gradle
+    let mut project_version = String::new();
+    for line in root_content.lines() {
+        let trimmed = line.trim();
+        // Match: version "4.0.9" or version = "4.0.9" or version '4.0.9'
+        if trimmed.starts_with("version") && !trimmed.starts_with("version(") {
+            if let Some(val) = extract_string_value(trimmed) {
+                project_version = val;
+                break;
+            }
+            if let Some(val) = extract_string_arg(trimmed) {
+                project_version = val;
+                break;
+            }
+        }
+    }
+
+    if !ext_vars.is_empty() {
+        println!(
+            "  {} Parsed {} ext variables from root build.gradle",
+            style("✓").green(),
+            ext_vars.len()
+        );
+    }
+
+    // Parse root build.gradle for basic config (name, etc.)
     let mut root_cfg = if let Some(path) = root_gradle_path {
         migrate_from_gradle(path)?
     } else {
@@ -214,38 +470,30 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
             .to_string();
     }
 
-    // Determine workspace patterns from module paths
-    let mut workspace_dirs: Vec<String> = Vec::new();
-    for module in modules {
-        if let Some(parent) = Path::new(module).parent() {
-            let parent_str = if parent.as_os_str().is_empty() {
-                ".".to_string()
-            } else {
-                parent.to_string_lossy().to_string()
-            };
-            let pattern = format!("{}/*", parent_str);
-            if !workspace_dirs.contains(&pattern) {
-                workspace_dirs.push(pattern);
-            }
+    // Apply allprojects group
+    if let Some(ref group) = all_group {
+        if root_cfg.group_id == "com.example" || root_cfg.group_id.is_empty() {
+            root_cfg.group_id.clone_from(group);
         }
     }
-    if workspace_dirs.is_empty() {
-        workspace_dirs.push("./*".to_string());
+
+    // Apply compiler args
+    if !compiler_args.is_empty() {
+        let compiler = root_cfg.compiler.get_or_insert_with(Default::default);
+        compiler.args = Some(compiler_args);
     }
 
-    root_cfg.private = Some(true);
-    root_cfg.workspaces = Some(workspace_dirs);
-    // Don't include deps in root if they're per-module
-    if modules.len() > 1 {
-        // Keep root deps as shared deps
+    // Set version
+    if !project_version.is_empty() {
+        root_cfg.version = Some(project_version.clone());
     }
 
-    let root_config_path = root.join(config::CONFIG_FILE);
-    config::save_config(&root_config_path, &root_cfg)?;
-    println!("  {} Created root package.toml", style("✓").green());
+    // Determine workspace patterns from module paths (use smart glob patterns)
+    let workspace_patterns = compute_workspace_patterns(modules);
+    root_cfg.workspaces = Some(workspace_patterns);
 
     // All module names for inter-module dependency detection
-    let all_module_names: Vec<String> = modules
+    let all_module_names: HashSet<String> = modules
         .iter()
         .map(|m| {
             Path::new(m)
@@ -255,8 +503,129 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
                 .to_string()
         })
         .collect();
+    let all_module_names_vec: Vec<String> = all_module_names.iter().cloned().collect();
 
-    // Migrate each submodule
+    // First pass: collect all external dependencies with their versions for root catalog
+    let mut all_ext_deps: BTreeMap<String, String> = BTreeMap::new();
+    let mut bom_managed_deps: HashSet<String> = HashSet::new(); // deps with no version (BOM managed)
+    for module_path in modules {
+        let module_dir = root.join(module_path);
+        let gradle_path = find_gradle_file(&module_dir);
+        let gradle_path = match gradle_path {
+            Some(p) => p,
+            None => continue,
+        };
+        let content = match std::fs::read_to_string(&gradle_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        collect_ext_deps_from_gradle(&content, &ext_vars, &project_version, &all_module_names, &mut all_ext_deps, &mut bom_managed_deps);
+    }
+
+    // Build root dependencies from ext variables + collected deps
+    let mut root_deps: BTreeMap<String, DependencyValue> = BTreeMap::new();
+    for (coord, version) in &all_ext_deps {
+        if coord.starts_with("com.summer.jarvis:") {
+            continue; // External jarvis deps stay per-module
+        }
+        root_deps.insert(
+            coord.clone(),
+            DependencyValue::Simple(version.clone()),
+        );
+    }
+
+    // Pre-scan for Spring Boot plugin version from ext vars or submodules
+    let mut spring_boot_version: Option<String> = ext_vars.get("springBootVersion").cloned();
+    if spring_boot_version.is_none() {
+        // Scan root and submodule build.gradle files for Spring Boot plugin version
+        let all_gradle_contents: Vec<String> = std::iter::once(root_content.clone())
+            .chain(modules.iter().filter_map(|m| {
+                let gp = find_gradle_file(&root.join(m));
+                gp.and_then(|p| std::fs::read_to_string(p).ok())
+            }))
+            .collect();
+        for content in &all_gradle_contents {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.contains("org.springframework.boot") && line.contains("version") {
+                    let resolved = resolve_ext_refs(line, &ext_vars, &project_version);
+                    if let Some(start) = resolved.rfind('\'').or_else(|| resolved.rfind('"')) {
+                        let before = &resolved[..start];
+                        if let Some(vstart) = before.rfind('\'').or_else(|| before.rfind('"')) {
+                            let ver = &resolved[vstart + 1..start];
+                            if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                                spring_boot_version = Some(ver.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if spring_boot_version.is_some() { break; }
+        }
+    }
+
+    // Add BOM-managed deps to root with resolved versions
+    if spring_boot_version.is_some() {
+        for coord in &bom_managed_deps {
+            if !root_deps.contains_key(coord) {
+                let version = resolve_bom_version(coord, "", &spring_boot_version);
+                root_deps.insert(coord.clone(), DependencyValue::Simple(version));
+            }
+        }
+    } else {
+        let sb_version = ext_vars.get("springBootVersion").cloned().unwrap_or_default();
+        if !sb_version.is_empty() {
+            for coord in &bom_managed_deps {
+                if !root_deps.contains_key(coord) {
+                    root_deps.insert(coord.clone(), DependencyValue::Simple(sb_version.clone()));
+                }
+            }
+        }
+    }
+
+    // Lombok → provided scope
+    // Check ext vars first, then scan for io.freefair.lombok plugin
+    let lombok_ver = ext_vars.get("lombokVersion").cloned();
+    let has_freefair_lombok = root_content.contains("io.freefair.lombok")
+        || modules.iter().any(|m| {
+            find_gradle_file(&root.join(m))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|c| c.contains("io.freefair.lombok"))
+        });
+    if lombok_ver.is_some() || has_freefair_lombok {
+        let ver = lombok_ver.unwrap_or_else(|| "1.18.36".to_string()); // latest stable default
+        root_deps.insert(
+            "org.projectlombok:lombok".to_string(),
+            DependencyValue::Detailed(DependencySpec {
+                version: Some(ver),
+                scope: Some("provided".to_string()),
+                ..Default::default()
+            }),
+        );
+        if has_freefair_lombok {
+            println!(
+                "  {} io.freefair.lombok plugin detected → added Lombok as provided dependency",
+                style("✓").green()
+            );
+        }
+    }
+
+    if !root_deps.is_empty() {
+        root_cfg.dependencies = Some(root_deps.clone());
+        println!(
+            "  {} Root dependencies: {} shared entries",
+            style("✓").green(),
+            root_deps.len()
+        );
+    }
+
+    let root_dep_coords: HashSet<String> = root_deps.keys().cloned().collect();
+
+    let root_config_path = root.join(config::CONFIG_FILE);
+    config::save_config(&root_config_path, &root_cfg)?;
+    println!("  {} Created root package.toml", style("✓").green());
+
+    // Second pass: migrate each submodule
     let mut migrated = 0;
     for module_path in modules {
         let module_dir = root.join(module_path);
@@ -269,17 +638,19 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
             continue; // Already migrated
         }
 
-        let gradle_file = module_dir.join("build.gradle.kts");
-        let gradle_file_alt = module_dir.join("build.gradle");
-        let gradle_path = if gradle_file.exists() {
-            gradle_file
-        } else if gradle_file_alt.exists() {
-            gradle_file_alt
-        } else {
-            continue;
+        let gradle_path = match find_gradle_file(&module_dir) {
+            Some(p) => p,
+            None => continue,
         };
 
-        let mut module_cfg = migrate_from_gradle_with_projects(&gradle_path, &all_module_names)?;
+        let mut module_cfg = migrate_from_gradle_ext(
+            &gradle_path,
+            &all_module_names_vec,
+            &ext_vars,
+            &project_version,
+            &root_dep_coords,
+            true, // quiet: suppress per-module hints in multi-module migration
+        )?;
 
         // Use directory name as module name if not set
         if module_cfg.name.is_empty() {
@@ -290,7 +661,15 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
                 .to_string();
         }
 
-        config::save_config(&module_config_path, &module_cfg)?;
+        // Inherit group from allprojects
+        if let Some(ref group) = all_group {
+            if module_cfg.group_id == "com.example" || module_cfg.group_id.is_empty() {
+                module_cfg.group_id.clone_from(group);
+            }
+        }
+
+        // Save with workspace inheritance for version and target
+        save_module_config(&module_config_path, &module_cfg)?;
         migrated += 1;
     }
 
@@ -306,6 +685,593 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
     );
 
     Ok(())
+}
+
+/// Save a sub-module config with `version = { workspace = true }` and `target = { workspace = true }`.
+fn save_module_config(path: &Path, cfg: &YmConfig) -> Result<()> {
+    // Separate workspace deps from non-workspace deps
+    let mut workspace_deps: BTreeMap<String, ()> = BTreeMap::new();
+    let mut temp_cfg = cfg.clone();
+    temp_cfg.version = None;
+    temp_cfg.target = None;
+
+    if let Some(ref mut deps) = temp_cfg.dependencies {
+        let mut non_ws = BTreeMap::new();
+        for (k, v) in deps.iter() {
+            if v.is_workspace() {
+                workspace_deps.insert(k.clone(), ());
+            } else {
+                non_ws.insert(k.clone(), v.clone());
+            }
+        }
+        if non_ws.is_empty() {
+            temp_cfg.dependencies = None;
+        } else {
+            *deps = non_ws;
+        }
+    }
+
+    // Save non-workspace deps via serde
+    config::save_config(path, &temp_cfg)?;
+
+    // Patch in workspace inheritance for version and target
+    let content = std::fs::read_to_string(path)?;
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    // Find the name line and insert version/target after it
+    if let Some(name_idx) = lines.iter().position(|l| l.starts_with("name")) {
+        let insert_at = name_idx + 1;
+        let insert_at = if insert_at < lines.len() && lines[insert_at].starts_with("group_id") {
+            insert_at + 1
+        } else {
+            insert_at
+        };
+        lines.insert(insert_at, "version = { workspace = true }".to_string());
+        lines.insert(insert_at + 1, "target = { workspace = true }".to_string());
+    }
+
+    // Append workspace deps as inline format under [dependencies]
+    if !workspace_deps.is_empty() {
+        // Ensure [dependencies] section exists
+        if !lines.iter().any(|l| l.trim() == "[dependencies]") {
+            lines.push(String::new());
+            lines.push("[dependencies]".to_string());
+        }
+        // Find the [dependencies] line and insert after it
+        if let Some(dep_idx) = lines.iter().position(|l| l.trim() == "[dependencies]") {
+            let mut insert_at = dep_idx + 1;
+            // Skip existing key = value lines
+            while insert_at < lines.len() {
+                let l = lines[insert_at].trim();
+                if l.is_empty() || l.starts_with('[') {
+                    break;
+                }
+                insert_at += 1;
+            }
+            for key in workspace_deps.keys() {
+                let needs_quote = key.contains(':');
+                let entry = if needs_quote {
+                    format!("\"{}\" = {{ workspace = true }}", key)
+                } else {
+                    format!("{} = {{ workspace = true }}", key)
+                };
+                lines.insert(insert_at, entry);
+                insert_at += 1;
+            }
+        }
+    }
+
+    std::fs::write(path, lines.join("\n"))?;
+    Ok(())
+}
+
+/// Find build.gradle or build.gradle.kts in a directory.
+fn find_gradle_file(dir: &Path) -> Option<std::path::PathBuf> {
+    let kts = dir.join("build.gradle.kts");
+    if kts.exists() {
+        return Some(kts);
+    }
+    let groovy = dir.join("build.gradle");
+    if groovy.exists() {
+        return Some(groovy);
+    }
+    None
+}
+
+/// Compute smart workspace patterns from module paths.
+/// Groups modules under common parent directories to minimize pattern count.
+fn compute_workspace_patterns(modules: &[String]) -> Vec<String> {
+    // Group by top-level directories and find optimal glob depth
+    let mut patterns: Vec<String> = Vec::new();
+    let mut seen_prefixes: HashSet<String> = HashSet::new();
+
+    // Sort modules by path for grouping
+    let mut sorted: Vec<&String> = modules.iter().collect();
+    sorted.sort();
+
+    for module in &sorted {
+        let parts: Vec<&str> = module.split('/').collect();
+        if parts.len() <= 1 {
+            // Top-level module
+            let pattern = format!("{}/*", parts[0]);
+            if seen_prefixes.insert(pattern.clone()) {
+                // Check if this single dir actually contains the module or is the module
+                // For top-level, use direct pattern
+                patterns.push(format!("./*"));
+            }
+            continue;
+        }
+
+        // For deeper paths, try to find the shallowest common prefix that uses **/*
+        // e.g., project/jarvis-utils/utils-xxx → project/jarvis-utils/*
+        // e.g., project/jarvis-infra/account/xxx/yyy → project/jarvis-infra/**/*
+        let mut found = false;
+        for depth in (1..parts.len()).rev() {
+            let prefix: String = parts[..depth].join("/");
+            let pattern = if depth == parts.len() - 1 {
+                format!("{}/*", prefix)
+            } else {
+                format!("{}/**/*", prefix)
+            };
+            if seen_prefixes.contains(&pattern) {
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            // Find the best prefix depth: check if all siblings share same parent depth
+            let prefix: String = parts[..parts.len() - 1].join("/");
+            let pattern = format!("{}/*", prefix);
+
+            // Check if any other module has more nesting under the same top-2 prefix
+            let top_prefix = if parts.len() >= 2 {
+                parts[..2].join("/")
+            } else {
+                parts[0].to_string()
+            };
+
+            let has_deeper = sorted.iter().any(|m| {
+                m.starts_with(&top_prefix) && m.split('/').count() > parts.len()
+            });
+
+            if has_deeper {
+                let deep_pattern = format!("{}/**/*", top_prefix);
+                if seen_prefixes.insert(deep_pattern.clone()) {
+                    patterns.push(deep_pattern);
+                }
+            } else {
+                if seen_prefixes.insert(pattern.clone()) {
+                    patterns.push(pattern);
+                }
+            }
+        }
+    }
+
+    // Deduplicate: remove patterns that are subsumed by **/* patterns
+    let glob_patterns: Vec<String> = patterns.iter().filter(|p| p.contains("**")).cloned().collect();
+    patterns.retain(|p| {
+        if p.contains("**") {
+            return true;
+        }
+        // Check if any **/* pattern already covers this
+        !glob_patterns.iter().any(|gp| {
+            let gp_prefix = gp.trim_end_matches("/**/*");
+            p.starts_with(gp_prefix)
+        })
+    });
+
+    if patterns.is_empty() {
+        patterns.push("./*".to_string());
+    }
+
+    patterns
+}
+
+/// Collect all external dependency coordinates+versions from a build.gradle
+/// (first pass, for building root dependency catalog).
+fn collect_ext_deps_from_gradle(
+    content: &str,
+    ext_vars: &BTreeMap<String, String>,
+    project_version: &str,
+    all_module_names: &HashSet<String>,
+    deps: &mut BTreeMap<String, String>,
+    bom_managed: &mut HashSet<String>,
+) {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+
+        // Skip project() dependencies
+        if trimmed.contains("project(") {
+            continue;
+        }
+
+        // Skip platform() dependencies
+        if trimmed.contains("platform(") {
+            continue;
+        }
+
+        // Parse dependency line
+        if let Some((coord, version)) = parse_gradle_dep_raw(trimmed) {
+            // Resolve ext variable references
+            let resolved_coord = resolve_ext_refs(&coord, ext_vars, project_version);
+            let resolved_version = resolve_ext_refs(&version, ext_vars, project_version);
+
+            if resolved_coord.contains("${") {
+                continue; // Unresolvable coordinate
+            }
+
+            let parts: Vec<&str> = resolved_coord.split(':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            let full_coord = if parts.len() >= 3 {
+                format!("{}:{}", parts[0], parts[1])
+            } else {
+                resolved_coord.clone()
+            };
+            let ver = if parts.len() >= 3 {
+                parts[2].to_string()
+            } else if !resolved_version.is_empty() && !resolved_version.contains("${") {
+                resolved_version
+            } else {
+                String::new()
+            };
+
+            // Skip com.summer.jarvis internal modules
+            if full_coord.starts_with("com.summer.jarvis:") {
+                let artifact = full_coord.split(':').nth(1).unwrap_or("");
+                if all_module_names.contains(artifact) {
+                    continue;
+                }
+                // External jarvis deps: don't add to root catalog
+                continue;
+            }
+
+            if ver.is_empty() {
+                // BOM-managed dependency (no version)
+                bom_managed.insert(full_coord);
+            } else {
+                deps.entry(full_coord).or_insert(ver);
+            }
+        }
+    }
+}
+
+/// Raw parse a Gradle dependency line, returning the full dependency string and version.
+fn parse_gradle_dep_raw(line: &str) -> Option<(String, String)> {
+    let scope_prefixes = [
+        "implementation", "api", "compile", "testImplementation",
+        "testCompile", "compileOnly", "runtimeOnly", "annotationProcessor",
+    ];
+
+    let trimmed = line.trim();
+    if !scope_prefixes.iter().any(|p| trimmed.starts_with(p)) {
+        return None;
+    }
+
+    // Skip project() references
+    if trimmed.contains("project(") || trimmed.contains("platform(") {
+        return None;
+    }
+
+    // Extract quoted dependency string
+    let start = trimmed.find('\'').or_else(|| trimmed.find('"'))?;
+    let quote_char = trimmed.chars().nth(start)?;
+    let rest = &trimmed[start + 1..];
+    let end = rest.rfind(quote_char)?;
+    let dep_str = &rest[..end];
+
+    // Split into coordinate parts
+    let parts: Vec<&str> = dep_str.split(':').collect();
+    match parts.len() {
+        3 => Some((dep_str.to_string(), parts[2].to_string())),
+        2 => Some((dep_str.to_string(), String::new())),
+        _ => None,
+    }
+}
+
+/// Migrate a Gradle build file with ext variable resolution and workspace awareness.
+fn migrate_from_gradle_ext(
+    gradle_path: &Path,
+    all_module_names: &[String],
+    ext_vars: &BTreeMap<String, String>,
+    project_version: &str,
+    root_dep_coords: &HashSet<String>,
+    quiet: bool,
+) -> Result<YmConfig> {
+    let content = std::fs::read_to_string(gradle_path)?;
+
+    let project_dir = gradle_path.parent().unwrap_or(Path::new("."));
+    let catalog = parse_version_catalog(project_dir);
+
+    let mut config = YmConfig::default();
+    let mut dependencies: BTreeMap<String, DependencyValue> = BTreeMap::new();
+
+    // Pre-scan for Spring Boot plugin version
+    let mut spring_boot_version: Option<String> = None;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.contains("org.springframework.boot") && line.contains("version") {
+            let resolved = resolve_ext_refs(line, ext_vars, project_version);
+            if let Some(start) = resolved.rfind('\'').or_else(|| resolved.rfind('"')) {
+                let before = &resolved[..start];
+                if let Some(vstart) = before.rfind('\'').or_else(|| before.rfind('"')) {
+                    let ver = &resolved[vstart + 1..start];
+                    if !ver.is_empty() && ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        spring_boot_version = Some(ver.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-scan settings.gradle for rootProject.name
+    let settings_path = project_dir.join("settings.gradle");
+    let settings_kts_path = project_dir.join("settings.gradle.kts");
+    let settings = if settings_kts_path.exists() {
+        std::fs::read_to_string(&settings_kts_path).ok()
+    } else if settings_path.exists() {
+        std::fs::read_to_string(&settings_path).ok()
+    } else {
+        None
+    };
+    if let Some(ref settings_content) = settings {
+        for line in settings_content.lines() {
+            let line = line.trim();
+            if line.starts_with("rootProject.name") {
+                if let Some(val) = extract_string_value(line) {
+                    config.name = val;
+                }
+            }
+        }
+    }
+
+    let all_module_set: HashSet<&str> = all_module_names.iter().map(|s| s.as_str()).collect();
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Skip comments
+        if line.starts_with("//") {
+            continue;
+        }
+
+        // Extract group/version
+        if line.starts_with("group") && !line.starts_with("groupId") {
+            if let Some(val) = extract_string_value(line) {
+                config.group_id = val.clone();
+                if config.package.is_none() {
+                    config.package = Some(val);
+                }
+            }
+        }
+        if line.starts_with("version") && line.contains('=') && !line.contains("${") {
+            if let Some(val) = extract_string_value(line) {
+                config.version = Some(val);
+            }
+        }
+
+        // sourceCompatibility
+        if line.starts_with("sourceCompatibility") {
+            if let Some(val) = extract_string_value(line) {
+                config.target = Some(val.trim_start_matches("JavaVersion.VERSION_").to_string());
+            }
+        }
+
+        // java toolchain: languageVersion = JavaLanguageVersion.of(21)
+        if line.contains("languageVersion") && line.contains("JavaLanguageVersion.of") {
+            if let Some(start) = line.find("JavaLanguageVersion.of(") {
+                let rest = &line[start + "JavaLanguageVersion.of(".len()..];
+                if let Some(end) = rest.find(')') {
+                    let ver = rest[..end].trim();
+                    if config.target.is_none() {
+                        config.target = Some(ver.to_string());
+                    }
+                }
+            }
+        }
+
+        // Detect inter-module project dependencies
+        if let Some(proj_dep) = parse_gradle_project_dependency(line) {
+            // Take the last segment of the project path as module name
+            let dep_name = proj_dep.split(':').last().unwrap_or(&proj_dep).to_string();
+            if all_module_set.contains(dep_name.as_str()) {
+                let scope = detect_scope(line);
+                let dep_val = if let Some(s) = scope {
+                    DependencyValue::Detailed(DependencySpec {
+                        workspace: Some(true),
+                        scope: Some(s),
+                        ..Default::default()
+                    })
+                } else {
+                    DependencyValue::Detailed(DependencySpec {
+                        workspace: Some(true),
+                        ..Default::default()
+                    })
+                };
+                dependencies.entry(dep_name).or_insert(dep_val);
+                continue;
+            }
+        }
+
+        // Skip platform() BOM imports (just log)
+        if line.contains("platform(") {
+            // Detected but not converted — user should handle manually
+            continue;
+        }
+
+        // External dependencies (with ext variable resolution)
+        if let Some((raw_coord, _raw_ver)) = parse_gradle_dep_raw(line) {
+            let resolved = resolve_ext_refs(&raw_coord, ext_vars, project_version);
+            let parts: Vec<&str> = resolved.split(':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+
+            let coord = if parts.len() >= 3 {
+                format!("{}:{}", parts[0], parts[1])
+            } else {
+                resolved.clone()
+            };
+            let version = if parts.len() >= 3 {
+                parts[2].to_string()
+            } else {
+                // BOM-managed: no version
+                String::new()
+            };
+
+            let scope = detect_scope(line);
+
+            // Check if it's a com.summer.jarvis reference
+            if coord.starts_with("com.summer.jarvis:") {
+                let artifact = coord.split(':').nth(1).unwrap_or("");
+                if all_module_set.contains(artifact) {
+                    // Internal module → workspace reference
+                    let dep_val = if let Some(s) = scope {
+                        DependencyValue::Detailed(DependencySpec {
+                            workspace: Some(true),
+                            scope: Some(s),
+                            ..Default::default()
+                        })
+                    } else {
+                        DependencyValue::Detailed(DependencySpec {
+                            workspace: Some(true),
+                            ..Default::default()
+                        })
+                    };
+                    dependencies.entry(artifact.to_string()).or_insert(dep_val);
+                    continue;
+                }
+                // External jarvis dep → keep as external with version
+                let ver = if version.is_empty() { project_version.to_string() } else { version };
+                let dep_val = if let Some(s) = scope {
+                    DependencyValue::Detailed(DependencySpec {
+                        version: Some(ver),
+                        scope: Some(s),
+                        ..Default::default()
+                    })
+                } else {
+                    DependencyValue::Simple(ver)
+                };
+                dependencies.entry(coord).or_insert(dep_val);
+                continue;
+            }
+
+            // Regular external dep: use workspace = true if in root catalog
+            if root_dep_coords.contains(&coord) {
+                let dep_val = if let Some(s) = scope {
+                    DependencyValue::Detailed(DependencySpec {
+                        workspace: Some(true),
+                        scope: Some(s),
+                        ..Default::default()
+                    })
+                } else {
+                    DependencyValue::Detailed(DependencySpec {
+                        workspace: Some(true),
+                        ..Default::default()
+                    })
+                };
+                dependencies.entry(coord).or_insert(dep_val);
+            } else {
+                // Not in root → include version directly
+                let ver = if version.is_empty() {
+                    resolve_bom_version(&coord, "", &spring_boot_version)
+                } else {
+                    version
+                };
+                let dep_val = if let Some(s) = scope {
+                    DependencyValue::Detailed(DependencySpec {
+                        version: Some(ver),
+                        scope: Some(s),
+                        ..Default::default()
+                    })
+                } else {
+                    DependencyValue::Simple(ver)
+                };
+                dependencies.entry(coord).or_insert(dep_val);
+            }
+
+            continue;
+        }
+
+        // Version Catalog references
+        if !catalog.is_empty() {
+            if let Some((scope_str, alias)) = parse_catalog_reference(line) {
+                let normalized = alias.replace('.', "-");
+                if let Some((module, version)) = catalog.get(&normalized) {
+                    let dep_val = match scope_str {
+                        "compile" => DependencyValue::Simple(version.clone()),
+                        _ => DependencyValue::Detailed(DependencySpec {
+                            version: Some(version.clone()),
+                            scope: Some(scope_str.to_string()),
+                            ..Default::default()
+                        }),
+                    };
+                    dependencies.insert(module.clone(), dep_val);
+                }
+            }
+        }
+    }
+
+    // Detect common Gradle plugins
+    detect_gradle_plugins(&content, &mut config, &mut dependencies, quiet);
+
+    // Post-process: convert deps that exist in root catalog to { workspace = true }
+    for (coord, dep_val) in dependencies.iter_mut() {
+        if root_dep_coords.contains(coord) {
+            // Preserve scope if any, but switch to workspace reference
+            let scope = match dep_val {
+                DependencyValue::Detailed(spec) => spec.scope.clone(),
+                _ => None,
+            };
+            if let Some(s) = scope {
+                *dep_val = DependencyValue::Detailed(DependencySpec {
+                    workspace: Some(true),
+                    scope: Some(s),
+                    ..Default::default()
+                });
+            } else {
+                *dep_val = DependencyValue::Detailed(DependencySpec {
+                    workspace: Some(true),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    if config.name.is_empty() {
+        config.name = gradle_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("my-app")
+            .to_string();
+    }
+
+    if !dependencies.is_empty() {
+        config.dependencies = Some(dependencies);
+    }
+
+    Ok(config)
+}
+
+/// Detect Gradle scope from a dependency line.
+fn detect_scope(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("testImplementation") || trimmed.starts_with("testCompile") {
+        Some("test".to_string())
+    } else if trimmed.starts_with("compileOnly") {
+        Some("provided".to_string())
+    } else if trimmed.starts_with("runtimeOnly") {
+        Some("runtime".to_string())
+    } else {
+        None
+    }
 }
 
 /// Parse a Gradle build file, detecting inter-module (project) dependencies.
@@ -554,7 +1520,7 @@ fn migrate_from_gradle_with_projects(
     }
 
     // Detect common Gradle plugins and map to ym config
-    detect_gradle_plugins(&content, &mut config, &dependencies);
+    detect_gradle_plugins(&content, &mut config, &mut dependencies, false);
 
     if config.name.is_empty() {
         config.name = gradle_path
@@ -576,7 +1542,8 @@ fn migrate_from_gradle_with_projects(
 fn detect_gradle_plugins(
     content: &str,
     config: &mut YmConfig,
-    deps: &BTreeMap<String, DependencyValue>,
+    deps: &mut BTreeMap<String, DependencyValue>,
+    quiet: bool,
 ) {
     let mut hints: Vec<String> = Vec::new();
 
@@ -592,12 +1559,30 @@ fn detect_gradle_plugins(
     }
 
     // Annotation processing (Lombok, MapStruct, etc.)
-    let has_lombok = deps.keys().any(|k| k.contains("lombok"));
+    let has_lombok_dep = deps.keys().any(|k| k.contains("lombok"));
+    // io.freefair.lombok plugin implicitly adds Lombok as compileOnly + annotationProcessor
+    let has_lombok_plugin = content.contains("io.freefair.lombok");
+    let has_lombok = has_lombok_dep || has_lombok_plugin;
     let has_mapstruct = deps.keys().any(|k| k.contains("mapstruct"));
     if has_lombok || has_mapstruct {
         let mut ap = Vec::new();
         if has_lombok {
             ap.push("org.projectlombok:lombok".to_string());
+            // If Lombok came from plugin (not explicitly in deps), add it as provided dependency
+            if has_lombok_plugin && !has_lombok_dep {
+                // freefair plugin version != Lombok library version (8.x → 1.18.x)
+                // Use latest stable Lombok version as default
+                let lombok_ver = "1.18.36".to_string();
+                deps.insert(
+                    "org.projectlombok:lombok".to_string(),
+                    DependencyValue::Detailed(DependencySpec {
+                        version: Some(lombok_ver),
+                        scope: Some("provided".to_string()),
+                        ..Default::default()
+                    }),
+                );
+                hints.push("io.freefair.lombok plugin → added Lombok as provided dependency".to_string());
+            }
         }
         if has_mapstruct {
             ap.push("org.mapstruct:mapstruct-processor".to_string());
@@ -620,9 +1605,11 @@ fn detect_gradle_plugins(
         }
     }
 
-    // Print detected plugin hints
-    for hint in &hints {
-        println!("  {} {}", style("➜").green(), style(hint).dim());
+    // Print detected plugin hints (skip in quiet mode for sub-modules)
+    if !quiet {
+        for hint in &hints {
+            println!("  {} {}", style("➜").green(), style(hint).dim());
+        }
     }
 }
 
@@ -1034,16 +2021,26 @@ fn find_modules(root: &roxmltree::Node) -> Vec<String> {
 }
 
 /// Resolve version for BOM-managed dependencies.
-/// If version is empty and we know the Spring Boot version, use it for Spring Boot starters.
-/// Otherwise warn and use "FIXME" placeholder.
+/// Downloads and parses Spring Boot BOM to get exact managed versions.
 fn resolve_bom_version(coord: &str, version: &str, spring_boot_version: &Option<String>) -> String {
     if !version.is_empty() {
         return version.to_string();
     }
-    // Spring Boot BOM-managed dependencies
-    if coord.starts_with("org.springframework.boot:") || coord.starts_with("org.springframework:") {
-        if let Some(sb_ver) = spring_boot_version {
+    if let Some(sb_ver) = spring_boot_version {
+        // Spring Boot BOM-managed: same version as Spring Boot itself
+        if coord.starts_with("org.springframework.boot:") {
             return sb_ver.clone();
+        }
+        // Try to resolve from Spring Boot BOM (cached)
+        let bom_versions = get_spring_boot_bom_versions(sb_ver);
+        if let Some(resolved) = bom_versions.get(coord) {
+            return resolved.clone();
+        }
+        // Spring Framework core: derive from Spring Boot version
+        if coord.starts_with("org.springframework:") {
+            if let Some(v) = spring_boot_to_framework_version(sb_ver) {
+                return v;
+            }
         }
     }
     eprintln!(
@@ -1054,6 +2051,258 @@ fn resolve_bom_version(coord: &str, version: &str, spring_boot_version: &Option<
     "FIXME".to_string()
 }
 
+/// Download and parse Spring Boot Dependencies BOM to extract managed versions.
+/// Results are cached in a thread-local to avoid repeated downloads.
+fn get_spring_boot_bom_versions(boot_version: &str) -> std::collections::HashMap<String, String> {
+    use std::sync::Mutex;
+    use std::collections::HashMap;
+
+    // Simple static cache
+    static BOM_CACHE: std::sync::LazyLock<Mutex<HashMap<String, HashMap<String, String>>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let mut cache = BOM_CACHE.lock().unwrap();
+    if let Some(versions) = cache.get(boot_version) {
+        return versions.clone();
+    }
+
+    let versions = fetch_spring_boot_bom_versions(boot_version);
+    cache.insert(boot_version.to_string(), versions.clone());
+    versions
+}
+
+fn fetch_spring_boot_bom_versions(boot_version: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+
+    let url = format!(
+        "https://repo1.maven.org/maven2/org/springframework/boot/spring-boot-dependencies/{}/spring-boot-dependencies-{}.pom",
+        boot_version, boot_version
+    );
+
+    eprintln!(
+        "  {} Fetching Spring Boot BOM {} for version resolution...",
+        console::style("↓").blue(),
+        boot_version
+    );
+
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut versions = HashMap::new();
+    let mut bom_imports: Vec<(String, String, String)> = Vec::new(); // (groupId, artifactId, version)
+
+    // Parse the main BOM
+    if let Some((props, _)) = fetch_and_parse_bom_pom(&client, &url) {
+        extract_managed_versions_from_url(&client, &url, &props, &mut versions, &mut bom_imports);
+    }
+
+    // Recursively resolve BOM imports (max 2 levels deep for Spring ecosystem)
+    for (group_id, artifact_id, version) in &bom_imports {
+        let nested_url = format!(
+            "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.pom",
+            group_id.replace('.', "/"),
+            artifact_id,
+            version,
+            artifact_id,
+            version
+        );
+        let mut nested_bom_imports = Vec::new();
+        if let Some((nested_props, _)) = fetch_and_parse_bom_pom(&client, &nested_url) {
+            extract_managed_versions_from_url(
+                &client, &nested_url, &nested_props, &mut versions, &mut nested_bom_imports,
+            );
+        }
+    }
+
+    if !versions.is_empty() {
+        eprintln!(
+            "  {} Spring Boot BOM: {} managed versions extracted (including nested BOMs)",
+            console::style("✓").green(),
+            versions.len()
+        );
+    }
+
+    versions
+}
+
+/// Fetch and parse a POM file, returning (properties, document_body).
+fn fetch_and_parse_bom_pom(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Option<(std::collections::HashMap<String, String>, String)> {
+    use std::collections::HashMap;
+
+    let response = client.get(url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.text().ok()?;
+    let doc = roxmltree::Document::parse(&body).ok()?;
+
+    let root = doc.root_element();
+    let mut props: HashMap<String, String> = HashMap::new();
+    for node in root.children() {
+        if node.tag_name().name() == "properties" {
+            for child in node.children() {
+                if child.is_element() {
+                    if let Some(val) = child.text() {
+                        props.insert(child.tag_name().name().to_string(), val.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Some((props, body))
+}
+
+/// Extract managed versions from a BOM POM, collecting direct versions and BOM imports.
+fn extract_managed_versions_from_url(
+    _client: &reqwest::blocking::Client,
+    url: &str,
+    parent_props: &std::collections::HashMap<String, String>,
+    versions: &mut std::collections::HashMap<String, String>,
+    bom_imports: &mut Vec<(String, String, String)>,
+) {
+    use std::collections::HashMap;
+
+    let client2 = match reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let response = match client2.get(url).send() {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+
+    let body = match response.text() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let doc = match roxmltree::Document::parse(&body) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let root = doc.root_element();
+
+    // Collect this POM's own properties, merging with parent
+    let mut props: HashMap<String, String> = parent_props.clone();
+    for node in root.children() {
+        if node.tag_name().name() == "properties" {
+            for child in node.children() {
+                if child.is_element() {
+                    if let Some(val) = child.text() {
+                        props.insert(child.tag_name().name().to_string(), val.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    for node in root.descendants() {
+        if node.tag_name().name() == "dependencyManagement" {
+            for deps_node in node.descendants() {
+                if deps_node.tag_name().name() == "dependency" {
+                    let mut group_id = String::new();
+                    let mut artifact_id = String::new();
+                    let mut version = String::new();
+                    let mut scope = String::new();
+                    let mut dep_type = String::new();
+
+                    for child in deps_node.children() {
+                        match child.tag_name().name() {
+                            "groupId" => group_id = child.text().unwrap_or("").trim().to_string(),
+                            "artifactId" => artifact_id = child.text().unwrap_or("").trim().to_string(),
+                            "version" => version = child.text().unwrap_or("").trim().to_string(),
+                            "scope" => scope = child.text().unwrap_or("").trim().to_string(),
+                            "type" => dep_type = child.text().unwrap_or("").trim().to_string(),
+                            _ => {}
+                        }
+                    }
+
+                    if group_id.is_empty() || artifact_id.is_empty() || version.is_empty() {
+                        continue;
+                    }
+
+                    let resolved_version = resolve_pom_properties(&version, &props);
+
+                    if scope == "import" && dep_type == "pom" {
+                        // BOM import — collect for recursive resolution
+                        bom_imports.push((
+                            resolve_pom_properties(&group_id, &props),
+                            resolve_pom_properties(&artifact_id, &props),
+                            resolved_version,
+                        ));
+                    } else {
+                        let coord = format!("{}:{}", group_id, artifact_id);
+                        versions.entry(coord).or_insert(resolved_version);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve ${property} references in a POM version string.
+fn resolve_pom_properties(value: &str, props: &std::collections::HashMap<String, String>) -> String {
+    let mut result = value.to_string();
+    for _ in 0..10 {
+        if !result.contains("${") {
+            break;
+        }
+        let mut new_result = result.clone();
+        while let Some(start) = new_result.find("${") {
+            if let Some(end) = new_result[start..].find('}') {
+                let key = &new_result[start + 2..start + end];
+                if let Some(val) = props.get(key) {
+                    new_result = format!("{}{}{}", &new_result[..start], val, &new_result[start + end + 1..]);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if new_result == result {
+            break;
+        }
+        result = new_result;
+    }
+    result
+}
+
+/// Derive Spring Framework version from Spring Boot version.
+/// Spring Boot 4.0.x → Spring Framework 7.0.x
+/// Spring Boot 3.4.x → Spring Framework 6.2.x
+/// Returns None if version pattern is unrecognized.
+fn spring_boot_to_framework_version(boot_ver: &str) -> Option<String> {
+    let parts: Vec<&str> = boot_ver.split('.').collect();
+    if parts.len() < 2 { return None; }
+    let major: u32 = parts[0].parse().ok()?;
+    let minor: u32 = parts[1].parse().ok()?;
+    // Mapping: Boot 4.0 → Framework 7.0, Boot 3.4 → Framework 6.2, Boot 3.3 → Framework 6.1
+    let (fw_major, fw_minor) = match (major, minor) {
+        (4, m) => (7, m),          // Boot 4.x → Framework 7.x
+        (3, 4) => (6, 2),          // Boot 3.4 → Framework 6.2
+        (3, 3) => (6, 1),          // Boot 3.3 → Framework 6.1
+        (3, m) => (6, m.saturating_sub(1)), // approximate
+        _ => return None,
+    };
+    let patch = if parts.len() >= 3 { parts[2] } else { "0" };
+    Some(format!("{}.{}.{}", fw_major, fw_minor, patch))
+}
+
 fn extract_string_value(line: &str) -> Option<String> {
     // Handle: key = 'value' or key = "value" or key = value
     let parts: Vec<&str> = line.splitn(2, '=').collect();
@@ -1061,11 +2310,30 @@ fn extract_string_value(line: &str) -> Option<String> {
         return None;
     }
     let val = parts[1].trim().trim_matches('\'').trim_matches('"').trim();
-    if val.is_empty() {
+    if val.is_empty() || val.contains("${") {
         None
     } else {
         Some(val.to_string())
     }
+}
+
+/// Extract string argument from a Gradle method call: `group "com.example"` or `group 'com.example'`
+fn extract_string_arg(line: &str) -> Option<String> {
+    // Find first quoted string after a space (method-call style: `group "value"`)
+    let trimmed = line.trim();
+    for (i, c) in trimmed.char_indices() {
+        if c == '\'' || c == '"' {
+            let rest = &trimmed[i + 1..];
+            if let Some(end) = rest.find(c) {
+                let val = &rest[..end];
+                if !val.is_empty() && !val.contains("${") {
+                    return Some(val.to_string());
+                }
+            }
+            break;
+        }
+    }
+    None
 }
 
 fn parse_gradle_dependency(line: &str, prefix: &str) -> Option<(String, String)> {

@@ -3,7 +3,7 @@ use console::style;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
 use crate::config::schema::{ResolvedCache, ResolvedDependency};
 
@@ -294,7 +294,7 @@ fn resolve_inner(
 
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("ym/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     // Resolve transitive graph with nearest-wins strategy (Maven convention).
@@ -325,6 +325,9 @@ fn resolve_inner(
         resolved_versions.insert(ga_key, (0, mc.version.clone()));
         queue.push_back(mc);
     }
+
+    let resolved_count = AtomicUsize::new(0);
+    let show_resolve_progress = !crate::is_json_quiet();
 
     while !queue.is_empty() {
         // Drain the current level for batched processing
@@ -374,6 +377,10 @@ fn resolve_inner(
                     let transitive = resolve_transitive_cached(
                         &client, coord, cache_dir, registries, Some(&pom_cache),
                     ).unwrap_or_default();
+                    let n = resolved_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if show_resolve_progress && n % 20 == 0 {
+                        eprint!("\r  {}  resolving dependency graph ({} artifacts)...   ", style("➜").cyan(), n);
+                    }
                     (coord.clone(), transitive)
                 })
                 .collect()
@@ -384,10 +391,18 @@ fn resolve_inner(
                     let transitive = resolve_transitive_cached(
                         &client, coord, cache_dir, registries, Some(&pom_cache),
                     ).unwrap_or_default();
+                    let n = resolved_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if show_resolve_progress && n % 20 == 0 {
+                        eprint!("\r  {}  resolving dependency graph ({} artifacts)...   ", style("➜").cyan(), n);
+                    }
                     (coord.clone(), transitive)
                 })
                 .collect()
         };
+        // Clear progress line after level completes
+        if show_resolve_progress && resolved_count.load(Ordering::Relaxed) >= 20 {
+            eprint!("\r{}\r", " ".repeat(60));
+        }
 
         for (coord, transitive) in level_results {
             let key = coord.versioned_key();
@@ -476,7 +491,13 @@ fn resolve_inner(
             }
         }
 
-        let download_results: Vec<(String, Result<String>)> = coords_to_download
+        // Use a dedicated thread pool with more threads for I/O-bound downloads
+        let download_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(32)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+        let download_results: Vec<(String, Result<String>)> = download_pool.install(|| {
+            coords_to_download
             .into_par_iter()
             .map(|(key, coord)| {
                 let jar_path = coord.jar_path(cache_dir);
@@ -505,7 +526,8 @@ fn resolve_inner(
                 }
                 (key, hash_result)
             })
-            .collect();
+            .collect()
+        });
 
         // Clear progress line
         if !crate::is_json_quiet() && is_tty {
@@ -1091,8 +1113,8 @@ fn collect_pom_properties(doc: &roxmltree::Document) -> HashMap<String, String> 
         props.insert("project.parent.version".to_string(), v.clone());
     }
 
-    // Collect explicit <properties>
-    for node in doc.descendants() {
+    // Collect explicit <properties> — only from project root, skip profiles/plugins
+    for node in root.children() {
         if node.tag_name().name() == "properties" {
             for child in node.children() {
                 if child.is_element() {
@@ -1328,16 +1350,37 @@ fn download_file(client: &reqwest::blocking::Client, url: &str, path: &Path) -> 
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    let bytes = response.bytes()?;
-                    let hash = crate::compiler::incremental::hash_bytes(&bytes);
-                    std::fs::write(path, &bytes)?;
-                    return Ok(hash);
-                }
-                // 404 means artifact doesn't exist in this repo, no retry
-                if response.status().as_u16() == 404 {
+                    // Stream to file to handle large JARs (100MB+)
+                    let tmp_path = path.with_extension("part");
+                    match (|| -> Result<String> {
+                        use sha2::{Digest, Sha256};
+                        use std::io::Read;
+                        let mut reader = response;
+                        let mut file = std::fs::File::create(&tmp_path)?;
+                        let mut hasher = Sha256::new();
+                        let mut buf = [0u8; 65536];
+                        loop {
+                            let n = reader.read(&mut buf)?;
+                            if n == 0 { break; }
+                            hasher.update(&buf[..n]);
+                            std::io::Write::write_all(&mut file, &buf[..n])?;
+                        }
+                        drop(file);
+                        std::fs::rename(&tmp_path, path)?;
+                        Ok(format!("{:x}", hasher.finalize()))
+                    })() {
+                        Ok(hash) => return Ok(hash),
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            last_err = Some(anyhow::anyhow!("Download stream failed for {}: {}", url, e));
+                        }
+                    }
+                } else if response.status().as_u16() == 404 {
+                    // 404 means artifact doesn't exist in this repo, no retry
                     bail!("HTTP 404 for {}", url);
+                } else {
+                    last_err = Some(anyhow::anyhow!("HTTP {} for {}", response.status(), url));
                 }
-                last_err = Some(anyhow::anyhow!("HTTP {} for {}", response.status(), url));
             }
             Err(e) => {
                 last_err = Some(anyhow::anyhow!("Request failed for {}: {}", url, e));
@@ -1579,10 +1622,40 @@ pub fn resolve_workspace_deps_with_resolutions(
                 let jar = coord.jar_path(cache_dir);
                 if jar.exists() {
                     module_jars.push(jar);
+                } else {
+                    // Fall back to resolved version JAR
+                    let ga = format!("{}:{}", parts[0], parts[1]);
+                    if let Some(resolved_key) = ga_to_versioned.get(&ga) {
+                        let rparts: Vec<&str> = resolved_key.split(':').collect();
+                        if rparts.len() == 3 {
+                            let rc = MavenCoord {
+                                group_id: rparts[0].to_string(),
+                                artifact_id: rparts[1].to_string(),
+                                version: rparts[2].to_string(),
+                                classifier: None,
+                                exclusions: Vec::new(),
+                                scope: None,
+                            };
+                            let rjar = rc.jar_path(cache_dir);
+                            if rjar.exists() {
+                                module_jars.push(rjar);
+                            }
+                        }
+                    }
                 }
             }
             // Add transitive deps from lock
-            if let Some(locked) = lock.dependencies.get(&key) {
+            // If exact key not found, fall back to GA lookup (version may differ due to resolution)
+            let locked_entry = lock.dependencies.get(&key).or_else(|| {
+                let parts: Vec<&str> = key.split(':').collect();
+                if parts.len() == 3 {
+                    let ga = format!("{}:{}", parts[0], parts[1]);
+                    ga_to_versioned.get(&ga).and_then(|resolved_key| lock.dependencies.get(resolved_key))
+                } else {
+                    None
+                }
+            });
+            if let Some(locked) = locked_entry {
                 if let Some(ref dep_keys) = locked.dependencies {
                     for dk in dep_keys {
                         if !visited_keys.contains(dk) {
