@@ -1132,10 +1132,23 @@ fn resolve_annotation_processors(project: &Path, cfg: &YmConfig, classpath: &[Pa
             let mut jars = Vec::new();
             for coord in coords {
                 if let Some(version) = deps.get(coord) {
+                    // Direct version available — resolve from cache
                     let mc = crate::workspace::resolver::MavenCoord::parse(coord, version)?;
                     let jar = mc.jar_path(&cache);
                     if jar.exists() {
                         jars.push(jar);
+                    }
+                } else {
+                    // Workspace-inherited dep: version not in local maven_dependencies().
+                    // Fall back to searching the already-resolved classpath by artifactId.
+                    let artifact_id = coord.split(':').nth(1).unwrap_or(coord);
+                    if let Some(jar) = classpath.iter().find(|p| {
+                        p.file_name()
+                            .and_then(|f| f.to_str())
+                            .map(|f| f.starts_with(artifact_id))
+                            .unwrap_or(false)
+                    }) {
+                        jars.push(jar.clone());
                     }
                 }
             }
