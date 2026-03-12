@@ -30,7 +30,7 @@ runs:
       shell: bash
       run: |
         case "$RUNNER_OS" in
-          Linux)  TARGET="x86_64-unknown-linux-gnu"; EXT="tar.gz" ;;
+          Linux)  TARGET="x86_64-unknown-linux-musl"; EXT="tar.gz" ;;
           Windows) TARGET="x86_64-pc-windows-msvc"; EXT="zip" ;;
           macOS)
             case "$(uname -m)" in

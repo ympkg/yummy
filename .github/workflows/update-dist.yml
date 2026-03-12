@@ -22,7 +22,7 @@ jobs:
       - name: Download and compute SHA256
         run: |
           VERSION="${{ steps.info.outputs.version }}"
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-gnu; do
             curl -fsSL "https://github.com/ympkg/yummy/releases/download/v${VERSION}/ym-${VERSION}-${target}.tar.gz" -o "${target}.tar.gz"
             sha256sum "${target}.tar.gz" | cut -d' ' -f1 > "${target}.sha256"
           done
@@ -32,7 +32,7 @@ jobs:
           VERSION="${{ steps.info.outputs.version }}"
           cp dist/homebrew/ym.rb ym-updated.rb
           sed -i "s/version \".*\"/version \"${VERSION}\"/" ym-updated.rb
-          sed -i "s/PLACEHOLDER_SHA256_LINUX_X64/$(cat x86_64-unknown-linux-gnu.sha256)/" ym-updated.rb
+          sed -i "s/PLACEHOLDER_SHA256_LINUX_X64/$(cat x86_64-unknown-linux-musl.sha256)/" ym-updated.rb
           sed -i "s/PLACEHOLDER_SHA256_LINUX_ARM64/$(cat aarch64-unknown-linux-gnu.sha256)/" ym-updated.rb
           cat ym-updated.rb
 

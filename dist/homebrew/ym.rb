@@ -21,7 +21,7 @@ class Ym < Formula
       sha256 "PLACEHOLDER_SHA256_LINUX_ARM64"
     end
     on_intel do
-      url "https://github.com/ympkg/yummy/releases/download/v#{version}/ym-#{version}-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/ympkg/yummy/releases/download/v#{version}/ym-#{version}-x86_64-unknown-linux-musl.tar.gz"
       sha256 "PLACEHOLDER_SHA256_LINUX_X64"
     end
   end
