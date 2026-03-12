@@ -438,7 +438,7 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
     // Workspace-level build fingerprint: skip entire compilation if nothing changed
     let (ws_build_fp, current_module_fps) = compute_workspace_build_fingerprint(root, targets, &packages, &ws)?;
 
-    if should_skip_workspace_build(root, targets, &ws_build_fp) {
+    if should_skip_workspace_build(root, targets, &ws_build_fp, &packages, &ws) {
         print_workspace_summary(0, 0, packages.len(), 0, 0, total_start.elapsed());
     } else {
 
@@ -1297,11 +1297,25 @@ fn workspace_build_fp_path(root: &Path, targets: &[String]) -> PathBuf {
 }
 
 /// Check if the workspace build can be skipped.
-fn should_skip_workspace_build(root: &Path, targets: &[String], fingerprint: &str) -> bool {
+/// Requires both fingerprint match AND output directories exist (guards against
+/// stale fingerprints on self-hosted runners where .ym/ persists but out/ is cleaned).
+fn should_skip_workspace_build(root: &Path, targets: &[String], fingerprint: &str, packages: &[String], ws: &crate::workspace::graph::WorkspaceGraph) -> bool {
     let fp_path = workspace_build_fp_path(root, targets);
     match std::fs::read_to_string(&fp_path) {
-        Ok(stored) => stored.trim() == fingerprint,
-        Err(_) => false,
+        Ok(stored) if stored.trim() == fingerprint => {
+            // Verify at least one module's out/classes dir exists
+            let any_output = packages.iter().any(|name| {
+                ws.get_package(name).map_or(false, |pkg| {
+                    pkg.path.join(config::OUTPUT_DIR).join(config::CLASSES_DIR).exists()
+                })
+            });
+            if !any_output {
+                eprintln!("  {} Stale build fingerprint (output dirs missing), rebuilding...",
+                    console::style("!").yellow());
+            }
+            any_output
+        }
+        _ => false,
     }
 }
 
