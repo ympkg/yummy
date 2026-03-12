@@ -12,7 +12,7 @@ pub mod workspace;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Cross-platform home directory (uses `dirs` crate).
 /// Returns `HOME` on Unix, `USERPROFILE`/Known Folder on Windows.
@@ -23,6 +23,39 @@ pub fn home_dir() -> PathBuf {
 /// Like `home_dir()` but returns a String.
 pub fn home_dir_string() -> String {
     home_dir().to_string_lossy().into_owned()
+}
+
+/// Normalize a path to a platform-independent string for use as cache key.
+///
+/// WSL `/mnt/d/code/foo` → `d:/code/foo`
+/// Windows `D:\code\foo` → `d:/code/foo`
+/// Other paths are returned as-is.
+pub fn normalize_cache_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    // WSL: /mnt/<drive>/... → <drive>:/...
+    if s.starts_with("/mnt/") && s.len() > 5 {
+        let drive = s.as_bytes()[5];
+        if drive.is_ascii_alphabetic() && (s.len() == 6 || s.as_bytes()[6] == b'/') {
+            return format!(
+                "{}:{}",
+                (drive as char).to_ascii_lowercase(),
+                if s.len() > 6 { &s[6..] } else { "/" }
+            );
+        }
+    }
+    // Windows: X:\... → x:/...
+    if s.len() >= 3
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/')
+    {
+        return format!(
+            "{}{}",
+            (s.as_bytes()[0] as char).to_ascii_lowercase(),
+            s[1..].replace('\\', "/")
+        );
+    }
+    s.into_owned()
 }
 
 // ============================================================
@@ -37,6 +70,22 @@ pub static JSON_QUIET: AtomicBool = AtomicBool::new(false);
 
 pub fn is_json_quiet() -> bool {
     JSON_QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// When true, resolver's internal eprint progress is suppressed.
+pub static RESOLVER_QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Global progress spinner active flag — when true, resolver skips raw eprint output.
+pub static SPINNER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Shared spinner message — resolver updates this, spinner thread reads it.
+pub static SPINNER_MSG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Update the spinner message (call from any thread).
+pub fn set_spinner_msg(msg: impl Into<String>) {
+    if let Ok(mut m) = SPINNER_MSG.lock() {
+        *m = msg.into();
+    }
 }
 
 // ============================================================
@@ -248,10 +297,10 @@ struct YmcCli {
 
 #[derive(Subcommand)]
 enum YmcCommands {
-    /// Compile the project and package release JAR
+    /// Compile the project and package fat JAR
     Build {
-        /// Target module name (workspace mode)
-        target: Option<String>,
+        /// Target module names (workspace mode, builds only these + their deps)
+        targets: Vec<String>,
         /// Number of parallel compilation threads (default: CPU cores)
         #[arg(long, short = 'j')]
         parallel: Option<usize>,
@@ -397,7 +446,11 @@ pub fn run_ymc() {
 
 fn run_result(result: Result<()>) {
     if let Err(e) = result {
-        eprintln!("  {} {}", console::style("✗").red(), e);
+        eprintln!(
+            "{} {}",
+            console::style(format!("{:>12}", "error")).red().bold(),
+            e
+        );
         std::process::exit(1);
     }
 }
@@ -627,11 +680,12 @@ fn print_version_banner(context: &str) {
 fn dispatch_ymc(cli: YmcCli) -> Result<()> {
     apply_color_mode(&cli.color);
 
-    // Print version banner (skip for JSON output modes)
+    // Print version banner (skip for JSON output modes and Build command which uses cargo-style)
     let is_json = matches!(&cli.command, YmcCommands::Idea { json: true, .. });
-    if !is_json && !is_json_quiet() {
+    let is_build = matches!(&cli.command, YmcCommands::Build { .. });
+    if !is_json && !is_build && !is_json_quiet() {
         let context = match &cli.command {
-            YmcCommands::Build { .. } => "building...",
+            YmcCommands::Build { .. } => unreachable!(),
             YmcCommands::Dev { .. } => "dev server starting...",
             YmcCommands::Test { .. } => "running tests...",
             YmcCommands::Clean { .. } => "cleaning...",
@@ -643,7 +697,7 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
     }
 
     match cli.command {
-        YmcCommands::Build { target, parallel, profile, verbose, clean, output, keep_going, strict } => {
+        YmcCommands::Build { targets, parallel, profile, verbose, clean, output, keep_going, strict } => {
             if let Some(n) = parallel {
                 commands::build::set_parallelism(n);
             }
@@ -660,11 +714,11 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
                 commands::build::set_strict(true);
             }
             if profile {
-                commands::build::execute_with_profile(target)
+                commands::build::execute_with_profile(targets)
             } else if keep_going {
-                commands::build::execute_keep_going(target)
+                commands::build::execute_keep_going(targets, true)
             } else {
-                commands::build::execute(target)
+                commands::build::execute(targets, true)
             }
         }
         YmcCommands::Dev { target, no_reload, debug, debug_port, suspend, args } => {
@@ -689,4 +743,52 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
 fn ymc_main() -> Result<()> {
     let cli = YmcCli::parse();
     dispatch_ymc(cli)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_cache_path_wsl_mount() {
+        let p = Path::new("/mnt/d/code/project/src/Foo.java");
+        assert_eq!(normalize_cache_path(p), "d:/code/project/src/Foo.java");
+    }
+
+    #[test]
+    fn test_normalize_cache_path_wsl_drive_root() {
+        let p = Path::new("/mnt/c");
+        assert_eq!(normalize_cache_path(p), "c:/");
+    }
+
+    #[test]
+    fn test_normalize_cache_path_wsl_drive_with_slash() {
+        let p = Path::new("/mnt/c/");
+        assert_eq!(normalize_cache_path(p), "c:/");
+    }
+
+    #[test]
+    fn test_normalize_cache_path_wsl_uppercase_drive() {
+        let p = Path::new("/mnt/D/code");
+        assert_eq!(normalize_cache_path(p), "d:/code");
+    }
+
+    #[test]
+    fn test_normalize_cache_path_native_linux() {
+        let p = Path::new("/home/user/project/src/Foo.java");
+        assert_eq!(normalize_cache_path(p), "/home/user/project/src/Foo.java");
+    }
+
+    #[test]
+    fn test_normalize_cache_path_multi_letter_mount_no_convert() {
+        // /mnt/data is not a single-drive mount, should not convert
+        let p = Path::new("/mnt/data/foo");
+        assert_eq!(normalize_cache_path(p), "/mnt/data/foo");
+    }
+
+    #[test]
+    fn test_normalize_cache_path_relative() {
+        let p = Path::new("src/Foo.java");
+        assert_eq!(normalize_cache_path(p), "src/Foo.java");
+    }
 }

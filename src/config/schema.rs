@@ -1,5 +1,26 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+/// Global package name registry: `@alias` → `groupId:artifactId`.
+/// Loaded from `~/.ym/registry.json` on first access.
+/// The file format is `{ "groupId:artifactId": "@alias", ... }` (coord → alias).
+/// This function builds the reverse map (alias → coord) for dependency resolution.
+/// Future: fetched from remote registry website.
+fn global_registry() -> &'static BTreeMap<String, String> {
+    static REGISTRY: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let path = crate::home_dir().join(".ym").join("registry.json");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let forward: BTreeMap<String, String> =
+                serde_json::from_str(&content).unwrap_or_default();
+            // Reverse: alias → coord
+            forward.into_iter().map(|(coord, alias)| (alias, coord)).collect()
+        } else {
+            BTreeMap::new()
+        }
+    })
+}
 
 /// Dependency value: either a simple version string or a detailed spec
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -203,7 +224,24 @@ impl RegistryValue {
     }
 }
 
-/// Main package.toml configuration
+/// Check if a dependency key is a Maven coordinate (vs. a workspace module name).
+/// Recognizes both `groupId:artifactId` and `@scope/name` formats.
+pub fn is_maven_dep(key: &str) -> bool {
+    key.contains(':') || key.starts_with('@')
+}
+
+/// Extract artifactId from a dependency key.
+/// - `@scope/name` → `name`
+/// - `groupId:artifactId` → `artifactId`
+pub fn artifact_id_from_key(key: &str) -> &str {
+    if key.starts_with('@') {
+        key.split('/').next_back().unwrap_or(key)
+    } else {
+        key.split(':').next_back().unwrap_or(key)
+    }
+}
+
+/// Main ym.json configuration
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct YmConfig {
@@ -256,6 +294,10 @@ pub struct YmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<BTreeMap<String, DependencyValue>>,
 
+    /// Dev dependencies — compile-only, not bundled (Lombok, JUnit, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_dependencies: Option<BTreeMap<String, DependencyValue>>,
+
     /// Workspace glob patterns
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<Vec<String>>,
@@ -292,6 +334,14 @@ pub struct YmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclusions: Option<Vec<String>>,
 
+    /// User-defined extra properties for version substitution (`${key}`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<BTreeMap<String, String>>,
+
+    /// Scope mapping: `@scope` → Maven groupId prefix (e.g. `@spring-boot` → `org.springframework.boot`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_mapping: Option<BTreeMap<String, String>>,
+
     /// Custom source directory (default: src/main/java → fallback src/)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_dir: Option<String>,
@@ -310,34 +360,106 @@ fn default_group_id() -> String {
 }
 
 impl YmConfig {
+    /// Resolve `${...}` variable references in a version string.
+    /// Built-in: `${project.version}`, `${project.groupId}`.
+    /// Custom: `${key}` from `[ext]` section.
+    /// `root` is the workspace root config (or self for root-level calls).
+    fn resolve_var(version: &str, root: &YmConfig) -> String {
+        if !version.contains("${") {
+            return version.to_string();
+        }
+        let mut result = version.to_string();
+        // Built-in variables
+        if result.contains("${project.version}") {
+            let v = root.version.as_deref().unwrap_or("0.0.0");
+            result = result.replace("${project.version}", v);
+        }
+        if result.contains("${project.groupId}") {
+            result = result.replace("${project.groupId}", &root.group_id);
+        }
+        // Custom [ext] variables
+        if result.contains("${") {
+            if let Some(ref ext) = root.ext {
+                for (k, v) in ext {
+                    let placeholder = format!("${{{}}}", k);
+                    if result.contains(&placeholder) {
+                        result = result.replace(&placeholder, v);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Iterate all dependencies: `[dependencies]` + `[devDependencies]`.
+    /// devDependencies entries yield `is_dev = true` (effective scope "provided").
+    fn iter_all_deps(&self) -> impl Iterator<Item = (&str, &DependencyValue, bool)> {
+        let deps = self.dependencies.iter()
+            .flat_map(|m| m.iter())
+            .map(|(k, v)| (k.as_str(), v, false));
+        let dev_deps = self.dev_dependencies.iter()
+            .flat_map(|m| m.iter())
+            .map(|(k, v)| (k.as_str(), v, true));
+        deps.chain(dev_deps)
+    }
+
+    /// Effective scope: devDependencies → "provided", else value.scope()
+    fn effective_scope<'a>(value: &'a DependencyValue, is_dev: bool) -> &'a str {
+        if is_dev { "provided" } else { value.scope() }
+    }
+
+    /// Resolve a dependency key to Maven `groupId:artifactId` format.
+    /// - `@alias` → look up global registry (~/.ym/registry.json) → `groupId:artifactId`
+    /// - `@scope/name` → look up ym.json `scopeMapping` → `groupId:name` (backward compat)
+    /// - `groupId:artifactId` → pass through
+    /// Return resolutions with keys resolved to Maven coordinates.
+    pub fn resolved_resolutions(&self) -> BTreeMap<String, String> {
+        match self.resolutions {
+            Some(ref res) => res
+                .iter()
+                .map(|(k, v)| (self.resolve_key(k), v.clone()))
+                .collect(),
+            None => BTreeMap::new(),
+        }
+    }
+
+    pub fn resolve_key(&self, key: &str) -> String {
+        if key.starts_with('@') {
+            // Global registry: @alias → groupId:artifactId (exact match)
+            if let Some(coord) = global_registry().get(key) {
+                return coord.clone();
+            }
+            // Backward compat: @scope/name → scopeMapping lookup
+            if let Some(slash_idx) = key.find('/') {
+                let scope = &key[..slash_idx];
+                let name = &key[slash_idx + 1..];
+                if let Some(ref mapping) = self.scope_mapping {
+                    if let Some(group_id) = mapping.get(scope) {
+                        return format!("{}:{}", group_id, name);
+                    }
+                }
+            }
+        }
+        key.to_string()
+    }
+
     /// Extract Maven dependencies as BTreeMap<coordinate, version>.
-    /// Filters out workspace module refs (keys without ':').
+    /// Filters out workspace module refs.
     /// Resolves DependencyValue to plain version strings.
     pub fn maven_dependencies(&self) -> BTreeMap<String, String> {
         let mut result = BTreeMap::new();
-        if let Some(ref deps) = self.dependencies {
-            for (key, value) in deps {
-                // Skip workspace module refs (no colon = module name)
-                if !key.contains(':') {
-                    continue;
-                }
-                // Skip { workspace = true } entries that inherit version from root
-                if value.is_workspace() {
-                    continue;
-                }
-                // Skip URL and Git dependencies (handled separately)
-                if value.url().is_some() || value.git().is_some() {
-                    continue;
-                }
-                if let Some(version) = value.version() {
-                    // Encode classifier into key: "g:a:classifier" for MavenCoord::parse
-                    let coord_key = if let Some(classifier) = value.classifier() {
-                        format!("{}:{}", key, classifier)
-                    } else {
-                        key.clone()
-                    };
-                    result.insert(coord_key, version.to_string());
-                }
+        for (key, value, _is_dev) in self.iter_all_deps() {
+            if !is_maven_dep(key) { continue; }
+            if value.is_workspace() { continue; }
+            if value.url().is_some() || value.git().is_some() { continue; }
+            if let Some(version) = value.version() {
+                let resolved = self.resolve_key(key);
+                let coord_key = if let Some(classifier) = value.classifier() {
+                    format!("{}:{}", resolved, classifier)
+                } else {
+                    resolved
+                };
+                result.insert(coord_key, Self::resolve_var(version, self));
             }
         }
         result
@@ -347,74 +469,67 @@ impl YmConfig {
     /// Returns names of local workspace modules this package depends on.
     pub fn workspace_module_deps(&self) -> Vec<String> {
         let mut result = Vec::new();
-        if let Some(ref deps) = self.dependencies {
-            for (key, value) in deps {
-                // No colon = workspace module name
-                if !key.contains(':') && value.is_workspace() {
-                    result.push(key.clone());
-                }
+        for (key, value, _is_dev) in self.iter_all_deps() {
+            if !is_maven_dep(key) && value.is_workspace() {
+                result.push(key.to_string());
             }
         }
         result
     }
 
     /// Extract Maven dependencies, resolving `{ workspace = true }` entries
-    /// by inheriting version from the root config's `[dependencies]`.
-    /// Root deps are NOT auto-inherited — child must explicitly declare.
+    /// by inheriting version from the root config's dependencies.
     pub fn maven_dependencies_with_root(&self, root: &YmConfig) -> BTreeMap<String, String> {
         let mut result = BTreeMap::new();
-        if let Some(ref deps) = self.dependencies {
-            for (key, value) in deps {
-                if !key.contains(':') {
-                    continue;
+        for (key, value, _is_dev) in self.iter_all_deps() {
+            if !is_maven_dep(key) { continue; }
+            if value.url().is_some() || value.git().is_some() { continue; }
+            let resolved = root.resolve_key(key);
+            if value.is_workspace() {
+                // Inherit version from root (check both deps and devDeps)
+                let root_version = root.find_dep_version(key);
+                if let Some(version) = root_version {
+                    result.insert(resolved, Self::resolve_var(version, root));
                 }
-                if value.url().is_some() || value.git().is_some() {
-                    continue;
-                }
-                if value.is_workspace() {
-                    // Inherit version from root
-                    if let Some(ref root_deps) = root.dependencies {
-                        if let Some(root_value) = root_deps.get(key) {
-                            if let Some(version) = root_value.version() {
-                                result.insert(key.clone(), version.to_string());
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if let Some(version) = value.version() {
-                    result.insert(key.clone(), version.to_string());
-                }
+                continue;
+            }
+            if let Some(version) = value.version() {
+                result.insert(resolved, Self::resolve_var(version, root));
             }
         }
         result
     }
 
+    /// Look up a dependency version in both `[dependencies]` and `[devDependencies]`.
+    fn find_dep_version(&self, key: &str) -> Option<&str> {
+        self.dependencies.as_ref()
+            .and_then(|d| d.get(key))
+            .and_then(|v| v.version())
+            .or_else(|| {
+                self.dev_dependencies.as_ref()
+                    .and_then(|d| d.get(key))
+                    .and_then(|v| v.version())
+            })
+    }
+
     /// Extract Maven dependencies filtered by allowed scopes.
-    /// Returns BTreeMap<coordinate, version> for dependencies matching any of the given scopes.
+    /// devDependencies are treated as scope "provided".
     pub fn maven_dependencies_for_scopes(&self, scopes: &[&str]) -> BTreeMap<String, String> {
         let mut result = BTreeMap::new();
-        if let Some(ref deps) = self.dependencies {
-            for (key, value) in deps {
-                if !key.contains(':') {
-                    continue;
-                }
-                if value.url().is_some() || value.git().is_some() {
-                    continue;
-                }
-                if value.is_workspace() {
-                    continue;
-                }
-                let dep_scope = value.scope();
-                if scopes.contains(&dep_scope) {
-                    if let Some(version) = value.version() {
-                        let coord_key = if let Some(classifier) = value.classifier() {
-                            format!("{}:{}", key, classifier)
-                        } else {
-                            key.clone()
-                        };
-                        result.insert(coord_key, version.to_string());
-                    }
+        for (key, value, is_dev) in self.iter_all_deps() {
+            if !is_maven_dep(key) { continue; }
+            if value.url().is_some() || value.git().is_some() { continue; }
+            if value.is_workspace() { continue; }
+            let dep_scope = Self::effective_scope(value, is_dev);
+            if scopes.contains(&dep_scope) {
+                if let Some(version) = value.version() {
+                    let resolved = self.resolve_key(key);
+                    let coord_key = if let Some(classifier) = value.classifier() {
+                        format!("{}:{}", resolved, classifier)
+                    } else {
+                        resolved
+                    };
+                    result.insert(coord_key, Self::resolve_var(version, self));
                 }
             }
         }
@@ -425,33 +540,23 @@ impl YmConfig {
     /// entries by inheriting version from root config but using child's own scope.
     pub fn maven_dependencies_for_scopes_with_root(&self, scopes: &[&str], root: &YmConfig) -> BTreeMap<String, String> {
         let mut result = BTreeMap::new();
-        if let Some(ref deps) = self.dependencies {
-            for (key, value) in deps {
-                if !key.contains(':') {
-                    continue;
-                }
-                if value.url().is_some() || value.git().is_some() {
-                    continue;
-                }
-                if value.is_workspace() {
-                    // Use child's scope, inherit version from root
-                    let dep_scope = value.scope();
-                    if scopes.contains(&dep_scope) {
-                        if let Some(ref root_deps) = root.dependencies {
-                            if let Some(root_value) = root_deps.get(key) {
-                                if let Some(version) = root_value.version() {
-                                    result.insert(key.clone(), version.to_string());
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-                let dep_scope = value.scope();
+        for (key, value, is_dev) in self.iter_all_deps() {
+            if !is_maven_dep(key) { continue; }
+            if value.url().is_some() || value.git().is_some() { continue; }
+            let resolved = root.resolve_key(key);
+            if value.is_workspace() {
+                let dep_scope = Self::effective_scope(value, is_dev);
                 if scopes.contains(&dep_scope) {
-                    if let Some(version) = value.version() {
-                        result.insert(key.clone(), version.to_string());
+                    if let Some(version) = root.find_dep_version(key) {
+                        result.insert(resolved, Self::resolve_var(version, root));
                     }
+                }
+                continue;
+            }
+            let dep_scope = Self::effective_scope(value, is_dev);
+            if scopes.contains(&dep_scope) {
+                if let Some(version) = value.version() {
+                    result.insert(resolved, Self::resolve_var(version, root));
                 }
             }
         }
@@ -491,28 +596,24 @@ impl YmConfig {
 
     /// Validate dependency declarations in a workspace child module.
     /// Returns errors for:
-    /// - `{ workspace = true }` Maven dep (has colon) not found in root
-    /// - Non-colon key without `workspace = true` (must be explicit module ref)
+    /// - `{ workspace = true }` Maven dep not found in root
+    /// - Non-Maven key without `workspace = true` (must be explicit module ref)
     pub fn validate_workspace_deps(&self, root: &YmConfig) -> Vec<String> {
         let mut errors = Vec::new();
         if let Some(ref deps) = self.dependencies {
             for (key, value) in deps {
-                if key.contains(':') {
+                if is_maven_dep(key) {
                     if value.is_workspace() {
-                        let found = root.dependencies.as_ref()
-                            .and_then(|d| d.get(key))
-                            .and_then(|v| v.version())
-                            .is_some();
-                        if !found {
+                        if root.find_dep_version(key).is_none() {
                             errors.push(format!(
-                                "Dependency '{}' uses {{ workspace = true }} but root package.toml has no version for it",
+                                "Dependency '{}' uses {{ workspace = true }} but root ym.json has no version for it",
                                 key
                             ));
                         }
                     }
                 } else if !value.is_workspace() {
                     errors.push(format!(
-                        "Dependency '{}' has no colon (not a Maven coordinate) and no {{ workspace = true }} — must be a workspace module reference",
+                        "Dependency '{}' is not a Maven coordinate and has no {{ workspace = true }} — must be a workspace module reference",
                         key
                     ));
                 }
@@ -725,7 +826,7 @@ where
             M: de::MapAccess<'de>,
         {
             // { workspace = true } → None (inherited from root)
-            while let Some((key, _value)) = map.next_entry::<String, toml::Value>()? {
+            while let Some((key, _value)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
                 let _ = key;
             }
             Ok(None)
@@ -778,7 +879,7 @@ where
         where
             M: de::MapAccess<'de>,
         {
-            while let Some((key, _value)) = map.next_entry::<String, toml::Value>()? {
+            while let Some((key, _value)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
                 let _ = key;
             }
             Ok(None)

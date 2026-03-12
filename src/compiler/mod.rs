@@ -1,11 +1,28 @@
 pub mod incremental;
 pub mod javac;
+pub mod worker;
 
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompileOutcome {
+    UpToDate,
+    Cached,
+    Compiled(usize),
+}
+
+impl CompileOutcome {
+    pub fn files_compiled(self) -> usize {
+        match self {
+            CompileOutcome::Compiled(n) => n,
+            _ => 0,
+        }
+    }
+}
+
 pub struct CompileResult {
     pub success: bool,
-    pub files_compiled: usize,
+    pub outcome: CompileOutcome,
     pub errors: String,
 }
 

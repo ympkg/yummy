@@ -37,7 +37,7 @@ pub fn execute(json: bool) -> Result<()> {
         let mut json_scopes: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         if let Some(ref deps) = cfg.dependencies {
             for (coord, value) in deps {
-                if coord.contains(':') && !value.is_workspace() {
+                if crate::config::schema::is_maven_dep(coord) && !value.is_workspace() {
                     *json_scopes.entry(value.scope()).or_insert(0) += 1;
                 }
             }
@@ -85,7 +85,7 @@ pub fn execute(json: bool) -> Result<()> {
     let mut scope_counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     if let Some(ref deps) = cfg.dependencies {
         for (coord, value) in deps {
-            if coord.contains(':') && !value.is_workspace() {
+            if crate::config::schema::is_maven_dep(coord) && !value.is_workspace() {
                 *scope_counts.entry(value.scope()).or_insert(0) += 1;
             }
         }

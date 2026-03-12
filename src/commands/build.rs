@@ -14,6 +14,52 @@ use crate::resources;
 use crate::scripts;
 use crate::workspace::graph::WorkspaceGraph;
 
+/// Simple spinner that uses raw eprint! — avoids indicatif's ANSI escape issues on WSL 1.
+/// Reads message from global SPINNER_MSG so resolver can update progress in-place.
+struct SimpleSpinner {
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SimpleSpinner {
+    fn new(msg: &str) -> Self {
+        crate::set_spinner_msg(msg);
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = running.clone();
+        let handle = std::thread::spawn(move || {
+            let chars = ['⠖', '⠲', '⠴', '⠦'];
+            let mut i = 0;
+            while r.load(std::sync::atomic::Ordering::Relaxed) {
+                let c = chars[i % chars.len()];
+                let msg = crate::SPINNER_MSG.lock().map(|m| m.clone()).unwrap_or_default();
+                // \r + trailing spaces ensures previous longer messages are fully overwritten
+                eprint!("\r  {} {}  \x1b[K", c, msg);
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+        Self { running, handle: Some(handle) }
+    }
+
+    fn set_message(&self, msg: impl Into<String>) {
+        crate::set_spinner_msg(msg);
+    }
+
+    fn finish_and_clear(mut self) {
+        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().ok();
+        }
+        eprint!("\r{}\r", " ".repeat(80));
+    }
+}
+
+impl Drop for SimpleSpinner {
+    fn drop(&mut self) {
+        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Custom output directory override (set via --output flag)
 static OUTPUT_DIR_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -57,7 +103,7 @@ pub fn is_strict() -> bool {
 }
 
 /// Build with per-phase timing breakdown
-pub fn execute_with_profile(_target: Option<String>) -> Result<()> {
+pub fn execute_with_profile(_targets: Vec<String>) -> Result<()> {
     let total_start = Instant::now();
 
     let (config_path, cfg) = config::load_or_find_config()?;
@@ -106,14 +152,14 @@ pub fn execute_with_profile(_target: Option<String>) -> Result<()> {
     println!(
         "  {} compilation ({} files)                     {:>6}ms",
         style("·").dim(),
-        result.files_compiled,
+        result.outcome.files_compiled(),
         compile_time.as_millis()
     );
 
     if cfg.main.is_some() {
         let jar_start = Instant::now();
         let runtime_jars = resolve_deps_with_scopes(&project, &cfg, &["compile", "runtime"])?;
-        build_release_jar(&project, &cfg, &runtime_jars, None)?;
+        build_release_jar(&project, &cfg, &runtime_jars, None, None)?;
         let jar_time = jar_start.elapsed();
         println!(
             "  {} JAR packaging                                {:>6}ms",
@@ -138,24 +184,23 @@ pub fn execute_with_profile(_target: Option<String>) -> Result<()> {
 
 /// Compile only (no JAR packaging). Used by dev/test commands.
 pub fn compile_only(target: Option<String>) -> Result<()> {
-    build_impl(target, false, false)
+    let targets = target.into_iter().collect();
+    build_impl(targets, false, false)
 }
 
-pub fn execute(target: Option<String>) -> Result<()> {
-    build_impl(target, true, false)
+pub fn execute(targets: Vec<String>, jar: bool) -> Result<()> {
+    build_impl(targets, jar, false)
 }
 
-pub fn execute_keep_going(target: Option<String>) -> Result<()> {
-    build_impl(target, true, true)
+pub fn execute_keep_going(targets: Vec<String>, jar: bool) -> Result<()> {
+    build_impl(targets, jar, true)
 }
 
-fn build_impl(target: Option<String>, package: bool, keep_going: bool) -> Result<()> {
+fn build_impl(targets: Vec<String>, package: bool, keep_going: bool) -> Result<()> {
     let total_start = Instant::now();
 
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
-
-    super::idea::auto_sync_idea(&project, &cfg);
 
     // Run prebuild script
     scripts::run_script(&cfg, "prebuild", &project)?;
@@ -164,9 +209,8 @@ fn build_impl(target: Option<String>, package: bool, keep_going: bool) -> Result
     ensure_jdk_for_config(&cfg)?;
 
     if cfg.workspaces.is_some() {
-        let result = build_workspace(&project, &cfg, target.as_deref(), package, keep_going);
+        let result = build_workspace(&project, &cfg, &targets, package, keep_going, total_start);
         scripts::run_script(&cfg, "postbuild", &project)?;
-        print_total_time(total_start);
         return result;
     }
 
@@ -192,18 +236,39 @@ fn build_impl(target: Option<String>, package: bool, keep_going: bool) -> Result
     }
 
     println!(
-        "  {} resolved dependencies {:>38}ms",
-        style("✓").green(),
+        "{} dependencies {:>40}ms",
+        style(format!("{:>12}", "Resolving")).green().bold(),
         resolve_time.as_millis()
     );
 
-    let out_dir = config::output_classes_dir(&project);
-    print_compile_result(&cfg.name, &result, compile_time, &out_dir);
+    print_compile_result(&cfg.name, &result, compile_time);
 
     if package && cfg.main.is_some() {
         // Fat JAR: compile + runtime (exclude provided and test)
         let runtime_jars = resolve_deps_with_scopes(&project, &cfg, &["compile", "runtime"])?;
-        build_release_jar(&project, &cfg, &runtime_jars, None)?;
+        let class_dir = config::output_classes_dir(&project);
+        let resource_dir = project.join("src").join("main").join("resources");
+        let fp = compute_packaging_fingerprint(&class_dir, &resource_dir, &runtime_jars, &cfg)?;
+        let jar_name = format!("{}-{}.jar", cfg.name, cfg.version.as_deref().unwrap_or("0.0.0"));
+        let output_jar = project.join("out").join("release").join(&jar_name);
+
+        if should_skip_packaging(&project, &fp, &output_jar) {
+            let jar_size = std::fs::metadata(&output_jar).map(|m| m.len()).unwrap_or(0);
+            let size_str = if jar_size >= 1024 * 1024 {
+                format!("{:.1} MB", jar_size as f64 / (1024.0 * 1024.0))
+            } else {
+                format!("{:.0} KB", jar_size as f64 / 1024.0)
+            };
+            println!(
+                "{} {} ({}) (up to date)",
+                style(format!("{:>12}", "Packaging")).green().bold(),
+                jar_name,
+                size_str,
+            );
+        } else {
+            build_release_jar(&project, &cfg, &runtime_jars, None, None)?;
+            save_packaging_fingerprint(&project, &fp)?;
+        }
     }
 
     scripts::run_script(&cfg, "postbuild", &project)?;
@@ -214,27 +279,58 @@ fn build_impl(target: Option<String>, package: bool, keep_going: bool) -> Result
 
 fn print_total_time(start: Instant) {
     let elapsed = start.elapsed();
-    let ms = elapsed.as_millis();
-    if ms > 1000 {
-        println!(
-            "\n  {} built in {:.2}s",
-            style("✓").green(),
-            elapsed.as_secs_f64()
-        );
+    let time = if elapsed.as_millis() > 1000 {
+        format!("{:.2}s", elapsed.as_secs_f64())
     } else {
-        println!(
-            "\n  {} built in {}ms",
-            style("✓").green(),
-            ms
-        );
-    }
+        format!("{}ms", elapsed.as_millis())
+    };
+    println!(
+        "{} build in {}",
+        style(format!("{:>12}", "Finished")).green().bold(),
+        time
+    );
 }
 
-fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, package: bool, keep_going: bool) -> Result<()> {
+fn print_workspace_summary(
+    compiled: usize, cached: usize, up_to_date: usize,
+    failed: usize, skipped: usize, elapsed: std::time::Duration,
+) {
+    let mut parts = Vec::new();
+    if compiled > 0 { parts.push(format!("{} compiled", compiled)); }
+    if cached > 0 { parts.push(format!("{} cached", cached)); }
+    if failed > 0 { parts.push(format!("{} failed", failed)); }
+    if skipped > 0 { parts.push(format!("{} skipped", skipped)); }
+    if up_to_date > 0 { parts.push(format!("{} up to date", up_to_date)); }
+
+    let icon = if failed > 0 {
+        style(format!("{:>12}", "Compiling")).red().bold()
+    } else {
+        style(format!("{:>12}", "Compiling")).green().bold()
+    };
+    let time = if elapsed.as_millis() > 1000 {
+        format!("{:.2}s", elapsed.as_secs_f64())
+    } else {
+        format!("{}ms", elapsed.as_millis())
+    };
+    println!("{} {} in {}", icon, parts.join(", "), time);
+}
+
+fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package: bool, keep_going: bool, total_start: Instant) -> Result<()> {
+    let spinner = SimpleSpinner::new("Scanning workspace...");
+
     let ws = WorkspaceGraph::build(root)?;
 
-    let packages = if let Some(target) = target {
-        ws.transitive_closure(target)?
+    let packages = if !targets.is_empty() {
+        let mut all = Vec::new();
+        for t in targets {
+            let closure = ws.transitive_closure(t)?;
+            for pkg in closure {
+                if !all.contains(&pkg) {
+                    all.push(pkg);
+                }
+            }
+        }
+        all
     } else {
         let mut all = Vec::new();
         for name in ws.all_packages() {
@@ -250,13 +346,19 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, packa
         all
     };
 
+    spinner.set_message(format!("Scanning workspace ({} modules)...", packages.len()));
+
     // Validate workspace dependency declarations
     for name in &packages {
         let pkg = ws.get_package(name).unwrap();
         let errors = pkg.config.validate_workspace_deps(root_cfg);
         if !errors.is_empty() {
             for e in &errors {
-                eprintln!("  {} {}: {}", console::style("✗").red(), name, e);
+                eprintln!(
+                    "{} {}: {}",
+                    console::style(format!("{:>12}", "error")).red().bold(),
+                    name, e
+                );
             }
             anyhow::bail!("Invalid workspace dependency declarations in '{}'", name);
         }
@@ -271,15 +373,19 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, packa
         .map(|name| {
             let pkg = ws.get_package(name).unwrap();
             let mut deps = pkg.config.maven_dependencies_with_root(root_cfg);
-            if let Some(ref resolutions) = root_cfg.resolutions {
-                for (k, v) in resolutions {
-                    if deps.contains_key(k) {
-                        deps.insert(k.clone(), v.clone());
-                    }
+            for (k, v) in root_cfg.resolved_resolutions() {
+                if deps.contains_key(&k) {
+                    deps.insert(k, v);
                 }
             }
             (name.clone(), deps)
         })
+        .collect();
+
+    // Pre-compute transitive closures for all packages (avoids O(N³) repeated BFS)
+    let closure_cache: std::collections::HashMap<String, Vec<String>> = packages
+        .iter()
+        .map(|name| (name.clone(), ws.transitive_closure(name).unwrap_or_default()))
         .collect();
 
     // Propagate Maven deps from workspace module dependencies (transitive)
@@ -288,8 +394,8 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, packa
         .map(|name| {
             let mut deps = own_module_deps.get(name).cloned().unwrap_or_default();
             // Walk workspace dep graph to include transitive Maven deps
-            if let Ok(closure) = ws.transitive_closure(name) {
-                for ws_dep in &closure {
+            if let Some(closure) = closure_cache.get(name) {
+                for ws_dep in closure {
                     if ws_dep != name {
                         if let Some(ws_dep_deps) = own_module_deps.get(ws_dep) {
                             for (k, v) in ws_dep_deps {
@@ -303,145 +409,268 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, packa
         })
         .collect();
 
+    let total_deps: usize = all_module_deps.iter().map(|(_, deps)| deps.len()).sum();
+    spinner.set_message(format!("Resolving dependencies ({} modules, {} artifacts)...", packages.len(), total_deps));
+
     let cache = config::maven_cache_dir(root);
     let mut resolved = config::load_resolved_cache_checked(root, root_cfg)?;
     let registries = root_cfg.registry_entries();
     let exclusions = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
 
-    let resolutions = root_cfg.resolutions.as_ref().cloned().unwrap_or_default();
+    let resolutions = root_cfg.resolved_resolutions();
+    // Spinner stays alive during resolve — resolver updates spinner message with progress
+    crate::SPINNER_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     let per_module_jars = crate::workspace::resolver::resolve_workspace_deps_with_resolutions(
         &all_module_deps, &cache, &mut resolved, &registries, &exclusions, &resolutions,
     )?;
+    crate::SPINNER_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    spinner.finish_and_clear();
     config::save_resolved_cache(root, &resolved)?;
-
     let dep_time = dep_start.elapsed();
     let total_jars: usize = per_module_jars.values().next().map(|v| v.len()).unwrap_or(0);
     println!(
-        "  {} resolved workspace dependencies ({} jars) {:>11}ms",
-        style("✓").green(),
+        "{} dependencies ({} jars) {:>25}ms",
+        style(format!("{:>12}", "Resolving")).green().bold(),
         total_jars,
         dep_time.as_millis()
     );
 
-    // Group into topological levels for parallel compilation
-    let levels = compute_parallel_levels(&packages, &ws);
+    // Workspace-level build fingerprint: skip entire compilation if nothing changed
+    let (ws_build_fp, current_module_fps) = compute_workspace_build_fingerprint(root, targets, &packages, &ws)?;
+
+    if should_skip_workspace_build(root, targets, &ws_build_fp) {
+        print_workspace_summary(0, 0, packages.len(), 0, 0, total_start.elapsed());
+    } else {
+
+    // Load stored per-module fingerprints for shortcut comparison
+    let stored_module_fps = load_module_fingerprints(root, targets);
+
+    // Wave scheduling: in-degree based parallel compilation
+    let mut in_degree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut dependents: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    for pkg_name in &packages {
+        let pkg = ws.get_package(pkg_name).unwrap();
+        let ws_deps = pkg.config.workspace_module_deps();
+        let relevant_dep_count = ws_deps.iter()
+            .filter(|d| packages.contains(d))
+            .count();
+        in_degree.insert(pkg_name.clone(), relevant_dep_count);
+        for dep in ws_deps.iter().filter(|d| packages.contains(d)) {
+            dependents.entry(dep.clone()).or_default().push(pkg_name.clone());
+        }
+    }
+
+    // Create compiler worker pool (warm JVM instances for parallel compilation)
+    let pool_size = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(packages.len())
+        .min(8);
+    let worker_pool = if packages.len() > 1 {
+        match compiler::worker::CompilerPool::new(pool_size) {
+            Ok(p) => Some(p),
+            Err(_) => None, // Fall back to direct javac silently
+        }
+    } else {
+        None
+    };
 
     let mut workspace_classpath: Vec<PathBuf> = Vec::new();
     let mut failed_modules: Vec<String> = Vec::new();
 
-    for level in &levels {
-        if level.len() == 1 {
-            let pkg_name = &level[0];
+    // Workspace output stats
+    let total_modules = packages.len();
+    let mut compiled_count: usize = 0;
+    let mut cached_count: usize = 0;
+    let mut up_to_date_count: usize = 0;
+    let mut skipped_count: usize = 0;
+    let mut processed: usize = 0;
+    let verbose = is_verbose();
+    let is_tty = console::Term::stderr().is_term();
 
-            // Skip modules that depend on a failed module
-            if keep_going && has_failed_dependency(pkg_name, &failed_modules, &ws) {
-                failed_modules.push(pkg_name.clone());
+    // Print initial progress header for non-verbose mode
+    if !verbose && total_modules > 1 && is_tty {
+        eprint!("   Compiling [{}/{}]", processed, total_modules);
+    }
+
+    loop {
+        let wave: Vec<String> = in_degree.iter()
+            .filter(|(_, deg)| **deg == 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        if wave.is_empty() { break; }
+
+        for name in &wave {
+            in_degree.remove(name);
+        }
+
+        // In keep_going mode, skip modules whose dependencies have failed
+        let (compilable, skipped): (Vec<&String>, Vec<&String>) = if keep_going {
+            let mut comp = Vec::new();
+            let mut skip = Vec::new();
+            for name in &wave {
+                if has_failed_dependency(name, &failed_modules, &ws) {
+                    skip.push(name);
+                } else {
+                    comp.push(name);
+                }
+            }
+            (comp, skip)
+        } else {
+            (wave.iter().collect(), Vec::new())
+        };
+
+        for name in &skipped {
+            failed_modules.push((*name).clone());
+            skipped_count += 1;
+            processed += 1;
+            if verbose {
                 println!(
                     "{} {} (depends on failed module)",
                     style(format!("{:>12}", "Skipping")).yellow().bold(),
-                    pkg_name
+                    name
                 );
-                continue;
+            } else if is_tty {
+                eprint!("\r   Compiling [{}/{}]   ", processed, total_modules);
             }
-
-            let pkg = ws.get_package(pkg_name).unwrap();
-            let start = Instant::now();
-
-            let jars = per_module_jars.get(pkg_name).cloned().unwrap_or_default();
-            let mut classpath = jars;
-            classpath.extend(workspace_classpath.clone());
-
-            let result = compile_project(&pkg.path, &pkg.config, &classpath)?;
-            let elapsed = start.elapsed();
-
-            if !result.success {
-                eprint!("{}", compiler::colorize_errors(&result.errors));
-                if keep_going {
-                    failed_modules.push(pkg_name.clone());
-                    continue;
+            if let Some(deps) = dependents.get(*name) {
+                for dep in deps {
+                    if let Some(deg) = in_degree.get_mut(dep) {
+                        *deg -= 1;
+                    }
                 }
-                bail!("Compilation of '{}' failed", pkg_name);
             }
+        }
 
-            let out_dir = config::output_classes_dir(&pkg.path);
-            print_compile_result(pkg_name, &result, elapsed, &out_dir);
-            workspace_classpath.push(out_dir);
-        } else {
-            let start = Instant::now();
-            let cp_snapshot = workspace_classpath.clone();
+        if compilable.is_empty() { continue; }
 
-            // Filter out modules with failed dependencies
-            let compilable: Vec<&String> = if keep_going {
-                level.iter().filter(|name| !has_failed_dependency(name, &failed_modules, &ws)).collect()
-            } else {
-                level.iter().collect()
+        let cp_snapshot = workspace_classpath.clone();
+
+        let results: Vec<_> = compilable
+            .par_iter()
+            .map(|pkg_name| {
+                // Per-module fingerprint shortcut: skip compile_project() if unchanged
+                if let (Some(current), Some(stored)) = (
+                    current_module_fps.get(pkg_name.as_str()),
+                    stored_module_fps.get(pkg_name.as_str()),
+                ) {
+                    if current == stored {
+                        return (pkg_name.to_string(), Ok(compiler::CompileResult {
+                            success: true,
+                            outcome: compiler::CompileOutcome::UpToDate,
+                            errors: String::new(),
+                        }), std::time::Duration::ZERO);
+                    }
+                }
+                let pkg = ws.get_package(pkg_name.as_str()).unwrap();
+                let start = Instant::now();
+                let jars = per_module_jars.get(pkg_name.as_str()).cloned().unwrap_or_default();
+                let mut classpath = jars;
+                classpath.extend(cp_snapshot.clone());
+                let result = compile_project_with_pool(&pkg.path, &pkg.config, &classpath, worker_pool.as_ref());
+                (pkg_name.to_string(), result, start.elapsed())
+            })
+            .collect();
+
+        for (pkg_name, result, elapsed) in results {
+            let success = match &result {
+                Ok(r) if r.success => {
+                    processed += 1;
+                    match r.outcome {
+                        compiler::CompileOutcome::UpToDate => {
+                            up_to_date_count += 1;
+                            if verbose {
+                                print_compile_result(&pkg_name, r, elapsed);
+                            } else if is_tty {
+                                eprint!("\r   Compiling [{}/{}]   ", processed, total_modules);
+                            }
+                        }
+                        compiler::CompileOutcome::Cached => {
+                            cached_count += 1;
+                            if is_tty { eprint!("\r{}\r", " ".repeat(40)); }
+                            print_compile_result(&pkg_name, r, elapsed);
+                        }
+                        compiler::CompileOutcome::Compiled(_) => {
+                            compiled_count += 1;
+                            if is_tty { eprint!("\r{}\r", " ".repeat(40)); }
+                            print_compile_result(&pkg_name, r, elapsed);
+                        }
+                    }
+                    if verbose && !r.errors.is_empty() {
+                        eprint!("{}", compiler::colorize_errors(&r.errors));
+                    }
+                    true
+                }
+                Ok(r) => {
+                    processed += 1;
+                    if is_tty { eprint!("\r{}\r", " ".repeat(40)); }
+                    eprint!("{}", compiler::colorize_errors(&r.errors));
+                    if keep_going {
+                        failed_modules.push(pkg_name.clone());
+                        false
+                    } else {
+                        bail!("Compilation of '{}' failed", pkg_name);
+                    }
+                }
+                Err(e) => {
+                    processed += 1;
+                    if is_tty { eprint!("\r{}\r", " ".repeat(40)); }
+                    if keep_going {
+                        eprintln!("{} compilation of '{}' failed: {}", style(format!("{:>12}", "error")).red().bold(), pkg_name, e);
+                        failed_modules.push(pkg_name.clone());
+                        false
+                    } else {
+                        bail!("Compilation of '{}' failed: {}", pkg_name, e);
+                    }
+                }
             };
 
-            let results: Vec<(String, Result<compiler::CompileResult>)> = compilable
-                .par_iter()
-                .map(|pkg_name| {
-                    let pkg = ws.get_package(pkg_name.as_str()).unwrap();
-                    let jars = per_module_jars.get(pkg_name.as_str()).cloned().unwrap_or_default();
-                    let mut classpath = jars;
-                    classpath.extend(cp_snapshot.clone());
-                    let result = compile_project(&pkg.path, &pkg.config, &classpath);
-                    (pkg_name.to_string(), result)
-                })
-                .collect();
-
-            let elapsed = start.elapsed();
-
-            for (pkg_name, result) in &results {
-                match result {
-                    Ok(r) if r.success => {
-                        let pkg = ws.get_package(pkg_name.as_str()).unwrap();
-                        print_compile_result(pkg_name, r, elapsed, &config::output_classes_dir(&pkg.path));
-                    }
-                    Ok(r) => {
-                        eprint!("{}", compiler::colorize_errors(&r.errors));
-                        if keep_going {
-                            failed_modules.push(pkg_name.clone());
-                        } else {
-                            bail!("Compilation of '{}' failed", pkg_name);
-                        }
-                    }
-                    Err(e) => {
-                        if keep_going {
-                            eprintln!("  {} Compilation of '{}' failed: {}", style("✗").red(), pkg_name, e);
-                            failed_modules.push(pkg_name.clone());
-                        } else {
-                            bail!("Compilation of '{}' failed: {}", pkg_name, e);
-                        }
-                    }
-                }
+            if success {
+                let pkg = ws.get_package(&pkg_name).unwrap();
+                workspace_classpath.push(config::output_classes_dir(&pkg.path));
             }
 
-            for pkg_name in level {
-                if !failed_modules.contains(pkg_name) {
-                    let pkg = ws.get_package(pkg_name).unwrap();
-                    workspace_classpath.push(config::output_classes_dir(&pkg.path));
+            if let Some(deps) = dependents.get(&pkg_name) {
+                for dep in deps {
+                    if let Some(deg) = in_degree.get_mut(dep) {
+                        *deg -= 1;
+                    }
                 }
             }
         }
     }
 
+    // Clear progress line
+    if is_tty { eprint!("\r{}\r", " ".repeat(40)); }
+
     if !failed_modules.is_empty() {
-        println!();
+        print_workspace_summary(compiled_count, cached_count, up_to_date_count,
+            failed_modules.len(), skipped_count, total_start.elapsed());
         println!(
-            "  {} {} module(s) failed: {}",
-            style("✗").red().bold(),
-            failed_modules.len(),
+            "{} failed: {}",
+            style(format!("{:>12}", "error")).red().bold(),
             failed_modules.join(", ")
         );
         bail!("Workspace build failed ({} module(s))", failed_modules.len());
     }
 
+    // Save workspace build fingerprint after successful compilation
+    save_workspace_build_fingerprint(root, targets, &ws_build_fp)?;
+    save_module_fingerprints(root, targets, &current_module_fps)?;
+
+    print_workspace_summary(compiled_count, cached_count, up_to_date_count,
+        0, skipped_count, total_start.elapsed());
+
+    } // end of else block (workspace fingerprint skip)
+
     if package {
         // Package fat JARs for modules with a `main` field
         // - If target specified: only that module
         // - If no target: all modules with a `main` field
-        let jar_targets: Vec<&str> = if let Some(target) = target {
-            vec![target]
+        let jar_targets: Vec<&str> = if !targets.is_empty() {
+            targets.iter().map(|s| s.as_str()).collect()
         } else {
             packages.iter()
                 .filter(|name| {
@@ -463,9 +692,37 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, packa
                     all_deps.push(config::output_classes_dir(&p.path));
                 }
             }
+            crate::RESOLVER_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
             let runtime_jars = resolve_deps_with_scopes(&pkg.path, &pkg.config, &["compile", "runtime"])?;
+            crate::RESOLVER_QUIET.store(false, std::sync::atomic::Ordering::Relaxed);
             all_deps.extend(runtime_jars);
-            build_release_jar(&pkg.path, &pkg.config, &all_deps, Some(root))?;
+
+            let class_dir = config::output_classes_dir(&pkg.path);
+            let resource_dir = pkg.path.join("src").join("main").join("resources");
+            let fp = compute_packaging_fingerprint(&class_dir, &resource_dir, &all_deps, &pkg.config)?;
+            let effective_version = pkg.config.version.as_deref()
+                .or(root_cfg.version.as_deref())
+                .unwrap_or("0.0.0");
+            let jar_name = format!("{}-{}.jar", pkg.config.name, effective_version);
+            let output_jar = pkg.path.join("out").join("release").join(&jar_name);
+
+            if should_skip_packaging(&pkg.path, &fp, &output_jar) {
+                let jar_size = std::fs::metadata(&output_jar).map(|m| m.len()).unwrap_or(0);
+                let size_str = if jar_size >= 1024 * 1024 {
+                    format!("{:.1} MB", jar_size as f64 / (1024.0 * 1024.0))
+                } else {
+                    format!("{:.0} KB", jar_size as f64 / 1024.0)
+                };
+                println!(
+                    "{} {} ({}) (up to date)",
+                    style(format!("{:>12}", "Packaging")).green().bold(),
+                    jar_name,
+                    size_str,
+                );
+            } else {
+                build_release_jar(&pkg.path, &pkg.config, &all_deps, None, root_cfg.version.as_deref())?;
+                save_packaging_fingerprint(&pkg.path, &fp)?;
+            }
         }
 
         if !jar_targets.is_empty() {
@@ -475,6 +732,21 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, target: Option<&str>, packa
                 style(root.join("out").join("release").display()).dim()
             );
         }
+    }
+
+    let total_time = total_start.elapsed();
+    if total_time.as_millis() > 1000 {
+        println!(
+            "{} build in {:.2}s",
+            style(format!("{:>12}", "Finished")).green().bold(),
+            total_time.as_secs_f64()
+        );
+    } else {
+        println!(
+            "{} build in {}ms",
+            style(format!("{:>12}", "Finished")).green().bold(),
+            total_time.as_millis()
+        );
     }
 
     Ok(())
@@ -492,69 +764,47 @@ fn has_failed_dependency(pkg_name: &str, failed: &[String], ws: &WorkspaceGraph)
     false
 }
 
-/// Group packages into levels where packages in the same level have no
-/// mutual dependencies and can be compiled in parallel.
-fn compute_parallel_levels(topo_sorted: &[String], ws: &WorkspaceGraph) -> Vec<Vec<String>> {
-    let mut levels: Vec<Vec<String>> = Vec::new();
-    let mut assigned: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-    for pkg_name in topo_sorted {
-        let pkg = ws.get_package(pkg_name).unwrap();
-        let ws_deps = pkg.config.workspace_module_deps();
-
-        let level = ws_deps
-            .iter()
-            .filter_map(|dep| assigned.get(dep))
-            .max()
-            .map(|l| l + 1)
-            .unwrap_or(0);
-
-        assigned.insert(pkg_name.clone(), level);
-
-        while levels.len() <= level {
-            levels.push(Vec::new());
-        }
-        levels[level].push(pkg_name.clone());
-    }
-
-    levels
-}
-
-fn print_compile_result(name: &str, result: &compiler::CompileResult, elapsed: std::time::Duration, _output_dir: &Path) {
-    if result.files_compiled == 0 {
-        if result.errors.contains("restored from build cache") {
-            println!(
-                "{} {} (cached) {:>30}ms",
-                style(format!("{:>12}", "Compiling")).green().bold(),
-                name,
-                elapsed.as_millis()
-            );
-        } else {
+fn print_compile_result(name: &str, result: &compiler::CompileResult, elapsed: std::time::Duration) {
+    match result.outcome {
+        compiler::CompileOutcome::UpToDate => {
             println!(
                 "{} {} (up to date)",
                 style(format!("{:>12}", "Compiling")).green().bold(),
                 name,
             );
         }
-    } else {
-        println!(
-            "{} {} ({} files) {:>27}ms",
-            style(format!("{:>12}", "Compiling")).green().bold(),
-            name,
-            result.files_compiled,
-            elapsed.as_millis()
-        );
+        compiler::CompileOutcome::Cached => {
+            println!(
+                "{} {} (cached) {:>30}ms",
+                style(format!("{:>12}", "Compiling")).green().bold(),
+                name,
+                elapsed.as_millis()
+            );
+        }
+        compiler::CompileOutcome::Compiled(n) => {
+            println!(
+                "{} {} ({} files) {:>27}ms",
+                style(format!("{:>12}", "Compiling")).green().bold(),
+                name,
+                n,
+                elapsed.as_millis()
+            );
+        }
     }
 }
 
 /// Build a fat/executable JAR containing all classes and dependencies.
-pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf], output_base: Option<&Path>) -> Result<()> {
+pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf], output_base: Option<&Path>, root_version: Option<&str>) -> Result<()> {
     let out = config::output_classes_dir(project);
     let base = output_base.unwrap_or(project);
     let release_dir = base.join("out").join("release");
     std::fs::create_dir_all(&release_dir)?;
 
-    let jar_name = format!("{}-{}.jar", cfg.name, cfg.version.as_deref().unwrap_or("0.0.0"));
+    let effective_version = cfg.version.as_deref()
+        .or(root_version)
+        .unwrap_or("0.0.0");
+    let jar_name = format!("{}-{}.jar", cfg.name, effective_version);
     let jar_path = release_dir.join(&jar_name);
 
     let staging = project.join("out").join(".release-staging");
@@ -565,58 +815,134 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
 
     copy_dir_recursive(&out, &staging)?;
 
-    // Detect class name conflicts across dependency JARs
-    detect_fat_jar_conflicts(jars);
-
-    // Collect mergeable META-INF entries (services, spring.factories, spring/*.imports)
+    // Single-pass: extract deps + collect mergeable META-INF + detect class conflicts
     let mut mergeable: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut class_sources: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
 
-    for dep in jars {
+    let total_deps = jars.len();
+    let pack_start = Instant::now();
+    for (idx, dep) in jars.iter().enumerate() {
         if !dep.exists() {
             continue;
         }
+
+        // Progress: show count and elapsed time during dependency extraction
+        eprint!(
+            "\r{} {} [{}/{}] {:.1}s   ",
+            style(format!("{:>12}", "Packaging")).green().bold(),
+            jar_name,
+            idx + 1,
+            total_deps,
+            pack_start.elapsed().as_secs_f64()
+        );
+
         if dep.is_dir() {
             copy_dir_recursive(dep, &staging)?;
         } else {
-            // Pre-read mergeable entries before extraction (jar xf will overwrite)
-            if let Ok(file) = std::fs::File::open(dep) {
-                if let Ok(mut archive) = zip::ZipArchive::new(std::io::BufReader::new(file)) {
-                    for i in 0..archive.len() {
-                        if let Ok(mut entry) = archive.by_index(i) {
-                            let name = entry.name().to_string();
-                            let should_merge = !entry.is_dir() && (
-                                name.starts_with("META-INF/services/") ||
-                                name == "META-INF/spring.factories" ||
-                                (name.starts_with("META-INF/spring/") && name.ends_with(".imports"))
-                            );
-                            if should_merge {
-                                let mut content = String::new();
-                                use std::io::Read;
-                                let _ = entry.read_to_string(&mut content);
-                                mergeable.entry(name).or_default().push(content);
-                            }
-                        }
+            let jar_file_name = dep.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| dep.display().to_string());
+
+            let file = match std::fs::File::open(dep) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut archive = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            for i in 0..archive.len() {
+                let mut entry = match archive.by_index(i) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let name = entry.name().to_string();
+
+                // Skip META-INF/MANIFEST.MF (we write our own) and unsafe paths
+                if name == "META-INF/MANIFEST.MF"
+                    || name.starts_with('/')
+                    || name.contains("..")
+                {
+                    continue;
+                }
+
+                // Track class conflicts
+                if name.ends_with(".class")
+                    && !name.starts_with("META-INF/")
+                    && name != "module-info.class"
+                {
+                    class_sources.entry(name.clone()).or_default().push(jar_file_name.clone());
+                }
+
+                // Collect mergeable META-INF entries (don't extract, will merge later)
+                let is_mergeable = !entry.is_dir() && (
+                    name.starts_with("META-INF/services/") ||
+                    name == "META-INF/spring.factories" ||
+                    (name.starts_with("META-INF/spring/") && name.ends_with(".imports"))
+                );
+                if is_mergeable {
+                    use std::io::Read;
+                    let mut content = String::new();
+                    let _ = entry.read_to_string(&mut content);
+                    mergeable.entry(name).or_default().push(content);
+                    continue;
+                }
+
+                // Extract entry to staging
+                if entry.is_dir() {
+                    let _ = std::fs::create_dir_all(staging.join(&name));
+                } else {
+                    let target = staging.join(&name);
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Ok(mut out_file) = std::fs::File::create(&target) {
+                        let _ = std::io::copy(&mut entry, &mut out_file);
                     }
                 }
             }
+        }
+    }
+    // Clear progress line
+    eprint!("\r{}\r", " ".repeat(60));
 
-            let _ = std::process::Command::new("jar")
-                .arg("xf")
-                .arg(dep)
-                .current_dir(&staging)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+    // Report class conflicts across dependency JARs
+    {
+        let mut conflicts: Vec<(String, Vec<String>)> = class_sources
+            .into_iter()
+            .filter(|(_, sources)| sources.len() > 1)
+            .collect();
+        if !conflicts.is_empty() {
+            conflicts.sort_by(|a, b| a.0.cmp(&b.0));
+            let total = conflicts.len();
+            println!(
+                "{} fat JAR: {} duplicate class(es) detected across dependency JARs",
+                style(format!("{:>12}", "warning")).yellow().bold(),
+                total
+            );
+            for (class_path, sources) in conflicts.iter().take(10) {
+                let class_name = class_path
+                    .strip_suffix(".class")
+                    .unwrap_or(class_path)
+                    .replace('/', ".");
+                println!("    {} → {}", class_name, sources.join(", "));
+            }
+            if total > 10 {
+                println!("    ... and {} more", total - 10);
+            }
         }
     }
 
-    // Merge collected META-INF files (combine entries from all JARs, deduplicate lines)
+    // Write merged META-INF files (combine entries from all JARs, deduplicate lines)
     for (meta_file, contents) in &mergeable {
-        if contents.len() > 1 {
-            let merged_path = staging.join(meta_file);
-            if let Some(parent) = merged_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+        let merged_path = staging.join(meta_file);
+        if let Some(parent) = merged_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if contents.len() == 1 {
+            std::fs::write(&merged_path, &contents[0])?;
+        } else {
             let mut seen = std::collections::HashSet::new();
             let mut merged = String::new();
             for content in contents {
@@ -649,112 +975,369 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
     manifest.push('\n');
     std::fs::write(manifest_dir.join("MANIFEST.MF"), &manifest)?;
 
-    let status = std::process::Command::new("jar")
-        .arg("cfm")
-        .arg(&jar_path)
-        .arg(manifest_dir.join("MANIFEST.MF"))
-        .arg("-C")
-        .arg(&staging)
-        .arg(".")
-        .status()?;
+    // Create JAR using zip crate (no JVM subprocess needed)
+    let jar_file = std::fs::File::create(&jar_path)?;
+    let mut zip_writer = zip::ZipWriter::new(std::io::BufWriter::new(jar_file));
+    let zip_options = zip::write::SimpleFileOptions::default();
 
-    let _ = std::fs::remove_dir_all(&staging);
+    eprint!(
+        "\r{} {} [creating jar] {:.1}s   ",
+        style(format!("{:>12}", "Packaging")).green().bold(),
+        jar_name,
+        pack_start.elapsed().as_secs_f64()
+    );
 
-    if !status.success() {
-        bail!("Failed to create release JAR");
+    // JAR spec: META-INF/MANIFEST.MF must be the first entry
+    zip_writer.add_directory("META-INF/", zip_options)?;
+    zip_writer.start_file("META-INF/MANIFEST.MF", zip_options)?;
+    std::io::copy(
+        &mut std::fs::File::open(manifest_dir.join("MANIFEST.MF"))?,
+        &mut zip_writer,
+    )?;
+
+    for walk_entry in walkdir::WalkDir::new(&staging).sort_by_file_name() {
+        let walk_entry = walk_entry?;
+        let path = walk_entry.path();
+        let relative = path.strip_prefix(&staging)?;
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if name.is_empty() || name == "META-INF" || name == "META-INF/MANIFEST.MF" {
+            continue;
+        }
+
+        if walk_entry.file_type().is_dir() {
+            let dir_name = if name.ends_with('/') { name } else { format!("{}/", name) };
+            zip_writer.add_directory(dir_name, zip_options)?;
+        } else {
+            zip_writer.start_file(&name, zip_options)?;
+            let mut f = std::fs::File::open(path)?;
+            std::io::copy(&mut f, &mut zip_writer)?;
+        }
     }
 
+    zip_writer.finish()?;
+
+    let pack_elapsed = pack_start.elapsed();
+    let jar_size = std::fs::metadata(&jar_path).map(|m| m.len()).unwrap_or(0);
+    let size_str = if jar_size >= 1024 * 1024 {
+        format!("{:.1} MB", jar_size as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB", jar_size as f64 / 1024.0)
+    };
+    eprint!("\r{}\r", " ".repeat(80));
     println!(
-        "{} {}",
+        "{} {} ({}) {:>22}ms",
         style(format!("{:>12}", "Packaging")).green().bold(),
-        jar_name
+        jar_name,
+        size_str,
+        pack_elapsed.as_millis()
     );
+
+    // Clean up staging directory (can be slow for large projects with many files)
+    eprint!(
+        "\r{} cleaning up staging...   ",
+        style(format!("{:>12}", "Packaging")).green().bold(),
+    );
+    let _ = std::fs::remove_dir_all(&staging);
+    eprint!("\r{}\r", " ".repeat(60));
 
     Ok(())
 }
 
-/// Detect class name conflicts across dependency JARs for fat JAR packaging.
-/// Prints warnings for duplicate .class entries found in different JARs.
-fn detect_fat_jar_conflicts(jars: &[PathBuf]) {
-    use std::collections::HashMap;
 
-    // Map: class entry path -> list of JAR file names containing it
-    let mut class_sources: HashMap<String, Vec<String>> = HashMap::new();
+/// Compute a fingerprint for packaging inputs (class files, dependencies, resources, config).
+/// If all inputs are unchanged and the output JAR exists, packaging can be skipped.
+fn compute_packaging_fingerprint(
+    class_dir: &Path,
+    resource_dir: &Path,
+    dep_jars: &[PathBuf],
+    cfg: &YmConfig,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
 
-    for jar_path in jars {
-        if !jar_path.exists() || jar_path.is_dir() {
-            continue;
+    // 1. Dependency JARs: path + size (sorted for determinism)
+    let mut dep_entries: Vec<(String, u64)> = Vec::new();
+    for jar in dep_jars {
+        if let Ok(meta) = std::fs::metadata(jar) {
+            dep_entries.push((jar.to_string_lossy().to_string(), meta.len()));
         }
+    }
+    dep_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, size) in &dep_entries {
+        hasher.update(b"dep:");
+        hasher.update(path.as_bytes());
+        hasher.update(&size.to_le_bytes());
+    }
 
-        let jar_name = jar_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| jar_path.display().to_string());
-
-        let file = match std::fs::File::open(jar_path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-
-        let mut archive = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-
-        for i in 0..archive.len() {
-            let entry = match archive.by_index(i) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let name = entry.name().to_string();
-            // Only check .class files, skip META-INF and module-info
-            if name.ends_with(".class")
-                && !name.starts_with("META-INF/")
-                && name != "module-info.class"
-            {
-                class_sources
-                    .entry(name)
-                    .or_default()
-                    .push(jar_name.clone());
+    // 2. Class files: path + size + mtime (sorted)
+    if class_dir.exists() {
+        let mut class_entries: Vec<(String, u64, u64)> = Vec::new();
+        for entry in walkdir::WalkDir::new(class_dir).sort_by_file_name() {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                let rel = entry.path().strip_prefix(class_dir)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy().to_string();
+                let meta = entry.metadata()?;
+                let mtime = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                class_entries.push((rel, meta.len(), mtime));
             }
         }
+        for (path, size, mtime) in &class_entries {
+            hasher.update(b"cls:");
+            hasher.update(path.as_bytes());
+            hasher.update(&size.to_le_bytes());
+            hasher.update(&mtime.to_le_bytes());
+        }
     }
 
-    // Collect conflicts (class found in 2+ JARs)
-    let mut conflicts: Vec<(String, Vec<String>)> = class_sources
-        .into_iter()
-        .filter(|(_, sources)| sources.len() > 1)
+    // 3. Resource files: path + size + mtime (sorted)
+    if resource_dir.exists() {
+        let mut res_entries: Vec<(String, u64, u64)> = Vec::new();
+        for entry in walkdir::WalkDir::new(resource_dir).sort_by_file_name() {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                let rel = entry.path().strip_prefix(resource_dir)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy().to_string();
+                let meta = entry.metadata()?;
+                let mtime = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                res_entries.push((rel, meta.len(), mtime));
+            }
+        }
+        for (path, size, mtime) in &res_entries {
+            hasher.update(b"res:");
+            hasher.update(path.as_bytes());
+            hasher.update(&size.to_le_bytes());
+            hasher.update(&mtime.to_le_bytes());
+        }
+    }
+
+    // 4. Config: main_class + version
+    if let Some(ref main) = cfg.main {
+        hasher.update(b"main:");
+        hasher.update(main.as_bytes());
+    }
+    if let Some(ref ver) = cfg.version {
+        hasher.update(b"ver:");
+        hasher.update(ver.as_bytes());
+    }
+    hasher.update(b"name:");
+    hasher.update(cfg.name.as_bytes());
+    hasher.update(b"group:");
+    hasher.update(cfg.group_id.as_bytes());
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Check if packaging can be skipped by comparing fingerprint with stored value.
+fn should_skip_packaging(project: &Path, fingerprint: &str, output_jar: &Path) -> bool {
+    if !output_jar.exists() {
+        return false;
+    }
+    let fp_path = project.join(config::CACHE_DIR).join("packaging-fingerprint");
+    match std::fs::read_to_string(&fp_path) {
+        Ok(stored) => stored.trim() == fingerprint,
+        Err(_) => false,
+    }
+}
+
+/// Save the packaging fingerprint after a successful build.
+fn save_packaging_fingerprint(project: &Path, fingerprint: &str) -> Result<()> {
+    let fp_path = project.join(config::CACHE_DIR).join("packaging-fingerprint");
+    if let Some(parent) = fp_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&fp_path, fingerprint)?;
+    Ok(())
+}
+
+/// Compute a workspace-level build fingerprint from source mtimes, config mtimes, and dep state.
+fn compute_workspace_build_fingerprint(
+    root: &Path,
+    targets: &[String],
+    packages: &[String],
+    ws: &WorkspaceGraph,
+) -> Result<(String, std::collections::HashMap<String, String>)> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+
+    // 1. Target names (different targets produce different fingerprints)
+    hasher.update(b"target:");
+    hasher.update(targets_cache_key(targets).as_bytes());
+
+    // 2. Root package.toml mtime
+    let root_config = root.join(config::CONFIG_FILE);
+    if let Ok(meta) = std::fs::metadata(&root_config) {
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        hasher.update(b"root_cfg:");
+        hasher.update(&mtime.to_le_bytes());
+    }
+
+    // 3. resolved.json content hash (dependency changes)
+    let resolved_path = root.join(config::CACHE_DIR).join(config::RESOLVED_FILE);
+    if let Ok(content) = std::fs::read(&resolved_path) {
+        hasher.update(b"resolved:");
+        hasher.update(&content);
+    }
+
+    // 4. Per-module: config mtime + source file mtimes + resource file mtimes
+    // Use rayon for parallel scanning of module source directories
+    let module_fingerprints: Vec<(String, String)> = packages
+        .par_iter()
+        .filter_map(|name| {
+            let pkg = ws.get_package(name)?;
+            let mut mod_hasher = Sha256::new();
+
+            // Module config mtime
+            let config_path = pkg.path.join(config::CONFIG_FILE);
+            if let Ok(meta) = std::fs::metadata(&config_path) {
+                let mtime = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                mod_hasher.update(&mtime.to_le_bytes());
+            }
+
+            // Source files: collect (relative_path, mtime_millis, size) sorted by path
+            let src_dir = config::source_dir_for(&pkg.path, &pkg.config);
+            if src_dir.exists() {
+                let mut entries: Vec<(String, u128, u64)> = Vec::new();
+                for entry in walkdir::WalkDir::new(&src_dir).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_file() {
+                        let rel = entry.path().strip_prefix(&src_dir)
+                            .unwrap_or(entry.path())
+                            .to_string_lossy().to_string();
+                        if let Ok(meta) = entry.metadata() {
+                            let mtime = meta.modified().ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0);
+                            entries.push((rel, mtime, meta.len()));
+                        }
+                    }
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (path, mtime, size) in &entries {
+                    mod_hasher.update(path.as_bytes());
+                    mod_hasher.update(&mtime.to_le_bytes());
+                    mod_hasher.update(&size.to_le_bytes());
+                }
+            }
+
+            // Resource files
+            let res_dir = pkg.path.join("src").join("main").join("resources");
+            if res_dir.exists() {
+                let mut entries: Vec<(String, u128, u64)> = Vec::new();
+                for entry in walkdir::WalkDir::new(&res_dir).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_file() {
+                        let rel = entry.path().strip_prefix(&res_dir)
+                            .unwrap_or(entry.path())
+                            .to_string_lossy().to_string();
+                        if let Ok(meta) = entry.metadata() {
+                            let mtime = meta.modified().ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0);
+                            entries.push((rel, mtime, meta.len()));
+                        }
+                    }
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (path, mtime, size) in &entries {
+                    mod_hasher.update(path.as_bytes());
+                    mod_hasher.update(&mtime.to_le_bytes());
+                    mod_hasher.update(&size.to_le_bytes());
+                }
+            }
+
+            Some((name.clone(), format!("{:x}", mod_hasher.finalize())))
+        })
         .collect();
 
-    if conflicts.is_empty() {
-        return;
+    // Merge module fingerprints in sorted order for determinism
+    let mut sorted_fps = module_fingerprints;
+    sorted_fps.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, fp) in &sorted_fps {
+        hasher.update(b"mod:");
+        hasher.update(name.as_bytes());
+        hasher.update(fp.as_bytes());
     }
 
-    conflicts.sort_by(|a, b| a.0.cmp(&b.0));
+    let per_module: std::collections::HashMap<String, String> = sorted_fps.into_iter().collect();
 
-    let total = conflicts.len();
-    println!(
-        "  {} fat JAR: {} duplicate class(es) detected across dependency JARs",
-        style("!").yellow(),
-        total
-    );
+    Ok((format!("{:x}", hasher.finalize()), per_module))
+}
 
-    // Show up to 10 conflicts
-    let show = conflicts.iter().take(10);
-    for (class_path, sources) in show {
-        let class_name = class_path
-            .strip_suffix(".class")
-            .unwrap_or(class_path)
-            .replace('/', ".");
-        println!(
-            "    {} → {}",
-            class_name,
-            sources.join(", ")
-        );
+/// Get the fingerprint file path for a workspace build target.
+/// Build a stable cache key from the targets list.
+fn targets_cache_key(targets: &[String]) -> String {
+    if targets.is_empty() {
+        "__all__".to_string()
+    } else {
+        let mut sorted = targets.to_vec();
+        sorted.sort();
+        sorted.join(",")
     }
-    if total > 10 {
-        println!("    ... and {} more", total - 10);
+}
+
+fn workspace_build_fp_path(root: &Path, targets: &[String]) -> PathBuf {
+    let key = targets_cache_key(targets);
+    let target_hash = incremental::hash_bytes(key.as_bytes());
+    root.join(config::CACHE_DIR).join(format!("workspace-build-fingerprint-{}", &target_hash[..12]))
+}
+
+/// Check if the workspace build can be skipped.
+fn should_skip_workspace_build(root: &Path, targets: &[String], fingerprint: &str) -> bool {
+    let fp_path = workspace_build_fp_path(root, targets);
+    match std::fs::read_to_string(&fp_path) {
+        Ok(stored) => stored.trim() == fingerprint,
+        Err(_) => false,
     }
+}
+
+/// Save the workspace build fingerprint after a successful build.
+fn save_workspace_build_fingerprint(root: &Path, targets: &[String], fingerprint: &str) -> Result<()> {
+    let fp_path = workspace_build_fp_path(root, targets);
+    if let Some(parent) = fp_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&fp_path, fingerprint)?;
+    Ok(())
+}
+
+/// Load per-module fingerprints from disk.
+fn load_module_fingerprints(root: &Path, targets: &[String]) -> std::collections::HashMap<String, String> {
+    let key = targets_cache_key(targets);
+    let target_hash = incremental::hash_bytes(key.as_bytes());
+    let path = root.join(config::CACHE_DIR)
+        .join(format!("workspace-module-fps-{}", &target_hash[..12]));
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// Save per-module fingerprints to disk after a successful build.
+fn save_module_fingerprints(root: &Path, targets: &[String], fps: &std::collections::HashMap<String, String>) -> Result<()> {
+    let key = targets_cache_key(targets);
+    let target_hash = incremental::hash_bytes(key.as_bytes());
+    let path = root.join(config::CACHE_DIR)
+        .join(format!("workspace-module-fps-{}", &target_hash[..12]));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string(fps)?)?;
+    Ok(())
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -778,7 +1361,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str]) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
-    let mut resolutions = cfg.resolutions.as_ref().cloned().unwrap_or_default();
+    let mut resolutions = cfg.resolved_resolutions();
 
     // Resolve deps: if inside a workspace, resolve { workspace = true } from root
     let deps = if let Some(ws_root) = config::find_workspace_root(project) {
@@ -790,13 +1373,11 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
                     anyhow::bail!("{}", errors.join("; "));
                 }
                 let mut d = cfg.maven_dependencies_for_scopes_with_root(scopes, &root_cfg);
-                if let Some(ref root_resolutions) = root_cfg.resolutions {
-                    for (k, v) in root_resolutions {
-                        if d.contains_key(k.as_str()) {
-                            d.insert(k.clone(), v.clone());
-                        }
-                        resolutions.insert(k.clone(), v.clone());
+                for (k, v) in root_cfg.resolved_resolutions() {
+                    if d.contains_key(&k) {
+                        d.insert(k.clone(), v.clone());
                     }
+                    resolutions.insert(k, v);
                 }
                 registries.extend(root_cfg.registry_entries());
                 d
@@ -858,18 +1439,26 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
 
 /// Build a mapping of "groupId:artifactId" -> scope from the config's direct dependencies.
 fn build_dep_scope_map(cfg: &YmConfig, _scopes: &[&str]) -> std::collections::HashMap<String, String> {
-    use crate::config::schema::DependencyValue;
+    use crate::config::schema::{DependencyValue, is_maven_dep};
     let mut map = std::collections::HashMap::new();
+    // Process [dependencies]
     if let Some(ref deps) = cfg.dependencies {
         for (key, value) in deps {
-            if !key.contains(':') {
-                continue; // workspace module dep
-            }
+            if !is_maven_dep(key) { continue; }
+            let resolved = cfg.resolve_key(key);
             let scope = match value {
                 DependencyValue::Simple(_) => "compile".to_string(),
                 DependencyValue::Detailed(spec) => spec.scope.clone().unwrap_or_else(|| "compile".to_string()),
             };
-            map.insert(key.clone(), scope);
+            map.insert(resolved, scope);
+        }
+    }
+    // Process [devDependencies] — effective scope "provided"
+    if let Some(ref dev_deps) = cfg.dev_dependencies {
+        for (key, _value) in dev_deps {
+            if !is_maven_dep(key) { continue; }
+            let resolved = cfg.resolve_key(key);
+            map.insert(resolved, "provided".to_string());
         }
     }
     map
@@ -918,7 +1507,7 @@ fn jar_path_to_versioned_key(jar: &std::path::Path, cache: &std::path::Path) -> 
 pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
-    let mut resolutions = cfg.resolutions.as_ref().cloned().unwrap_or_default();
+    let mut resolutions = cfg.resolved_resolutions();
 
     // Resolve deps: if inside a workspace, resolve { workspace = true } from root
     let deps = if let Some(ws_root) = config::find_workspace_root(project) {
@@ -930,13 +1519,11 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
                     anyhow::bail!("{}", errors.join("; "));
                 }
                 let mut d = cfg.maven_dependencies_with_root(&root_cfg);
-                if let Some(ref root_resolutions) = root_cfg.resolutions {
-                    for (k, v) in root_resolutions {
-                        if d.contains_key(k.as_str()) {
-                            d.insert(k.clone(), v.clone());
-                        }
-                        resolutions.insert(k.clone(), v.clone());
+                for (k, v) in root_cfg.resolved_resolutions() {
+                    if d.contains_key(&k) {
+                        d.insert(k.clone(), v.clone());
                     }
+                    resolutions.insert(k, v);
                 }
                 registries.extend(root_cfg.registry_entries());
                 d
@@ -984,15 +1571,14 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     if !conflicts.is_empty() {
         for (ga, versions) in &conflicts {
             eprintln!(
-                "  {} Version conflict: {} has versions: {}",
-                console::style("!").yellow(),
+                "{} version conflict: {} has versions: {}",
+                console::style(format!("{:>12}", "warning")).yellow().bold(),
                 console::style(ga).bold(),
                 versions.join(", ")
             );
         }
         eprintln!(
-            "  {} Use [resolutions] in package.toml to pin a specific version",
-            console::style("→").dim()
+            "             Use [resolutions] in package.toml to pin a specific version"
         );
     }
 
@@ -1013,10 +1599,53 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
 
 /// Like resolve_deps but skip JAR downloads. Returns expected cache paths.
 /// Used by `ym idea --json` so importing is never blocked by network I/O.
+/// Batch resolve for workspace: pre-loaded root config avoids repeated I/O.
+/// Skips save_resolved_cache (read-only, for idea --json).
+pub fn resolve_deps_no_download_with_root(
+    project: &Path,
+    cfg: &YmConfig,
+    root_cfg: &YmConfig,
+    shared_cache_dir: &Path,
+    root_registries: &[crate::workspace::resolver::RegistryEntry],
+    root_resolutions: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<PathBuf>> {
+    let mut registries: Vec<crate::workspace::resolver::RegistryEntry> = root_registries.to_vec();
+    let mut resolutions = cfg.resolved_resolutions();
+    for (k, v) in root_resolutions {
+        resolutions.insert(k.clone(), v.clone());
+    }
+
+    let deps = cfg.maven_dependencies_with_root(root_cfg);
+
+    let current_entries = cfg.registry_entries();
+    for entry in current_entries {
+        if !registries.iter().any(|e| e.url == entry.url) {
+            registries.insert(0, entry);
+        }
+    }
+
+    if deps.is_empty() {
+        return Ok(resolve_lib_dirs(project, cfg));
+    }
+
+    let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
+    let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
+    exclusions.extend(cfg.per_dependency_exclusions());
+
+    let dep_scopes = build_dep_scope_map(cfg, &["compile", "provided", "runtime", "test"]);
+    let jars = crate::workspace::resolver::resolve_no_download(
+        &deps, shared_cache_dir, &mut resolved, &registries, &exclusions, &resolutions, &dep_scopes,
+    )?;
+
+    let mut all_jars = jars;
+    all_jars.extend(resolve_lib_dirs(project, cfg));
+    Ok(all_jars)
+}
+
 pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
-    let mut resolutions = cfg.resolutions.as_ref().cloned().unwrap_or_default();
+    let mut resolutions = cfg.resolved_resolutions();
 
     let deps = if let Some(ws_root) = config::find_workspace_root(project) {
         if ws_root != project {
@@ -1027,13 +1656,11 @@ pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<Pa
                     anyhow::bail!("{}", errors.join("; "));
                 }
                 let mut d = cfg.maven_dependencies_with_root(&root_cfg);
-                if let Some(ref root_resolutions) = root_cfg.resolutions {
-                    for (k, v) in root_resolutions {
-                        if d.contains_key(k.as_str()) {
-                            d.insert(k.clone(), v.clone());
-                        }
-                        resolutions.insert(k.clone(), v.clone());
+                for (k, v) in root_cfg.resolved_resolutions() {
+                    if d.contains_key(&k) {
+                        d.insert(k.clone(), v.clone());
                     }
+                    resolutions.insert(k, v);
                 }
                 registries.extend(root_cfg.registry_entries());
                 d
@@ -1121,7 +1748,53 @@ pub fn compile_project(
         resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
 
-    incremental::incremental_compile(&compile_cfg, &cache)
+    incremental::incremental_compile(&compile_cfg, &cache, None)
+}
+
+/// Compile a project using a compiler worker pool (for workspace builds).
+pub fn compile_project_with_pool(
+    project: &Path,
+    cfg: &YmConfig,
+    classpath: &[PathBuf],
+    pool: Option<&compiler::worker::CompilerPool>,
+) -> Result<compiler::CompileResult> {
+    let src = config::source_dir_for(project, cfg);
+    let out = if let Some(custom) = OUTPUT_DIR_OVERRIDE.get() {
+        PathBuf::from(custom)
+    } else {
+        config::output_classes_dir(project)
+    };
+    let cache = config::cache_dir(project);
+
+    let encoding = cfg.compiler.as_ref().and_then(|c| c.encoding.clone());
+    let ap_jars = resolve_annotation_processors(project, cfg, classpath)?;
+    let lint = cfg.compiler.as_ref().and_then(|c| c.lint.clone()).unwrap_or_default();
+    let mut extra_args = cfg.compiler.as_ref().and_then(|c| c.args.clone()).unwrap_or_default();
+    if is_strict() && !extra_args.iter().any(|a| a == "-Werror") {
+        extra_args.push("-Werror".to_string());
+    }
+
+    let compile_cfg = compiler::CompileConfig {
+        source_dirs: vec![src.clone()],
+        output_dir: out.clone(),
+        classpath: classpath.to_vec(),
+        java_version: cfg.target.clone(),
+        encoding,
+        annotation_processors: ap_jars,
+        lint,
+        extra_args,
+    };
+
+    let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
+    let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
+    resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
+
+    let resources_dir = project.join("src").join("main").join("resources");
+    if resources_dir.exists() {
+        resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
+    }
+
+    incremental::incremental_compile(&compile_cfg, &cache, pool)
 }
 
 fn resolve_annotation_processors(project: &Path, cfg: &YmConfig, classpath: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -1221,15 +1894,13 @@ pub fn ensure_jdk_for_config(cfg: &YmConfig) -> Result<()> {
     let java_home = jvm::ensure_jdk(&version, vendor, auto_download)?;
 
     if java_home != Path::new("system") && java_home.exists() {
-        if !crate::is_json_quiet() {
-            // Print JDK info: extract name from path (e.g. "jdk-21.0.2" from the directory name)
+        if !crate::is_json_quiet() && is_verbose() {
             let jdk_name = java_home.file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| format!("JDK {}", version));
             println!(
-                "  {}  {}  {} ({})",
-                style("➜").green(),
-                style("JDK:").bold(),
+                "{} jdk {} ({})",
+                style(format!("{:>12}", "Using")).green().bold(),
                 &jdk_name,
                 style(java_home.display()).dim()
             );
@@ -1245,8 +1916,7 @@ pub fn ensure_jdk_for_config(cfg: &YmConfig) -> Result<()> {
                 );
             }
         }
-    } else if !crate::is_json_quiet() {
-        // System JDK — get path from which javac
+    } else if !crate::is_json_quiet() && is_verbose() {
         let javac_path = jvm::which_javac()
             .and_then(|p| p.parent().and_then(|b| b.parent()).map(|h| h.to_path_buf()));
         if let Some(home) = javac_path {
@@ -1254,9 +1924,8 @@ pub fn ensure_jdk_for_config(cfg: &YmConfig) -> Result<()> {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "System JDK".to_string());
             println!(
-                "  {}  {}  {} ({})",
-                style("➜").green(),
-                style("JDK:").bold(),
+                "{} jdk {} ({})",
+                style(format!("{:>12}", "Using")).green().bold(),
                 &jdk_name,
                 style(home.display()).dim()
             );
@@ -1324,8 +1993,8 @@ fn resolve_url_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
         if !jar_path.exists() {
             if !crate::is_json_quiet() {
                 println!(
-                    "  {} downloading {}...",
-                    console::style("➜").green(),
+                    "{} {}...",
+                    console::style(format!("{:>12}", "Downloading")).green().bold(),
                     filename
                 );
             }
@@ -1335,8 +2004,8 @@ fn resolve_url_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
             let response = client.get(url).send()?;
             if !response.status().is_success() {
                 eprintln!(
-                    "  {} Failed to download {}: HTTP {}",
-                    console::style("!").yellow(),
+                    "{} failed to download {}: HTTP {}",
+                    console::style(format!("{:>12}", "warning")).yellow().bold(),
                     url,
                     response.status()
                 );
@@ -1346,8 +2015,8 @@ fn resolve_url_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
             std::fs::write(&jar_path, &bytes)?;
             if !crate::is_json_quiet() {
                 println!(
-                    "  {} downloaded {}",
-                    console::style("✓").green(),
+                    "{} {}",
+                    console::style(format!("{:>12}", "Downloaded")).green().bold(),
                     filename
                 );
             }
@@ -1377,8 +2046,8 @@ fn resolve_git_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
         if !repo_dir.exists() {
             if !crate::is_json_quiet() {
                 println!(
-                    "  {} cloning {}...",
-                    console::style("➜").green(),
+                    "{} {}...",
+                    console::style(format!("{:>12}", "Cloning")).green().bold(),
                     name
                 );
             }
@@ -1391,8 +2060,8 @@ fn resolve_git_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
             let status = cmd.status()?;
             if !status.success() {
                 eprintln!(
-                    "  {} Failed to clone {}",
-                    console::style("!").yellow(),
+                    "{} failed to clone {}",
+                    console::style(format!("{:>12}", "warning")).yellow().bold(),
                     git_url
                 );
                 continue;
@@ -1400,13 +2069,13 @@ fn resolve_git_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
         }
 
         // Look for output JARs: check if it has package.toml (ym project)
-        let pkg_toml = repo_dir.join("package.toml");
+        let pkg_toml = repo_dir.join(config::CONFIG_FILE);
         if pkg_toml.exists() {
             // Build with ym
             if !crate::is_json_quiet() {
                 println!(
-                    "  {} building Git dependency {}...",
-                    console::style("➜").green(),
+                    "{} Git dependency {}...",
+                    console::style(format!("{:>12}", "Building")).green().bold(),
                     name
                 );
             }
@@ -1424,8 +2093,8 @@ fn resolve_git_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
                 }
                 _ => {
                     eprintln!(
-                        "  {} Failed to build Git dependency {}",
-                        console::style("!").yellow(),
+                        "{} failed to build Git dependency {}",
+                        console::style(format!("{:>12}", "warning")).yellow().bold(),
                         name
                     );
                 }
@@ -1445,7 +2114,7 @@ fn resolve_git_deps(cfg: &YmConfig, cache: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Scan `compiler.libs` directories for JAR files and return their paths.
-fn resolve_lib_dirs(project: &Path, cfg: &YmConfig) -> Vec<PathBuf> {
+pub fn resolve_lib_dirs(project: &Path, cfg: &YmConfig) -> Vec<PathBuf> {
     let lib_dirs = match cfg.compiler.as_ref().and_then(|c| c.libs.as_ref()) {
         Some(dirs) => dirs,
         None => return vec![],

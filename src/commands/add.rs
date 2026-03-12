@@ -228,8 +228,8 @@ pub fn execute(dep: &str, scope: Option<&str>, classifier: Option<&str>) -> Resu
 }
 
 fn parse_dep_spec(dep: &str) -> Result<(String, String, String)> {
-    // Format: com.google.guava:guava@33.0.0-jre
-    if dep.contains(':') {
+    // Format: com.google.guava:guava@33.0.0-jre or groupId:artifactId:version
+    if crate::config::schema::is_maven_dep(dep) {
         let (coord, version) = if dep.contains('@') {
             let parts: Vec<&str> = dep.splitn(2, '@').collect();
             (parts[0], Some(parts[1].to_string()))

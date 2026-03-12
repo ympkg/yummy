@@ -16,7 +16,7 @@ pub fn compile(config: &CompileConfig) -> Result<CompileResult> {
     if java_files.is_empty() {
         return Ok(CompileResult {
             success: true,
-            files_compiled: 0,
+            outcome: super::CompileOutcome::UpToDate,
             errors: String::new(),
         });
     }
@@ -103,7 +103,7 @@ pub fn compile(config: &CompileConfig) -> Result<CompileResult> {
 
     Ok(CompileResult {
         success: output.status.success(),
-        files_compiled: file_count,
+        outcome: super::CompileOutcome::Compiled(file_count),
         errors: stderr,
     })
 }

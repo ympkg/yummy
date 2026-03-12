@@ -17,7 +17,7 @@ pub fn execute(interactive: bool, yes: bool, json: bool) -> Result<()> {
     if let Some(ref deps) = cfg.dependencies {
         for (coord, value) in deps {
             // Skip workspace refs and non-Maven deps
-            if !coord.contains(':') || value.is_workspace() {
+            if !crate::config::schema::is_maven_dep(coord) || value.is_workspace() {
                 continue;
             }
             if pinned.contains_key(coord) {
@@ -27,7 +27,8 @@ pub fn execute(interactive: bool, yes: bool, json: bool) -> Result<()> {
                 Some(v) => v.to_string(),
                 None => continue,
             };
-            let parts: Vec<&str> = coord.split(':').collect();
+            let resolved = cfg.resolve_key(coord);
+            let parts: Vec<&str> = resolved.split(':').collect();
             if parts.len() != 2 {
                 continue;
             }

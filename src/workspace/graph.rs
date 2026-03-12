@@ -86,13 +86,7 @@ impl WorkspaceGraph {
                 }
             }
         }
-        if !crate::is_json_quiet() && packages.len() > 10 {
-            eprintln!(
-                "  {} scanned {} workspace modules",
-                console::style("✓").green(),
-                packages.len()
-            );
-        }
+        // scanned N workspace modules — info absorbed into spinner
 
         // Add all packages as nodes, validating name uniqueness
         for pkg in &packages {
@@ -228,8 +222,10 @@ impl WorkspaceGraph {
         }
 
         // Topological sort of the subgraph
+        // Build in-degree map and reverse index (dependency → dependents) for O(V+E) sort
         let mut result = Vec::new();
         let mut in_degree: HashMap<NodeIndex, usize> = HashMap::new();
+        let mut reverse_deps: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::new();
 
         for &idx in &visited {
             let ws_deps = self.graph[idx].config.workspace_module_deps();
@@ -238,6 +234,7 @@ impl WorkspaceGraph {
                 if let Some(&dep_idx) = self.name_to_index.get(dep_name) {
                     if visited.contains(&dep_idx) {
                         deg += 1;
+                        reverse_deps.entry(dep_idx).or_default().push(idx);
                     }
                 }
             }
@@ -253,9 +250,8 @@ impl WorkspaceGraph {
         while let Some(node) = ready.pop_front() {
             result.push(self.graph[node].name.clone());
 
-            for &idx in &visited {
-                let ws_deps = self.graph[idx].config.workspace_module_deps();
-                if ws_deps.contains(&self.graph[node].name) {
+            if let Some(deps) = reverse_deps.get(&node) {
+                for &idx in deps {
                     if let Some(deg) = in_degree.get_mut(&idx) {
                         *deg -= 1;
                         if *deg == 0 {

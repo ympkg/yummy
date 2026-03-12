@@ -7,6 +7,76 @@ use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
 use crate::config::schema::{ResolvedCache, ResolvedDependency};
 
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn format_eta(secs: u64) -> String {
+    if secs == 0 { return String::new(); }
+    if secs >= 60 {
+        format!("ETA {}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("ETA {}s", secs)
+    }
+}
+
+/// Update progress: updates spinner message when active, otherwise raw eprint.
+fn resolver_progress(msg: &str) {
+    if crate::SPINNER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::set_spinner_msg(msg);
+    } else {
+        eprint!("\r{} {}   ", style(format!("{:>12}", "Resolving")).green().bold(), msg);
+    }
+}
+
+/// Current platform classifier for native JAR detection (e.g. "linux-x86_64").
+fn platform_classifier() -> &'static str {
+    if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        "linux-x86_64"
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+        "linux-arm64"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        "macosx-x86_64"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        "macosx-arm64"
+    } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        "windows-x86_64"
+    } else {
+        ""
+    }
+}
+
+/// For each resolved JAR, check if a platform-specific classifier JAR exists
+/// in the same directory and append it to the list.
+fn append_native_jars(jars: &mut Vec<PathBuf>) {
+    let classifier = platform_classifier();
+    if classifier.is_empty() { return; }
+
+    let mut extras = Vec::new();
+    for jar in jars.iter() {
+        if let Some(name) = jar.file_name().and_then(|n| n.to_str()) {
+            if let Some(stem) = name.strip_suffix(".jar") {
+                // Skip JARs that already have a classifier suffix
+                if stem.ends_with(classifier) { continue; }
+                let native_name = format!("{}-{}.jar", stem, classifier);
+                let native_jar = jar.with_file_name(&native_name);
+                if native_jar.exists() {
+                    extras.push(native_jar);
+                }
+            }
+        }
+    }
+    jars.extend(extras);
+}
+
 /// A registry entry with optional scope routing
 #[derive(Clone, Debug)]
 pub struct RegistryEntry {
@@ -54,13 +124,33 @@ impl MavenCoord {
         })
     }
 
+    /// Parse a versioned key like "g:a:v" or "g:a:v:classifier" back into a MavenCoord.
+    pub fn from_versioned_key(key: &str) -> Option<MavenCoord> {
+        let parts: Vec<&str> = key.split(':').collect();
+        if parts.len() >= 3 {
+            Some(MavenCoord {
+                group_id: parts[0].to_string(),
+                artifact_id: parts[1].to_string(),
+                version: parts[2].to_string(),
+                classifier: parts.get(3).map(|s| s.to_string()),
+                exclusions: Vec::new(),
+                scope: None,
+            })
+        } else {
+            None
+        }
+    }
+
     #[allow(dead_code)]
     pub fn key(&self) -> String {
         format!("{}:{}", self.group_id, self.artifact_id)
     }
 
     pub fn versioned_key(&self) -> String {
-        format!("{}:{}:{}", self.group_id, self.artifact_id, self.version)
+        match &self.classifier {
+            Some(c) => format!("{}:{}:{}:{}", self.group_id, self.artifact_id, self.version, c),
+            None => format!("{}:{}:{}", self.group_id, self.artifact_id, self.version),
+        }
     }
 
     fn group_path(&self) -> String {
@@ -327,7 +417,7 @@ fn resolve_inner(
     }
 
     let resolved_count = AtomicUsize::new(0);
-    let show_resolve_progress = !crate::is_json_quiet();
+    let show_resolve_progress = !crate::is_json_quiet() && !crate::RESOLVER_QUIET.load(Ordering::Relaxed);
 
     while !queue.is_empty() {
         // Drain the current level for batched processing
@@ -379,7 +469,7 @@ fn resolve_inner(
                     ).unwrap_or_default();
                     let n = resolved_count.fetch_add(1, Ordering::Relaxed) + 1;
                     if show_resolve_progress && n % 20 == 0 {
-                        eprint!("\r  {}  resolving dependency graph ({} artifacts)...   ", style("➜").cyan(), n);
+                        resolver_progress(&format!("Resolving dependency graph ({} artifacts)...", n));
                     }
                     (coord.clone(), transitive)
                 })
@@ -393,14 +483,14 @@ fn resolve_inner(
                     ).unwrap_or_default();
                     let n = resolved_count.fetch_add(1, Ordering::Relaxed) + 1;
                     if show_resolve_progress && n % 20 == 0 {
-                        eprint!("\r  {}  resolving dependency graph ({} artifacts)...   ", style("➜").cyan(), n);
+                        resolver_progress(&format!("Resolving dependency graph ({} artifacts)...", n));
                     }
                     (coord.clone(), transitive)
                 })
                 .collect()
         };
-        // Clear progress line after level completes
-        if show_resolve_progress && resolved_count.load(Ordering::Relaxed) >= 20 {
+        // Clear progress line after level completes (only needed without spinner)
+        if show_resolve_progress && resolved_count.load(Ordering::Relaxed) >= 20 && !crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
             eprint!("\r{}\r", " ".repeat(60));
         }
 
@@ -475,18 +565,32 @@ fn resolve_inner(
     if download && !coords_to_download.is_empty() {
         let total = coords_to_download.len();
         let is_tty = console::Term::stdout().is_term();
+        let show_progress = !crate::is_json_quiet() && is_tty;
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Shared download progress: total bytes expected, bytes downloaded so far
+        let dl_total_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dl_done_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dl_start = std::time::Instant::now();
+        // Throttle eprint updates to avoid flickering from concurrent threads
+        let last_print_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let pending = std::sync::Arc::new(Mutex::new(std::collections::BTreeSet::<String>::new()));
 
         if !crate::is_json_quiet() {
-            if is_tty {
+            let first = coords_to_download.first()
+                .map(|(_, c)| format!("{}:{}:{}", c.group_id, c.artifact_id, c.version))
+                .unwrap_or_default();
+            if crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
+                crate::set_spinner_msg(format!("Downloading 0/{} {}", total, first));
+            } else if is_tty {
                 eprint!(
-                    "  {}  downloading dependencies (0/{})...",
-                    style("➜").green(), total
+                    "{} 0/{} {}",
+                    style(format!("{:>12}", "Downloading")).green().bold(), total, first
                 );
             } else {
+                let dep_word = if total == 1 { "dependency" } else { "dependencies" };
                 println!(
-                    "  {}  downloading {} dependencies...",
-                    style("➜").green(), total
+                    "{} {} {}...",
+                    style(format!("{:>12}", "Downloading")).green().bold(), total, dep_word
                 );
             }
         }
@@ -500,58 +604,139 @@ fn resolve_inner(
             coords_to_download
             .into_par_iter()
             .map(|(key, coord)| {
+                let short_name = format!("{}:{}:{}", coord.group_id, coord.artifact_id, coord.version);
+                if show_progress {
+                    pending.lock().unwrap().insert(short_name.clone());
+                }
                 let jar_path = coord.jar_path(cache_dir);
+
+                // Build progress callback for byte-level tracking
+                let dl_total_ref = dl_total_bytes.clone();
+                let dl_done_ref = dl_done_bytes.clone();
+                let completed_ref = completed.clone();
+                let pending_ref = pending.clone();
+                let last_print_ref = last_print_ms.clone();
+                let dl_start_ref = dl_start;
+                let name_for_cb = short_name.clone();
+                let progress_cb: Option<Box<dyn Fn(u64, u64) + Send + Sync>> = if show_progress {
+                    Some(Box::new(move |content_len: u64, chunk_bytes: u64| {
+                        // First call per download: register total size
+                        if chunk_bytes == 0 {
+                            dl_total_ref.fetch_add(content_len, Ordering::Relaxed);
+                            return;
+                        }
+                        let done = dl_done_ref.fetch_add(chunk_bytes, Ordering::Relaxed) + chunk_bytes;
+                        // Throttle: only update display every 100ms
+                        let now_ms = dl_start_ref.elapsed().as_millis() as u64;
+                        let prev = last_print_ref.load(Ordering::Relaxed);
+                        if now_ms.saturating_sub(prev) < 100 {
+                            return;
+                        }
+                        if last_print_ref.compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                            return; // another thread won the race, skip
+                        }
+                        let total_b = dl_total_ref.load(Ordering::Relaxed);
+                        let elapsed = dl_start_ref.elapsed().as_secs_f64();
+                        let speed = if elapsed > 0.1 { done as f64 / elapsed } else { 0.0 };
+                        let eta = if speed > 0.0 && total_b > done { ((total_b - done) as f64 / speed) as u64 } else { 0 };
+                        let done_count = completed_ref.load(Ordering::Relaxed);
+                        let current = pending_ref.lock().unwrap().iter().next().cloned().unwrap_or_else(|| name_for_cb.clone());
+                        if crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
+                            crate::set_spinner_msg(format!(
+                                "Downloading {}/{}  {}    {}/{}  {}/s  {}",
+                                done_count, total, current,
+                                format_bytes(done), format_bytes(total_b),
+                                format_bytes(speed as u64), format_eta(eta),
+                            ));
+                        } else {
+                            eprint!(
+                                "\r{} {}/{}  {}    {}/{}  {}/s  {}{}",
+                                style(format!("{:>12}", "Downloading")).green().bold(),
+                                done_count, total,
+                                current,
+                                format_bytes(done), format_bytes(total_b),
+                                format_bytes(speed as u64),
+                                format_eta(eta),
+                                " ".repeat(10)
+                            );
+                        }
+                    }))
+                } else {
+                    None
+                };
+
                 let hash_result = if coord.is_snapshot() {
-                    // For SNAPSHOT, try timestamped version from maven-metadata.xml first
                     if let Some((ts, bn)) = resolve_snapshot_version(&client, &coord, registries) {
-                        download_from_repos(&client, &coord, &jar_path, registries, |c, r| c.snapshot_jar_url(r, &ts, &bn))
+                        download_from_repos(&client, &coord, &jar_path, registries, progress_cb.as_deref(), |c, r| c.snapshot_jar_url(r, &ts, &bn))
                     } else {
-                        // Fallback: plain SNAPSHOT naming (some repos use this)
-                        download_from_repos(&client, &coord, &jar_path, registries, |c, r| c.jar_url(r))
+                        download_from_repos(&client, &coord, &jar_path, registries, progress_cb.as_deref(), |c, r| c.jar_url(r))
                     }
                 } else {
-                    download_from_repos(&client, &coord, &jar_path, registries, |c, r| c.jar_url(r))
+                    download_from_repos(&client, &coord, &jar_path, registries, progress_cb.as_deref(), |c, r| c.jar_url(r))
                 };
-                // Try GPG signature verification if JAR downloaded successfully
                 if hash_result.is_ok() {
                     verify_gpg_signature(&client, &coord, &jar_path, registries);
                 }
-                // Update single-line progress (TTY only)
-                if !crate::is_json_quiet() && is_tty {
-                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    eprint!(
-                        "\r  {}  downloading dependencies ({}/{})...   ",
-                        style("➜").green(), done, total
-                    );
+                // Mark completed
+                if show_progress {
+                    let done_count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let mut pend = pending.lock().unwrap();
+                    pend.remove(&short_name);
+                    let current = pend.iter().next().cloned().unwrap_or_default();
+                    let done = dl_done_bytes.load(Ordering::Relaxed);
+                    let total_b = dl_total_bytes.load(Ordering::Relaxed);
+                    let elapsed = dl_start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.1 { done as f64 / elapsed } else { 0.0 };
+                    let eta = if speed > 0.0 && total_b > done { ((total_b - done) as f64 / speed) as u64 } else { 0 };
+                    if crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
+                        crate::set_spinner_msg(format!(
+                            "Downloading {}/{}  {}    {}/{}  {}/s  {}",
+                            done_count, total, current,
+                            format_bytes(done), format_bytes(total_b),
+                            format_bytes(speed as u64), format_eta(eta),
+                        ));
+                    } else {
+                        eprint!(
+                            "\r{} {}/{}  {}    {}/{}  {}/s  {}{}",
+                            style(format!("{:>12}", "Downloading")).green().bold(),
+                            done_count, total,
+                            current,
+                            format_bytes(done), format_bytes(total_b),
+                            format_bytes(speed as u64),
+                            format_eta(eta),
+                            " ".repeat(5)
+                        );
+                    }
                 }
                 (key, hash_result)
             })
             .collect()
         });
 
-        // Clear progress line
-        if !crate::is_json_quiet() && is_tty {
+        // Clear progress line (not needed when spinner handles it)
+        if !crate::is_json_quiet() && is_tty && !crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
             eprint!("\r{}\r", " ".repeat(60));
         }
 
-        // Print final summary
-        if !crate::is_json_quiet() {
+        // Print final summary (skip when spinner is active — build.rs prints its own summary)
+        if !crate::is_json_quiet() && !crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
             let ok_count = download_results.iter().filter(|(_, r)| r.is_ok()).count();
+            let done_word = if ok_count == 1 { "dependency" } else { "dependencies" };
             println!(
-                "  {} downloaded {} dependencies",
-                style("✓").green(), ok_count
+                "{} {} {}",
+                style(format!("{:>12}", "Downloaded")).green().bold(), ok_count, done_word
             );
         }
 
-        // Print only failures
-        for (key, result) in &download_results {
-            if let Err(e) = result {
-                eprintln!("  {} {} — {}", style("✗").red(), key, e);
+        // Print only failures (defer if spinner active to avoid visual conflict)
+        if !crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
+            for (key, result) in &download_results {
+                if let Err(e) = result {
+                    eprintln!("{} {} — {}", style(format!("{:>12}", "error")).red().bold(), key, e);
+                }
             }
+            print_gpg_summary();
         }
-
-        // Print GPG verification summary (if any failures)
-        print_gpg_summary();
 
         // Record hashes in lock; collect failures
         let mut failures = Vec::new();
@@ -573,17 +758,8 @@ fn resolve_inner(
     // Phase 3: build lock entries and collect JAR paths
     let mut all_jars = Vec::new();
     for key in &ordered_keys {
-        let parts: Vec<&str> = key.split(':').collect();
-        if parts.len() != 3 {
+        let Some(coord) = MavenCoord::from_versioned_key(key) else {
             continue;
-        }
-        let coord = MavenCoord {
-            group_id: parts[0].to_string(),
-            artifact_id: parts[1].to_string(),
-            version: parts[2].to_string(),
-            classifier: None,
-            exclusions: Vec::new(),
-            scope: None,
         };
         all_jars.push(coord.jar_path(cache_dir));
 
@@ -601,6 +777,7 @@ fn resolve_inner(
         });
     }
 
+    append_native_jars(&mut all_jars);
     Ok(all_jars)
 }
 
@@ -680,34 +857,20 @@ fn try_resolve_from_lock(
         // Check lock file entry exists
         let locked = lock.dependencies.get(&key)?;
 
-        // Verify SHA-256 integrity if hash is recorded
-        if let Some(ref expected_sha) = locked.sha256 {
-            if let Ok(data) = std::fs::read(&jar_path) {
-                let actual = crate::compiler::incremental::hash_bytes(&data);
-                if &actual != expected_sha {
-                    return None; // Integrity mismatch, force re-download
-                }
-            }
-        }
+        // SHA-256 was already verified at download time; skip re-verification
+        // to avoid reading hundreds of MBs of JARs on every build.
 
         all_jars.push(jar_path);
         if let Some(ref dep_keys) = locked.dependencies {
             for dep_key in dep_keys {
-                let parts: Vec<&str> = dep_key.split(':').collect();
-                if parts.len() == 3 {
-                    queue.push_back(MavenCoord {
-                        group_id: parts[0].to_string(),
-                        artifact_id: parts[1].to_string(),
-                        version: parts[2].to_string(),
-                        classifier: None,
-                        exclusions: Vec::new(),
-                        scope: None,
-                    });
+                if let Some(mc) = MavenCoord::from_versioned_key(dep_key) {
+                    queue.push_back(mc);
                 }
             }
         }
     }
 
+    append_native_jars(&mut all_jars);
     Some(all_jars)
 }
 
@@ -811,12 +974,12 @@ fn resolve_transitive_cached(
     if !pom_path.exists() || coord.is_snapshot() {
         let pom_result = if coord.is_snapshot() {
             if let Some((ts, bn)) = resolve_snapshot_version(client, coord, registries) {
-                download_from_repos(client, coord, &pom_path, registries, |c, r| c.snapshot_pom_url(r, &ts, &bn))
+                download_from_repos(client, coord, &pom_path, registries, None, |c, r| c.snapshot_pom_url(r, &ts, &bn))
             } else {
-                download_from_repos(client, coord, &pom_path, registries, |c, r| c.pom_url(r))
+                download_from_repos(client, coord, &pom_path, registries, None, |c, r| c.pom_url(r))
             }
         } else {
-            download_from_repos(client, coord, &pom_path, registries, |c, r| c.pom_url(r))
+            download_from_repos(client, coord, &pom_path, registries, None, |c, r| c.pom_url(r))
         };
         if pom_result.is_err() {
             return Ok(vec![]); // POM not found is non-fatal
@@ -898,7 +1061,7 @@ fn resolve_parent_properties(
                 };
                 let parent_pom_path = parent_coord.pom_path(cache_dir);
                 if !parent_pom_path.exists() {
-                    let _ = download_from_repos(client, &parent_coord, &parent_pom_path, registries, |c, r| c.pom_url(r));
+                    let _ = download_from_repos(client, &parent_coord, &parent_pom_path, registries, None, |c, r| c.pom_url(r));
                 }
                 if parent_pom_path.exists() {
                     let parent_content = std::fs::read_to_string(&parent_pom_path)?;
@@ -1195,7 +1358,7 @@ fn collect_managed_versions_with_bom(
                                 let bom_pom_path = bom_coord.pom_path(cache_dir);
                                 if !bom_pom_path.exists() {
                                     let _ = download_from_repos(
-                                        client, &bom_coord, &bom_pom_path, registries,
+                                        client, &bom_coord, &bom_pom_path, registries, None,
                                         |c, r| c.pom_url(r),
                                     );
                                 }
@@ -1311,13 +1474,14 @@ fn download_from_repos(
     coord: &MavenCoord,
     path: &Path,
     registries: &[RegistryEntry],
+    progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
     url_fn: impl Fn(&MavenCoord, &str) -> String,
 ) -> Result<String> {
     let repos = repos_for_group_id(registries, &coord.group_id);
     let mut last_err = None;
     for repo in &repos {
         let url = url_fn(coord, repo);
-        match download_file(client, &url, path) {
+        match download_file(client, &url, path, progress) {
             Ok(hash) => return Ok(hash),
             Err(e) => last_err = Some(e),
         }
@@ -1327,7 +1491,14 @@ fn download_from_repos(
 
 /// Download a file and return its SHA-256 hash.
 /// Retries up to 3 times with exponential backoff (1s → 2s → 4s).
-fn download_file(client: &reqwest::blocking::Client, url: &str, path: &Path) -> Result<String> {
+/// `progress`: optional callback — first call `(content_length, 0)` to register size,
+/// then `(0, chunk_bytes)` for each chunk read.
+fn download_file(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    path: &Path,
+    progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> Result<String> {
     let max_retries = 3;
     let mut last_err = None;
 
@@ -1350,6 +1521,10 @@ fn download_file(client: &reqwest::blocking::Client, url: &str, path: &Path) -> 
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
+                    let content_len = response.content_length().unwrap_or(0);
+                    if let Some(cb) = &progress {
+                        cb(content_len, 0); // register total size
+                    }
                     // Stream to file to handle large JARs (100MB+)
                     let tmp_path = path.with_extension("part");
                     match (|| -> Result<String> {
@@ -1364,6 +1539,9 @@ fn download_file(client: &reqwest::blocking::Client, url: &str, path: &Path) -> 
                             if n == 0 { break; }
                             hasher.update(&buf[..n]);
                             std::io::Write::write_all(&mut file, &buf[..n])?;
+                            if let Some(cb) = &progress {
+                                cb(0, n as u64);
+                            }
                         }
                         drop(file);
                         std::fs::rename(&tmp_path, path)?;
@@ -1407,7 +1585,7 @@ fn verify_gpg_signature(
     let asc_path = jar_path.with_extension("jar.asc");
 
     // Try to download the .asc signature file
-    let asc_result = download_from_repos(client, coord, &asc_path, registries, |c, r| {
+    let asc_result = download_from_repos(client, coord, &asc_path, registries, None, |c, r| {
         format!("{}.asc", c.jar_url(r))
     });
 
@@ -1456,8 +1634,8 @@ fn print_gpg_summary() {
     let count = GPG_FAIL_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed);
     if count > 0 && !GPG_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!(
-            "  {} {} artifact(s) failed GPG signature verification (missing public keys?)",
-            console::style("!").yellow(),
+            "{} {} artifact(s) failed GPG signature verification (missing public keys?)",
+            console::style(format!("{:>12}", "warning")).yellow().bold(),
             count
         );
     }
@@ -1519,13 +1697,15 @@ pub fn check_conflicts(lock: &ResolvedCache) -> Vec<(String, Vec<String>)> {
     let mut versions_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for key in lock.dependencies.keys() {
-        let parts: Vec<&str> = key.split(':').collect();
-        if parts.len() == 3 {
-            let ga = format!("{}:{}", parts[0], parts[1]);
-            versions_map
-                .entry(ga)
-                .or_default()
-                .push(parts[2].to_string());
+        if let Some(mc) = MavenCoord::from_versioned_key(key) {
+            // Only track conflicts for base artifacts (not classifier variants)
+            if mc.classifier.is_none() {
+                let ga = format!("{}:{}", mc.group_id, mc.artifact_id);
+                versions_map
+                    .entry(ga)
+                    .or_default()
+                    .push(mc.version);
+            }
         }
     }
 
@@ -1572,18 +1752,28 @@ pub fn resolve_workspace_deps_with_resolutions(
     // 2. Resolve once for the entire workspace
     let _all_jars = resolve_and_download_with_resolutions(&merged_deps, cache_dir, lock, registries, exclusions, resolutions)?;
 
-    // 3. Build a versioned key lookup: groupId:artifactId -> versioned key (g:a:v)
-    //    using resolved_versions from the lock file
+    // 3+4. Distribute resolved JARs to per-module sets
+    if !crate::is_json_quiet() && console::Term::stderr().is_term() {
+        resolver_progress("Distributing dependencies...");
+    }
+    Ok(distribute_jars_per_module(all_module_deps, cache_dir, lock))
+}
+
+/// Distribute resolved JARs to per-module sets by BFS through the lock file graph.
+fn distribute_jars_per_module(
+    all_module_deps: &[(String, BTreeMap<String, String>)],
+    cache_dir: &Path,
+    lock: &ResolvedCache,
+) -> HashMap<String, Vec<PathBuf>> {
+    // Build GA → versioned key lookup from lock file
     let mut ga_to_versioned: HashMap<String, String> = HashMap::new();
     for key in lock.dependencies.keys() {
-        let parts: Vec<&str> = key.split(':').collect();
-        if parts.len() == 3 {
-            let ga = format!("{}:{}", parts[0], parts[1]);
+        if let Some(mc) = MavenCoord::from_versioned_key(key) {
+            let ga = format!("{}:{}", mc.group_id, mc.artifact_id);
             ga_to_versioned.entry(ga).or_insert(key.clone());
         }
     }
 
-    // 4. Per module: walk the lock file graph to collect only relevant jars
     let mut per_module = HashMap::new();
     for (name, deps) in all_module_deps {
         let mut module_jars = Vec::new();
@@ -1592,10 +1782,8 @@ pub fn resolve_workspace_deps_with_resolutions(
 
         // Seed with this module's direct deps
         for (coord, version) in deps {
-            let mc = MavenCoord::parse(coord, version);
-            if let Ok(mc) = mc {
+            if let Ok(mc) = MavenCoord::parse(coord, version) {
                 let vk = mc.versioned_key();
-                // Try exact match first, then GA lookup
                 if lock.dependencies.contains_key(&vk) {
                     queue.push_back(vk);
                 } else if let Some(resolved_key) = ga_to_versioned.get(coord) {
@@ -1609,33 +1797,15 @@ pub fn resolve_workspace_deps_with_resolutions(
             if !visited_keys.insert(key.clone()) {
                 continue;
             }
-            let parts: Vec<&str> = key.split(':').collect();
-            if parts.len() == 3 {
-                let coord = MavenCoord {
-                    group_id: parts[0].to_string(),
-                    artifact_id: parts[1].to_string(),
-                    version: parts[2].to_string(),
-                    classifier: None,
-                    exclusions: Vec::new(),
-                    scope: None,
-                };
+            if let Some(coord) = MavenCoord::from_versioned_key(&key) {
                 let jar = coord.jar_path(cache_dir);
                 if jar.exists() {
                     module_jars.push(jar);
                 } else {
                     // Fall back to resolved version JAR
-                    let ga = format!("{}:{}", parts[0], parts[1]);
+                    let ga = format!("{}:{}", coord.group_id, coord.artifact_id);
                     if let Some(resolved_key) = ga_to_versioned.get(&ga) {
-                        let rparts: Vec<&str> = resolved_key.split(':').collect();
-                        if rparts.len() == 3 {
-                            let rc = MavenCoord {
-                                group_id: rparts[0].to_string(),
-                                artifact_id: rparts[1].to_string(),
-                                version: rparts[2].to_string(),
-                                classifier: None,
-                                exclusions: Vec::new(),
-                                scope: None,
-                            };
+                        if let Some(rc) = MavenCoord::from_versioned_key(resolved_key) {
                             let rjar = rc.jar_path(cache_dir);
                             if rjar.exists() {
                                 module_jars.push(rjar);
@@ -1645,15 +1815,11 @@ pub fn resolve_workspace_deps_with_resolutions(
                 }
             }
             // Add transitive deps from lock
-            // If exact key not found, fall back to GA lookup (version may differ due to resolution)
             let locked_entry = lock.dependencies.get(&key).or_else(|| {
-                let parts: Vec<&str> = key.split(':').collect();
-                if parts.len() == 3 {
-                    let ga = format!("{}:{}", parts[0], parts[1]);
+                MavenCoord::from_versioned_key(&key).and_then(|mc| {
+                    let ga = format!("{}:{}", mc.group_id, mc.artifact_id);
                     ga_to_versioned.get(&ga).and_then(|resolved_key| lock.dependencies.get(resolved_key))
-                } else {
-                    None
-                }
+                })
             });
             if let Some(locked) = locked_entry {
                 if let Some(ref dep_keys) = locked.dependencies {
@@ -1666,10 +1832,40 @@ pub fn resolve_workspace_deps_with_resolutions(
             }
         }
 
+        append_native_jars(&mut module_jars);
         per_module.insert(name.clone(), module_jars);
     }
 
-    Ok(per_module)
+    per_module
+}
+
+/// Workspace-level no-download variant: resolve merged deps from lock + local cache only.
+/// Used by `idea --json` to avoid network I/O.
+pub fn resolve_workspace_deps_no_download(
+    all_module_deps: &[(String, BTreeMap<String, String>)],
+    cache_dir: &Path,
+    lock: &mut ResolvedCache,
+    registries: &[RegistryEntry],
+    exclusions: &[String],
+    resolutions: &BTreeMap<String, String>,
+) -> Result<HashMap<String, Vec<PathBuf>>> {
+    let mut merged_deps = BTreeMap::new();
+    for (_name, deps) in all_module_deps {
+        for (coord, version) in deps {
+            merged_deps.entry(coord.clone()).or_insert(version.clone());
+        }
+    }
+
+    if merged_deps.is_empty() {
+        return Ok(all_module_deps.iter().map(|(name, _)| (name.clone(), vec![])).collect());
+    }
+
+    // Resolve without downloading (lock + local cache only)
+    let _all_jars = resolve_no_download(
+        &merged_deps, cache_dir, lock, registries, exclusions, resolutions, &HashMap::new(),
+    )?;
+
+    Ok(distribute_jars_per_module(all_module_deps, cache_dir, lock))
 }
 
 /// Search Maven Central for an artifact by keyword

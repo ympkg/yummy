@@ -29,7 +29,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
     crate::scripts::run_script(&cfg, "prepublish", &project)?;
 
     // Build first
-    super::build::execute(None)?;
+    super::build::execute(vec![], true)?;
 
     // Generate POM
     let pom_path = project.join("out").join("pom.xml");
@@ -174,7 +174,7 @@ fn publish_workspace_module(
     let module_path = &pkg.path;
 
     // Build the module
-    super::build::execute(Some(module_name.to_string()))?;
+    super::build::execute(vec![module_name.to_string()], true)?;
 
     // Generate POM for the module
     let pom_path = module_path.join("out").join("pom.xml");
@@ -274,8 +274,8 @@ fn generate_pom(
     let mut dep_xml = String::new();
     if let Some(ref deps) = cfg.dependencies {
         for (coord, value) in deps {
-            // Handle workspace module deps (no colon, workspace=true)
-            if !coord.contains(':') && value.is_workspace() {
+            // Handle workspace module deps (not a Maven coordinate, workspace=true)
+            if !crate::config::schema::is_maven_dep(coord) && value.is_workspace() {
                 if let Some(ref ws) = ws {
                     if let Some(pkg) = ws.get_package(coord) {
                         let mod_version = pkg.config.version.as_deref().unwrap_or("0.0.0");
@@ -293,7 +293,7 @@ fn generate_pom(
                 continue;
             }
 
-            if !coord.contains(':') || value.is_workspace() {
+            if !crate::config::schema::is_maven_dep(coord) || value.is_workspace() {
                 continue;
             }
             let version = match value.version() {
@@ -305,7 +305,8 @@ fn generate_pom(
             if scope == "test" {
                 continue;
             }
-            let parts: Vec<&str> = coord.split(':').collect();
+            let resolved = cfg.resolve_key(coord);
+            let parts: Vec<&str> = resolved.split(':').collect();
             if parts.len() == 2 {
                 let scope_xml = match scope {
                     "compile" => String::new(),

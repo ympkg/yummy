@@ -6,50 +6,6 @@ use std::path::{Path, PathBuf};
 use crate::config;
 use crate::workspace::graph::WorkspaceGraph;
 
-/// Auto-sync IDEA project files when `.idea/` exists but `.iml` is missing.
-/// Called by build/dev/test so users get IDEA support without manual `ym idea`.
-pub(crate) fn auto_sync_idea(project: &Path, cfg: &config::schema::YmConfig) {
-    if crate::is_json_quiet() {
-        return;
-    }
-    let idea_dir = project.join(".idea");
-    if !idea_dir.is_dir() {
-        return;
-    }
-    let modules_dir = idea_dir.join("modules");
-    let iml_path = modules_dir.join(format!("{}.iml", cfg.name));
-    if iml_path.exists() {
-        return;
-    }
-
-    let java_version = cfg.target.as_deref().unwrap_or("21");
-    let result = if cfg.workspaces.is_some() {
-        WorkspaceGraph::build(project).and_then(|ws| {
-            let mut all = ws.all_packages();
-            all.sort();
-            generate_idea_project(project, &all, &ws, java_version, false)
-        })
-    } else {
-        generate_single_project_idea(project, cfg, java_version, false)
-    };
-
-    match result {
-        Ok(()) => {
-            eprintln!(
-                "  {} Auto-synced IDEA project (detected .idea/ without .iml)",
-                style("✓").green()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "  {} Failed to auto-sync IDEA project: {}",
-                style("⚠").yellow(),
-                e
-            );
-        }
-    }
-}
-
 pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
@@ -58,6 +14,11 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
 
     if json {
         return execute_json(&project, &cfg, target.as_deref(), java_version);
+    }
+
+    // .idea/ is created by IDEA itself — skip silently if not present
+    if !project.join(".idea").is_dir() {
+        return Ok(());
     }
 
     if cfg.workspaces.is_some() {
@@ -76,8 +37,8 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
         generate_idea_project(&project, &packages, &ws, java_version, download_sources)?;
 
         println!(
-            "  {} Generated IDEA project ({} modules)",
-            style("✓").green(),
+            "{} IDEA project ({} modules)",
+            style(format!("{:>12}", "Finished")).green().bold(),
             packages.len()
         );
     } else {
@@ -85,8 +46,8 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
         generate_single_project_idea(&project, &cfg, java_version, download_sources)?;
 
         println!(
-            "  {} Generated IDEA project for {}",
-            style("✓").green(),
+            "{} IDEA project for {}",
+            style(format!("{:>12}", "Finished")).green().bold(),
             style(&cfg.name).bold()
         );
     }
@@ -180,14 +141,53 @@ fn execute_json(
 }
 
 fn build_modules_workspace(
-    _root: &Path,
+    root: &Path,
     packages: &[String],
     ws: &WorkspaceGraph,
 ) -> Result<Vec<IdeaModuleModel>> {
+    use crate::workspace::resolver;
+
+    // Pre-load root config ONCE
+    let root_config_path = root.join(config::CONFIG_FILE);
+    let root_cfg = config::load_config(&root_config_path)?;
+    let root_registries = root_cfg.registry_entries();
+    let root_resolutions = root_cfg.resolved_resolutions();
+    let cache_dir = config::maven_cache_dir(root);
+
+    eprintln!("  Scanning {} modules...", packages.len());
+
+    // Collect all module deps for single-pass workspace resolution
+    let mut all_module_deps: Vec<(String, std::collections::BTreeMap<String, String>)> = Vec::new();
+    for pkg_name in packages {
+        let pkg = ws.get_package(pkg_name).unwrap();
+        let deps = pkg.config.maven_dependencies_with_root(&root_cfg);
+        all_module_deps.push((pkg_name.clone(), deps));
+    }
+
+    let unique_dep_count: usize = {
+        let mut all_keys = std::collections::BTreeSet::new();
+        for (_, deps) in &all_module_deps {
+            all_keys.extend(deps.keys().cloned());
+        }
+        all_keys.len()
+    };
+    eprintln!("  Resolving {} artifacts...", unique_dep_count);
+
+    // Single-pass resolution: merge all deps → resolve + download → distribute per-module
+    let mut resolved = config::load_resolved_cache(root)?;
+    let exclusions: Vec<String> = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
+    let per_module_jars = resolver::resolve_workspace_deps_with_resolutions(
+        &all_module_deps, &cache_dir, &mut resolved, &root_registries, &exclusions, &root_resolutions,
+    )?;
+    config::save_resolved_cache(root, &resolved)?;
+
+    eprintln!("  Building project model...");
+
+    // Build module models
     let mut modules = Vec::new();
     for pkg_name in packages {
         let pkg = ws.get_package(pkg_name).unwrap();
-        let jars = super::build::resolve_deps_no_download(&pkg.path, &pkg.config)?;
+        let jars = per_module_jars.get(pkg_name).cloned().unwrap_or_default();
         let ap_jars = collect_annotation_processor_jars(&pkg.config, &jars);
         let ws_deps = pkg.config.workspace_module_deps();
 
@@ -216,6 +216,19 @@ fn build_modules_workspace(
             });
         }
 
+        // Also add lib dirs for this module
+        let lib_jars = super::build::resolve_lib_dirs(&pkg.path, &pkg.config);
+        for jar in &lib_jars {
+            let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
+            dependencies.push(IdeaDependency {
+                dep_type: "library".to_string(),
+                name: jar_name,
+                jar_path: Some(to_idea_path(&jar.to_string_lossy())),
+                source_path: None,
+                scope: "COMPILE".to_string(),
+            });
+        }
+
         modules.push(IdeaModuleModel {
             name: pkg_name.clone(),
             path: to_idea_path(&pkg.path.to_string_lossy()),
@@ -235,7 +248,7 @@ fn build_module_single(
     project: &Path,
     cfg: &config::schema::YmConfig,
 ) -> Result<IdeaModuleModel> {
-    let jars = super::build::resolve_deps_no_download(project, cfg)?;
+    let jars = super::build::resolve_deps(project, cfg)?;
     let ap_jars = collect_annotation_processor_jars(cfg, &jars);
 
     let mut dependencies = Vec::new();
@@ -267,11 +280,13 @@ fn build_module_single(
 
 /// Return the IDEA scope string for a JAR: COMPILE, RUNTIME, PROVIDED, TEST
 fn jar_to_idea_scope_str(jar: &Path, cfg: &config::schema::YmConfig) -> String {
+    use config::schema::{is_maven_dep, artifact_id_from_key};
     let jar_stem = jar.file_stem().unwrap_or_default().to_string_lossy();
+    // Check [dependencies]
     if let Some(ref deps) = cfg.dependencies {
         for (key, value) in deps {
-            if !key.contains(':') { continue; }
-            let artifact_id = key.split(':').next_back().unwrap_or("");
+            if !is_maven_dep(key) { continue; }
+            let artifact_id = artifact_id_from_key(key);
             if jar_stem.starts_with(artifact_id) {
                 return match value.scope() {
                     "runtime" => "RUNTIME",
@@ -279,6 +294,16 @@ fn jar_to_idea_scope_str(jar: &Path, cfg: &config::schema::YmConfig) -> String {
                     "test" => "TEST",
                     _ => "COMPILE",
                 }.to_string();
+            }
+        }
+    }
+    // Check [devDependencies] — always PROVIDED
+    if let Some(ref dev_deps) = cfg.dev_dependencies {
+        for (key, _value) in dev_deps {
+            if !is_maven_dep(key) { continue; }
+            let artifact_id = artifact_id_from_key(key);
+            if jar_stem.starts_with(artifact_id) {
+                return "PROVIDED".to_string();
             }
         }
     }
@@ -340,7 +365,6 @@ fn generate_idea_project(
     download_sources: bool,
 ) -> Result<()> {
     let idea_dir = root.join(".idea");
-    std::fs::create_dir_all(&idea_dir)?;
 
     // misc.xml - JDK version
     let misc = format!(
@@ -363,13 +387,23 @@ fn generate_idea_project(
 
     let mut all_jars: Vec<PathBuf> = Vec::new();
 
+    // Pre-load root config ONCE
+    let root_config_path = root.join(config::CONFIG_FILE);
+    let root_cfg = config::load_config(&root_config_path)?;
+    let root_registries = root_cfg.registry_entries();
+    let root_resolutions = root_cfg.resolved_resolutions();
+    let shared_cache_dir = config::maven_cache_dir(root);
+
     for pkg_name in packages {
         let pkg = ws.get_package(pkg_name).unwrap();
         let rel_path = pathdiff(root, &pkg.path);
         let iml_path = modules_dir.join(format!("{}.iml", pkg_name));
 
         // Resolve Maven deps for this package
-        let jars = super::build::resolve_deps_no_download(&pkg.path, &pkg.config)?;
+        let jars = super::build::resolve_deps_no_download_with_root(
+            &pkg.path, &pkg.config, &root_cfg, &shared_cache_dir,
+            &root_registries, &root_resolutions,
+        )?;
         all_jars.extend(jars.clone());
 
         // Build module dependencies
@@ -470,7 +504,6 @@ fn generate_single_project_idea(
     download_sources: bool,
 ) -> Result<()> {
     let idea_dir = project.join(".idea");
-    std::fs::create_dir_all(&idea_dir)?;
 
     let misc = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -806,24 +839,31 @@ fn detect_source_folders(project: &Path, base_url: &str) -> String {
 /// Map a JAR file to its IDEA scope attribute based on the dependency's scope in config.
 /// Returns empty string for COMPILE (default), or ` scope="RUNTIME"` etc.
 fn jar_to_idea_scope(jar: &Path, cfg: &config::schema::YmConfig) -> String {
+    use config::schema::{is_maven_dep, artifact_id_from_key};
     // Extract artifactId from JAR filename to match against dependencies
     let jar_stem = jar.file_stem().unwrap_or_default().to_string_lossy();
 
     if let Some(ref deps) = cfg.dependencies {
         for (key, value) in deps {
-            if !key.contains(':') {
-                continue;
-            }
-            let artifact_id = key.split(':').next_back().unwrap_or("");
-            // Check if JAR filename starts with the artifactId
+            if !is_maven_dep(key) { continue; }
+            let artifact_id = artifact_id_from_key(key);
             if jar_stem.starts_with(artifact_id) {
-                let scope = value.scope();
-                return match scope {
+                return match value.scope() {
                     "runtime" => " scope=\"RUNTIME\"".to_string(),
                     "provided" => " scope=\"PROVIDED\"".to_string(),
                     "test" => " scope=\"TEST\"".to_string(),
-                    _ => String::new(), // compile = default, no attribute needed
+                    _ => String::new(),
                 };
+            }
+        }
+    }
+    // devDependencies → PROVIDED
+    if let Some(ref dev_deps) = cfg.dev_dependencies {
+        for (key, _value) in dev_deps {
+            if !is_maven_dep(key) { continue; }
+            let artifact_id = artifact_id_from_key(key);
+            if jar_stem.starts_with(artifact_id) {
+                return " scope=\"PROVIDED\"".to_string();
             }
         }
     }

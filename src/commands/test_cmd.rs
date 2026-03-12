@@ -36,8 +36,6 @@ pub fn execute(
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
-    super::idea::auto_sync_idea(&project, &cfg);
-
     // Ensure JDK is available
     super::build::ensure_jdk_for_config(&cfg)?;
 
@@ -307,7 +305,7 @@ fn run_tests(
     };
 
     let cache = config::cache_dir(project);
-    let result = crate::compiler::incremental::incremental_compile(&main_compile_cfg, &cache)?;
+    let result = crate::compiler::incremental::incremental_compile(&main_compile_cfg, &cache, None)?;
     if !result.success {
         eprint!("{}", crate::compiler::colorize_errors(&result.errors));
         bail!("Main compilation failed");
@@ -329,7 +327,7 @@ fn run_tests(
             extra_args: vec![],
         };
 
-        let result = crate::compiler::incremental::incremental_compile(&test_compile_cfg, &cache)?;
+        let result = crate::compiler::incremental::incremental_compile(&test_compile_cfg, &cache, None)?;
         if !result.success {
             eprint!("{}", crate::compiler::colorize_errors(&result.errors));
             bail!("Test compilation failed");
@@ -868,7 +866,7 @@ fn test_workspace(
         };
 
         let ws_cache = config::cache_dir(&target_pkg.path);
-        let result = crate::compiler::incremental::incremental_compile(&compile_cfg, &ws_cache)?;
+        let result = crate::compiler::incremental::incremental_compile(&compile_cfg, &ws_cache, None)?;
         if !result.success {
             eprint!("{}", crate::compiler::colorize_errors(&result.errors));
             bail!("Test compilation failed");

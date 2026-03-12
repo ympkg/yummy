@@ -63,7 +63,7 @@ impl Fingerprints {
                 let path = entry.path().to_path_buf();
                 all.push(path.clone());
 
-                let rel_key = path.to_string_lossy().to_string();
+                let rel_key = crate::normalize_cache_path(&path);
 
                 // Quick check: modification time
                 let mtime = entry
@@ -93,7 +93,7 @@ impl Fingerprints {
 
     /// Update fingerprint for a compiled file.
     pub fn update_source(&mut self, path: &Path, source_hash: &str, mtime_secs: u64) {
-        let key = path.to_string_lossy().to_string();
+        let key = crate::normalize_cache_path(path);
         let entry = self.entries.entry(key).or_insert_with(|| FileEntry {
             source_hash: String::new(),
             abi_hash: None,
@@ -105,7 +105,7 @@ impl Fingerprints {
 
     /// Update ABI hash for a compiled class.
     pub fn update_abi(&mut self, source_path: &Path, abi_hash: &str) {
-        let key = source_path.to_string_lossy().to_string();
+        let key = crate::normalize_cache_path(source_path);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.abi_hash = Some(abi_hash.to_string());
         }
@@ -115,7 +115,7 @@ impl Fingerprints {
     /// Returns true if ABI changed or if no previous ABI recorded.
     #[allow(dead_code)]
     pub fn abi_changed(&self, source_path: &Path, new_abi_hash: &str) -> bool {
-        let key = source_path.to_string_lossy().to_string();
+        let key = crate::normalize_cache_path(source_path);
         match self.entries.get(&key) {
             Some(entry) => entry.abi_hash.as_deref() != Some(new_abi_hash),
             None => true,
@@ -127,7 +127,7 @@ impl Fingerprints {
     pub fn prune(&mut self, existing_files: &[PathBuf]) -> Vec<String> {
         let existing_keys: std::collections::HashSet<String> = existing_files
             .iter()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| crate::normalize_cache_path(p))
             .collect();
         let removed: Vec<String> = self.entries.keys()
             .filter(|k| !existing_keys.contains(k.as_str()))
@@ -434,6 +434,7 @@ fn read_u32(data: &[u8], pos: usize) -> Option<u32> {
 pub fn incremental_compile(
     config: &super::CompileConfig,
     cache_dir: &Path,
+    pool: Option<&super::worker::CompilerPool>,
 ) -> Result<super::CompileResult> {
     // Use a per-output-dir fingerprint file so workspace modules don't conflict
     let fp_dir = fingerprint_dir_for(cache_dir, &config.output_dir);
@@ -447,6 +448,18 @@ pub fn incremental_compile(
             .unwrap_or(false);
 
     let files_to_compile = if !has_classes {
+        // Check if all source files were previously compiled with no class output
+        // (entirely commented-out modules). Skip full recompile in this case.
+        let all_have_fingerprints = !all_files.is_empty() && all_files.iter().all(|f| {
+            fingerprints.entries.contains_key(&crate::normalize_cache_path(f))
+        });
+        if all_have_fingerprints && changed.is_empty() {
+            return Ok(super::CompileResult {
+                success: true,
+                outcome: super::CompileOutcome::UpToDate,
+                errors: String::new(),
+            });
+        }
         // Full compile needed — try build cache first
         if !all_files.is_empty() {
             if let Some(result) = try_restore_build_cache(config, &all_files, &mut fingerprints, &fp_dir)? {
@@ -456,15 +469,25 @@ pub fn incremental_compile(
         all_files.clone()
     } else if changed.is_empty() {
         // Check for missing .class files (e.g. user deleted out/classes/ contents)
+        // But skip source files that were previously compiled successfully with no output
+        // (e.g. entirely commented-out .java files that produce no .class)
         let missing: Vec<PathBuf> = all_files
             .iter()
-            .filter(|src| find_class_for_source(src, &config.source_dirs, &config.output_dir).is_none())
+            .filter(|src| {
+                if find_class_for_source(src, &config.source_dirs, &config.output_dir).is_some() {
+                    return false; // .class exists, not missing
+                }
+                // No .class file — check if this source was previously compiled successfully
+                // (has a fingerprint entry). If so, it's a no-output file, skip it.
+                let key = crate::normalize_cache_path(src);
+                !fingerprints.entries.contains_key(&key)
+            })
             .cloned()
             .collect();
         if missing.is_empty() {
             return Ok(super::CompileResult {
                 success: true,
-                files_compiled: 0,
+                outcome: super::CompileOutcome::UpToDate,
                 errors: String::new(),
             });
         }
@@ -491,7 +514,7 @@ pub fn incremental_compile(
         extra_args: config.extra_args.clone(),
     };
 
-    let result = compile_files(&incremental_config, &files_to_compile)?;
+    let result = compile_files(&incremental_config, &files_to_compile, pool)?;
 
     let is_full_compile = files_to_compile.len() == all_files.len();
 
@@ -535,7 +558,11 @@ pub fn incremental_compile(
 
     Ok(super::CompileResult {
         success: result.success,
-        files_compiled: files_to_compile.len(),
+        outcome: if files_to_compile.is_empty() {
+            super::CompileOutcome::UpToDate
+        } else {
+            super::CompileOutcome::Compiled(files_to_compile.len())
+        },
         errors: result.errors,
     })
 }
@@ -558,7 +585,7 @@ fn find_class_for_source(source: &Path, source_dirs: &[PathBuf], output_dir: &Pa
 /// Derive a per-module fingerprint directory from the output dir path.
 /// This ensures workspace modules have independent fingerprint files.
 fn fingerprint_dir_for(cache_dir: &Path, output_dir: &Path) -> PathBuf {
-    let hash = hash_bytes(output_dir.to_string_lossy().as_bytes());
+    let hash = hash_bytes(crate::normalize_cache_path(output_dir).as_bytes());
     cache_dir.join("fingerprints").join(&hash[..16])
 }
 
@@ -571,7 +598,7 @@ fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBu
     let mut source_hashes: Vec<(String, String)> = Vec::new();
     for f in source_files {
         let h = hash_file(f)?;
-        let rel = f.to_string_lossy().to_string();
+        let rel = crate::normalize_cache_path(f);
         source_hashes.push((rel, h));
     }
     source_hashes.sort_by(|a, b| a.0.cmp(&b.0));
@@ -582,7 +609,7 @@ fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBu
 
     // Classpath (sorted paths)
     let mut cp: Vec<String> = config.classpath.iter()
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| crate::normalize_cache_path(p))
         .collect();
     cp.sort();
     for p in &cp {
@@ -656,8 +683,8 @@ fn try_restore_build_cache(
 
     Ok(Some(super::CompileResult {
         success: true,
-        files_compiled: 0,
-        errors: "(restored from build cache)".to_string(),
+        outcome: super::CompileOutcome::Cached,
+        errors: String::new(),
     }))
 }
 
@@ -694,21 +721,42 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Compile specific files using javac.
+/// Compile specific files using javac (or worker pool if available).
 fn compile_files(
     config: &super::CompileConfig,
     files: &[PathBuf],
+    pool: Option<&super::worker::CompilerPool>,
 ) -> Result<super::CompileResult> {
     if files.is_empty() {
         return Ok(super::CompileResult {
             success: true,
-            files_compiled: 0,
+            outcome: super::CompileOutcome::UpToDate,
             errors: String::new(),
         });
     }
 
     std::fs::create_dir_all(&config.output_dir)?;
 
+    if let Some(pool) = pool {
+        pool.compile(config, files)
+    } else {
+        compile_with_javac(config, files)
+    }
+}
+
+/// Direct javac compilation (public for worker fallback).
+pub fn compile_files_direct(
+    config: &super::CompileConfig,
+    files: &[PathBuf],
+) -> Result<super::CompileResult> {
+    if files.is_empty() {
+        return Ok(super::CompileResult {
+            success: true,
+            outcome: super::CompileOutcome::UpToDate,
+            errors: String::new(),
+        });
+    }
+    std::fs::create_dir_all(&config.output_dir)?;
     compile_with_javac(config, files)
 }
 
@@ -796,7 +844,7 @@ fn compile_with_javac(
 
     Ok(super::CompileResult {
         success: output.status.success(),
-        files_compiled: files.len(),
+        outcome: super::CompileOutcome::Compiled(files.len()),
         errors: stderr,
     })
 }

@@ -9,7 +9,7 @@ pub fn execute(dep: &str) -> Result<()> {
 
     let deps = match cfg.dependencies.as_mut() {
         Some(d) => d,
-        None => bail!("No dependencies in package.toml"),
+        None => bail!("No dependencies in ym.json"),
     };
 
     // Exact match
@@ -25,11 +25,11 @@ pub fn execute(dep: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Fuzzy match by artifactId (when input has no colon)
-    if !dep.contains(':') {
+    // Fuzzy match by artifactId (when input has no colon or @scope)
+    if !crate::config::schema::is_maven_dep(dep) {
         let matching: Vec<String> = deps
             .keys()
-            .filter(|k| k.split(':').next_back().is_some_and(|a| a == dep))
+            .filter(|k| crate::config::schema::artifact_id_from_key(k) == dep)
             .cloned()
             .collect();
 

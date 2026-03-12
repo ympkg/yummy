@@ -12,7 +12,7 @@ pub fn execute(verify: bool) -> Result<()> {
     let config_path = cwd.join(config::CONFIG_FILE);
 
     if config_path.exists() {
-        bail!("package.toml already exists. Remove it first to re-migrate.");
+        bail!("ym.json already exists. Remove it first to re-migrate.");
     }
 
     let pom = cwd.join("pom.xml");
@@ -112,7 +112,7 @@ fn run_post_migration_verify() -> Result<()> {
                 e
             );
             eprintln!(
-                "  {} package.toml was generated but may need manual adjustments",
+                "  {} ym.json was generated but may need manual adjustments",
                 style("!").yellow()
             );
             Ok(()) // Don't fail the convert command itself
@@ -121,7 +121,7 @@ fn run_post_migration_verify() -> Result<()> {
 }
 
 fn print_migration_summary(cfg: &YmConfig) {
-    println!("  {} Created package.toml", style("✓").green());
+    println!("  {} Created ym.json", style("✓").green());
 
     let dep_count = cfg.dependencies.as_ref().map(|d| d.len()).unwrap_or(0);
 
@@ -623,7 +623,7 @@ fn migrate_gradle_multimodule(root: &Path, _settings_path: &Path, modules: &[Str
 
     let root_config_path = root.join(config::CONFIG_FILE);
     config::save_config(&root_config_path, &root_cfg)?;
-    println!("  {} Created root package.toml", style("✓").green());
+    println!("  {} Created root ym.json", style("✓").green());
 
     // Second pass: migrate each submodule
     let mut migrated = 0;
@@ -1692,7 +1692,7 @@ fn migrate_maven_multimodule(root: &Path, root_pom: &Path, modules: &[String]) -
 
     let root_config_path = root.join(config::CONFIG_FILE);
     config::save_config(&root_config_path, &root_cfg)?;
-    println!("  {} Created root package.toml", style("✓").green());
+    println!("  {} Created root ym.json", style("✓").green());
 
     // Collect all module artifact IDs for inter-module dep detection
     let mut module_artifacts: BTreeMap<String, String> = BTreeMap::new(); // artifactId -> module_path

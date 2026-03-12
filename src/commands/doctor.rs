@@ -351,15 +351,17 @@ fn validate_config_schema(cfg: &crate::config::schema::YmConfig, project: &std::
     // Validate dependency coordinate format
     if let Some(ref deps) = cfg.dependencies {
         for (key, value) in deps {
-            if key.contains(':') {
-                // Maven coordinate: should be groupId:artifactId
-                let parts: Vec<&str> = key.split(':').collect();
-                if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-                    println!(
-                        "  {} Invalid coordinate format: '{}' (expected groupId:artifactId)",
-                        style("!").yellow(),
-                        key
-                    );
+            if crate::config::schema::is_maven_dep(key) {
+                // Maven coordinate: validate format
+                if key.contains(':') {
+                    let parts: Vec<&str> = key.split(':').collect();
+                    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                        println!(
+                            "  {} Invalid coordinate format: '{}' (expected groupId:artifactId or @scope/name)",
+                            style("!").yellow(),
+                            key
+                        );
+                    }
                 }
                 // Validate scope value
                 let scope = value.scope();

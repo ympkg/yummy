@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use schema::{ResolvedCache, YmConfig};
 use std::path::{Path, PathBuf};
 
-pub const CONFIG_FILE: &str = "package.toml";
+pub const CONFIG_FILE: &str = "ym.json";
 pub const CACHE_DIR: &str = ".ym";
 pub const OUTPUT_DIR: &str = "out";
 pub const CLASSES_DIR: &str = "classes";
@@ -12,7 +12,7 @@ pub const TEST_CLASSES_DIR: &str = "test-classes";
 pub const SOURCE_DIR: &str = "src";
 pub const RESOLVED_FILE: &str = "resolved.json";
 
-/// Search upward from `start` for a package.toml file
+/// Search upward from `start` for an ym.json file
 pub fn find_config(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
@@ -26,7 +26,7 @@ pub fn find_config(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Search upward for the workspace root (a package.toml with "workspaces" field)
+/// Search upward for the workspace root (an ym.json with "workspaces" field)
 pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     let mut last_with_workspaces = None;
@@ -50,36 +50,12 @@ pub fn load_config(path: &Path) -> Result<YmConfig> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let config: YmConfig =
-        toml::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
+        serde_json::from_str(&content).with_context(|| format!("Failed to parse {}", path.display()))?;
     Ok(config)
 }
 
 pub fn save_config(path: &Path, config: &YmConfig) -> Result<()> {
-    // Use toml_edit to preserve comments and formatting when the file exists
-    if path.exists() {
-        let original = std::fs::read_to_string(path)?;
-        if let Ok(mut doc) = original.parse::<toml_edit::DocumentMut>() {
-            // Serialize new config to a temp TOML, then merge changed fields
-            let new_content = toml::to_string_pretty(config)?;
-            if let Ok(new_doc) = new_content.parse::<toml_edit::DocumentMut>() {
-                for (key, value) in new_doc.iter() {
-                    doc[key] = value.clone();
-                }
-                // Remove keys that no longer exist in config
-                let new_keys: Vec<String> = new_doc.iter().map(|(k, _)| k.to_string()).collect();
-                let old_keys: Vec<String> = doc.iter().map(|(k, _)| k.to_string()).collect();
-                for key in old_keys {
-                    if !new_keys.contains(&key) {
-                        doc.remove(&key);
-                    }
-                }
-                std::fs::write(path, doc.to_string())?;
-                return Ok(());
-            }
-        }
-    }
-    // Fallback: write fresh file
-    let content = toml::to_string_pretty(config)?;
+    let content = serde_json::to_string_pretty(config)? + "\n";
     std::fs::write(path, content)?;
     Ok(())
 }
@@ -110,19 +86,29 @@ pub fn load_resolved_cache_checked(project: &Path, cfg: &YmConfig) -> Result<Res
 }
 
 /// Save the resolved dependency cache to .ym/resolved.json
+/// Skips writing if the content is unchanged (preserves mtime for fingerprinting).
 pub fn save_resolved_cache(project: &Path, cache: &ResolvedCache) -> Result<()> {
     let dir = cache_dir(project);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(RESOLVED_FILE);
-    let content = serde_json::to_string_pretty(cache)?;
-    std::fs::write(path, content + "\n")?;
+    let content = serde_json::to_string_pretty(cache)? + "\n";
+    // Only write if content has changed, to preserve mtime for build fingerprinting
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if existing == content {
+            return Ok(());
+        }
+    }
+    // Atomic write: tmp + rename to avoid corruption on interrupt
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &content)?;
+    std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
-/// Load package.toml from the current directory or any parent
+/// Load ym.json from the current directory or any parent
 pub fn load_or_find_config() -> Result<(PathBuf, YmConfig)> {
     let cwd = std::env::current_dir()?;
-    let config_path = find_config(&cwd).context("No package.toml found. Run 'ym init' to create one.")?;
+    let config_path = find_config(&cwd).context("No ym.json found. Run 'ym init' to create one.")?;
     let config = load_config(&config_path)?;
     Ok((config_path, config))
 }
@@ -150,7 +136,7 @@ pub fn source_dir(project: &Path) -> PathBuf {
     }
 }
 
-/// Get the source directory respecting package.toml `sourceDir` override.
+/// Get the source directory respecting ym.json `sourceDir` override.
 pub fn source_dir_for(project: &Path, cfg: &YmConfig) -> PathBuf {
     if let Some(ref custom) = cfg.source_dir {
         project.join(custom)
@@ -170,7 +156,7 @@ pub fn test_dir(project: &Path) -> PathBuf {
     }
 }
 
-/// Get the test directory respecting package.toml `testDir` override.
+/// Get the test directory respecting ym.json `testDir` override.
 pub fn test_dir_for(project: &Path, cfg: &YmConfig) -> PathBuf {
     if let Some(ref custom) = cfg.test_dir {
         project.join(custom)
@@ -185,6 +171,9 @@ pub fn cache_dir(project: &Path) -> PathBuf {
     root.join(CACHE_DIR)
 }
 
-pub fn maven_cache_dir(project: &Path) -> PathBuf {
-    cache_dir(project).join("cache").join("maven")
+pub fn maven_cache_dir(_project: &Path) -> PathBuf {
+    dirs::home_dir()
+        .expect("Cannot determine home directory")
+        .join(".ym")
+        .join("caches")
 }

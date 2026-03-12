@@ -40,7 +40,7 @@ pub fn execute(docker: bool, out: Option<String>, platform: Option<String>, inst
     }
 
     let runtime_jars = build::resolve_deps_with_scopes(&project, &cfg, &["compile", "runtime"])?;
-    build::build_release_jar(&project, &cfg, &runtime_jars, None)?;
+    build::build_release_jar(&project, &cfg, &runtime_jars, None, None)?;
 
     let version = cfg.version.as_deref().unwrap_or("0.0.0");
     let jar_name = format!("{}-{}.jar", cfg.name, version);

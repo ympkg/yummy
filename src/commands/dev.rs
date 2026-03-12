@@ -22,8 +22,6 @@ pub fn execute(
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
-    super::idea::auto_sync_idea(&project, &cfg);
-
     // Ensure JDK is available
     super::build::ensure_jdk_for_config(&cfg)?;
 
@@ -54,8 +52,8 @@ pub fn execute(
     let ws_count = cfg.workspace_module_deps().len();
 
     println!(
-        "  {} resolved dependencies ({} workspace + {} maven) {:>4}ms",
-        style("✓").green(),
+        "{} dependencies ({} workspace + {} maven) {:>4}ms",
+        style(format!("{:>12}", "Resolving")).green().bold(),
         ws_count,
         dep_count,
         resolve_time.as_millis()
@@ -87,7 +85,7 @@ pub fn execute(
         "{} {} ({} files) {:>27}ms",
         style(format!("{:>12}", "Compiling")).green().bold(),
         &cfg.name,
-        result.files_compiled,
+        result.outcome.files_compiled(),
         compile_time.as_millis()
     );
 
@@ -481,7 +479,7 @@ fn dev_watch_loop(
                             println!(
                                 "  {} compiled {} file(s) ({}ms) -> {} {}",
                                 style(&now).dim(),
-                                result.files_compiled,
+                                result.outcome.files_compiled(),
                                 compile_time.as_millis(),
                                 reload_result.strategy,
                                 style("✓").green()
@@ -515,7 +513,7 @@ fn dev_watch_loop(
         println!(
             "  {} compiled {} file(s) ({}ms) -> restarted {}",
             style(&now).dim(),
-            result.files_compiled,
+            result.outcome.files_compiled(),
             compile_time.as_millis(),
             style("✓").green()
         );

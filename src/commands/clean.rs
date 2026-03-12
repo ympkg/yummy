@@ -29,6 +29,19 @@ pub fn execute(all: bool, yes: bool) -> Result<()> {
         }
     }
 
+    // Remove workspace build fingerprints
+    let cache = config::cache_dir(&project);
+    if cache.exists() {
+        if let Ok(entries) = std::fs::read_dir(&cache) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("workspace-build-fingerprint-") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     if all {
         // Confirm before deleting dependency cache
         if !yes {
