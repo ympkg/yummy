@@ -409,9 +409,10 @@ impl YmConfig {
     }
 
     /// Resolve a dependency key to Maven `groupId:artifactId` format.
-    /// - `@alias` → look up global registry (~/.ym/registry.json) → `groupId:artifactId`
-    /// - `@scope/name` → look up ym.json `scopeMapping` → `groupId:name` (backward compat)
-    /// - `groupId:artifactId` → pass through
+    /// Priority: ym.json scopeMapping > global registry (~/.ym/registry.json) > pass through.
+    /// scopeMapping supports:
+    /// - Exact: `"@scope/name" → "groupId:artifactId"`
+    /// - Prefix: `"@scope" → "groupId"` (constructs `groupId:name`)
     /// Return resolutions with keys resolved to Maven coordinates.
     pub fn resolved_resolutions(&self) -> BTreeMap<String, String> {
         match self.resolutions {
@@ -425,19 +426,26 @@ impl YmConfig {
 
     pub fn resolve_key(&self, key: &str) -> String {
         if key.starts_with('@') {
-            // Global registry: @alias → groupId:artifactId (exact match)
-            if let Some(coord) = global_registry().get(key) {
-                return coord.clone();
-            }
-            // Backward compat: @scope/name → scopeMapping lookup
-            if let Some(slash_idx) = key.find('/') {
-                let scope = &key[..slash_idx];
-                let name = &key[slash_idx + 1..];
-                if let Some(ref mapping) = self.scope_mapping {
+            // 1. ym.json scopeMapping takes priority (project-specific)
+            if let Some(ref mapping) = self.scope_mapping {
+                // 1a. Exact key match: "@scope/name" → "groupId:artifactId"
+                if let Some(coord) = mapping.get(key) {
+                    if coord.contains(':') {
+                        return coord.clone();
+                    }
+                }
+                // 1b. Scope prefix match: "@scope" → groupId, construct groupId:name
+                if let Some(slash_idx) = key.find('/') {
+                    let scope = &key[..slash_idx];
+                    let name = &key[slash_idx + 1..];
                     if let Some(group_id) = mapping.get(scope) {
                         return format!("{}:{}", group_id, name);
                     }
                 }
+            }
+            // 2. Fallback to global registry (~/.ym/registry.json)
+            if let Some(coord) = global_registry().get(key) {
+                return coord.clone();
             }
         }
         key.to_string()
