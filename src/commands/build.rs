@@ -1148,21 +1148,36 @@ fn should_skip_packaging(project: &Path, fingerprint: &str, output_jar: &Path) -
     if !output_jar.exists() {
         return false;
     }
-    let fp_path = project.join(config::CACHE_DIR).join("packaging-fingerprint");
-    match std::fs::read_to_string(&fp_path) {
-        Ok(stored) => stored.trim() == fingerprint,
-        Err(_) => false,
-    }
+    let name = project.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let fps = load_packaging_fingerprints(project);
+    fps.get(&name).map(|s| s.as_str()) == Some(fingerprint)
 }
 
 /// Save the packaging fingerprint after a successful build.
 fn save_packaging_fingerprint(project: &Path, fingerprint: &str) -> Result<()> {
-    let fp_path = project.join(config::CACHE_DIR).join("packaging-fingerprint");
+    let name = project.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let fp_path = packaging_fingerprints_path(project);
     if let Some(parent) = fp_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&fp_path, fingerprint)?;
+    let mut fps = load_packaging_fingerprints(project);
+    fps.insert(name, fingerprint.to_string());
+    let json = serde_json::to_string_pretty(&fps)?;
+    std::fs::write(&fp_path, json)?;
     Ok(())
+}
+
+fn packaging_fingerprints_path(project: &Path) -> PathBuf {
+    let root = config::find_workspace_root(project).unwrap_or_else(|| project.to_path_buf());
+    root.join(config::CACHE_DIR).join("packaging-fingerprints.json")
+}
+
+fn load_packaging_fingerprints(project: &Path) -> std::collections::HashMap<String, String> {
+    let fp_path = packaging_fingerprints_path(project);
+    std::fs::read_to_string(&fp_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Compute a workspace-level build fingerprint from source mtimes, config mtimes, and dep state.

@@ -600,7 +600,11 @@ fn start_java_process(
     for arg in jvm_args {
         cmd.arg(arg);
     }
-    cmd.arg("-cp").arg(&cp).arg(main_class);
+
+    // Use argfile to avoid "Argument list too long" (E2BIG) on large classpaths
+    let argfile = std::env::temp_dir().join(format!("ym-cp-{}.txt", std::process::id()));
+    std::fs::write(&argfile, format!("-cp\n{}\n{}", cp, main_class))?;
+    cmd.arg(format!("@{}", argfile.display()));
 
     // Create a new process group so we can kill the entire tree on stop
     #[cfg(unix)]

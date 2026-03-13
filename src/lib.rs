@@ -205,6 +205,18 @@ enum YmCommands {
         /// Remove credentials for a registry URL
         #[arg(long)]
         remove: Option<String>,
+        /// Registry URL to login to (for CI/non-interactive use)
+        #[arg(long)]
+        registry_url: Option<String>,
+        /// Registry name from [registries] in ym.json (resolves URL automatically)
+        #[arg(long)]
+        registry: Option<String>,
+        /// Username (for CI/non-interactive use)
+        #[arg(long)]
+        username: Option<String>,
+        /// Password (for CI/non-interactive use)
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Show project and environment info
     Info {
@@ -497,8 +509,15 @@ fn ym_main() -> Result<()> {
         YmCommands::Publish { target, registry, dry_run } => {
             commands::publish::execute(target, registry.as_deref(), dry_run)
         }
-        YmCommands::Login { list, remove } => {
-            commands::login::execute(list, remove.as_deref())
+        YmCommands::Login { list, remove, registry_url, registry, username, password } => {
+            commands::login::execute(
+                list,
+                remove.as_deref(),
+                registry_url.as_deref(),
+                registry.as_deref(),
+                username.as_deref(),
+                password.as_deref(),
+            )
         }
         YmCommands::Info { json } => commands::info::execute(json),
         YmCommands::Tree { depth, json, flat, dot, reverse } => {

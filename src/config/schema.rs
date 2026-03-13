@@ -129,6 +129,10 @@ pub struct RegistrySpec {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 /// Script value — either a simple command string or a detailed spec with timeout
@@ -220,6 +224,20 @@ impl RegistryValue {
         match self {
             RegistryValue::Simple(_) => None,
             RegistryValue::Detailed(spec) => spec.scope.as_deref(),
+        }
+    }
+
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            RegistryValue::Simple(_) => None,
+            RegistryValue::Detailed(spec) => spec.username.as_deref(),
+        }
+    }
+
+    pub fn password(&self) -> Option<&str> {
+        match self {
+            RegistryValue::Simple(_) => None,
+            RegistryValue::Detailed(spec) => spec.password.as_deref(),
         }
     }
 }
@@ -388,16 +406,18 @@ impl YmConfig {
                 }
             }
         }
-        // Environment variables: ${env.VAR_NAME}
-        if result.contains("${env.") {
+        // Environment variables: ${env.VAR_NAME} or ${VAR_NAME}
+        if result.contains("${") {
             result = Self::resolve_env_vars(&result);
         }
         result
     }
 
-    /// Resolve `${env.VAR_NAME}` placeholders with environment variable values.
-    fn resolve_env_vars(s: &str) -> String {
+    /// Resolve `${env.VAR_NAME}` and `${VAR_NAME}` placeholders with environment variable values.
+    /// Both syntaxes are supported; `${env.VAR}` is the legacy form, `${VAR}` is the short form.
+    pub fn resolve_env_vars(s: &str) -> String {
         let mut result = s.to_string();
+        // First resolve ${env.VAR} (legacy)
         while let Some(start) = result.find("${env.") {
             let rest = &result[start + 6..];
             if let Some(end) = rest.find('}') {
@@ -408,7 +428,31 @@ impl YmConfig {
                 break;
             }
         }
-        result
+        // Then resolve ${VAR} (short form) — skip anything already resolved
+        let mut out = String::new();
+        let mut remaining = result.as_str();
+        while let Some(start) = remaining.find("${") {
+            out.push_str(&remaining[..start]);
+            let rest = &remaining[start + 2..];
+            if let Some(end) = rest.find('}') {
+                let var_name = &rest[..end];
+                // Only resolve if it looks like an env var name (uppercase, digits, underscores)
+                if !var_name.is_empty() && var_name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+                    let value = std::env::var(var_name).unwrap_or_default();
+                    out.push_str(&value);
+                } else {
+                    // Not an env var pattern, keep as-is
+                    out.push_str(&remaining[start..start + 2 + end + 1]);
+                }
+                remaining = &rest[end + 1..];
+            } else {
+                out.push_str(&remaining[start..]);
+                remaining = "";
+                break;
+            }
+        }
+        out.push_str(remaining);
+        out
     }
 
     /// Iterate all dependencies: `[dependencies]` + `[devDependencies]`.
@@ -710,7 +754,7 @@ impl YmConfig {
         if let Some(ref registries) = self.registries {
             for value in registries.values() {
                 let url = value.url();
-                let resolved_url = if url.contains("${env.") {
+                let resolved_url = if url.contains("${") {
                     Self::resolve_env_vars(url)
                 } else {
                     url.to_string()

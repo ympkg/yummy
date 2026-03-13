@@ -3,7 +3,14 @@ use console::style;
 use dialoguer::{Input, Password};
 use std::collections::BTreeMap;
 
-pub fn execute(list: bool, remove: Option<&str>) -> Result<()> {
+pub fn execute(
+    list: bool,
+    remove: Option<&str>,
+    registry_url: Option<&str>,
+    registry_name: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
     let creds_path = credentials_path();
 
     if list {
@@ -14,18 +21,58 @@ pub fn execute(list: bool, remove: Option<&str>) -> Result<()> {
         return remove_credentials(&creds_path, url);
     }
 
-    // Interactive login
-    let registry: String = Input::new()
-        .with_prompt("Registry URL")
-        .interact_text()?;
+    // Resolve registry URL: --registry-url takes priority, then --registry (lookup from ym.json)
+    let resolved_url = if let Some(url) = registry_url {
+        Some(url.to_string())
+    } else if let Some(name) = registry_name {
+        Some(super::publish::resolve_registry_url_by_name(name)?)
+    } else {
+        None
+    };
 
-    let username: String = Input::new()
-        .with_prompt("Username")
-        .interact_text()?;
+    // Non-interactive mode: all required params provided
+    if let (Some(url), Some(user), Some(pass)) = (&resolved_url, username, password) {
+        let mut creds = load_credentials_map(&creds_path);
+        creds.insert(
+            url.trim_end_matches('/').to_string(),
+            serde_json::json!({
+                "username": user,
+                "password": pass
+            }),
+        );
+        save_credentials_map(&creds_path, &creds)?;
+        println!(
+            "  {} Logged in to {}",
+            style("✓").green(),
+            style(url).cyan()
+        );
+        return Ok(());
+    }
 
-    let password = Password::new()
-        .with_prompt("Password")
-        .interact()?;
+    // Interactive login (with optional defaults from flags)
+    let registry: String = if let Some(url) = resolved_url {
+        url
+    } else {
+        Input::new()
+            .with_prompt("Registry URL")
+            .interact_text()?
+    };
+
+    let user: String = if let Some(u) = username {
+        u.to_string()
+    } else {
+        Input::new()
+            .with_prompt("Username")
+            .interact_text()?
+    };
+
+    let pass = if let Some(p) = password {
+        p.to_string()
+    } else {
+        Password::new()
+            .with_prompt("Password")
+            .interact()?
+    };
 
     // Load existing credentials or create new map
     let mut creds = load_credentials_map(&creds_path);
@@ -34,8 +81,8 @@ pub fn execute(list: bool, remove: Option<&str>) -> Result<()> {
     creds.insert(
         registry.trim_end_matches('/').to_string(),
         serde_json::json!({
-            "username": username,
-            "password": password
+            "username": user,
+            "password": pass
         }),
     );
 

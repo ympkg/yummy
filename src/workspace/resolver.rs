@@ -1650,24 +1650,10 @@ fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
     Some(xml[start..end].trim().to_string())
 }
 
-/// Load credentials for the given URL.
-/// Priority: env vars > credentials.json file.
-/// Env vars: YM_REGISTRY_USERNAME + YM_REGISTRY_PASSWORD, or YM_REGISTRY_TOKEN (Bearer).
+/// Load credentials for the given URL from `~/.ym/credentials.json`.
+/// Use `ym login` to store credentials.
 /// File format: { "https://maven.example.com": { "username": "...", "password": "..." } }
 fn load_credentials_for_url(url: &str) -> Option<(String, String)> {
-    // 1. Check environment variables (highest priority)
-    if let (Ok(username), Ok(password)) = (
-        std::env::var("YM_REGISTRY_USERNAME"),
-        std::env::var("YM_REGISTRY_PASSWORD"),
-    ) {
-        return Some((username, password));
-    }
-    // Bearer token as username with empty password (reqwest basic_auth encodes it)
-    if let Ok(token) = std::env::var("YM_REGISTRY_TOKEN") {
-        return Some((token, String::new()));
-    }
-
-    // 2. Check credentials.json file
     let creds_path = crate::home_dir().join(".ym").join("credentials.json");
     let content = std::fs::read_to_string(&creds_path).ok()?;
     let creds: std::collections::BTreeMap<String, serde_json::Value> =

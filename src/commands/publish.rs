@@ -33,7 +33,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
 
     // Generate POM
     let pom_path = project.join("out").join("pom.xml");
-    generate_pom(&project, &cfg, &pom_path)?;
+    generate_pom(&project, &cfg, &pom_path, None)?;
 
     println!(
         "  {} Generated POM for {}@{}",
@@ -43,40 +43,17 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
     );
 
     // Find registry: --registry flag → "default" key → single registry → error
-    let registry_url = if let Some(name) = registry {
-        cfg.registries
-            .as_ref()
-            .and_then(|r| r.get(name))
-            .map(|v| v.url().to_string())
-            .ok_or_else(|| anyhow::anyhow!("Registry '{}' not found in [registries]", name))?
-    } else {
-        let regs = cfg.registries.as_ref();
-        match regs {
-            None => bail!("No [registries] configured in package.toml. Add a registry to publish."),
-            Some(r) if r.is_empty() => bail!("No [registries] configured in package.toml. Add a registry to publish."),
-            Some(r) => {
-                if let Some(v) = r.get("default") {
-                    v.url().to_string()
-                } else if r.len() == 1 {
-                    r.values().next().unwrap().url().to_string()
-                } else {
-                    bail!(
-                        "Multiple registries configured but no 'default' key. Use --registry <name> to specify.\nAvailable: {}",
-                        r.keys().cloned().collect::<Vec<_>>().join(", ")
-                    );
-                }
-            }
-        }
-    };
+    let reg = resolve_registry(&cfg, registry)?;
+    let registry_url = reg.url;
 
-    let jar_path = find_output_jar(&project, &cfg)?;
+    let jar_path = find_output_jar(&project, &cfg, None)?;
     let jar_size = std::fs::metadata(&jar_path).map(|m| m.len()).unwrap_or(0);
 
     // Generate sources JAR
-    let sources_jar = generate_sources_jar(&project, &cfg)?;
+    let sources_jar = generate_sources_jar(&project, &cfg, None)?;
 
     // Generate javadoc JAR (non-fatal if fails)
-    let javadoc_jar = generate_javadoc_jar(&project, &cfg)?;
+    let javadoc_jar = generate_javadoc_jar(&project, &cfg, None)?;
 
     if dry_run {
         println!();
@@ -107,7 +84,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
 
     // Check credentials
     let creds_path = credentials_path();
-    let creds = load_credentials_for_registry(&creds_path, &registry_url)?;
+    let creds = load_credentials_for_registry(&creds_path, &registry_url, reg.inline_creds)?;
 
     println!(
         "  {} publishing {} to {}",
@@ -117,7 +94,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
     );
 
     // Upload JAR + POM + sources JAR + javadoc JAR + checksums + GPG signatures
-    upload_artifact(&jar_path, &pom_path, &sources_jar, javadoc_jar.as_deref(), &cfg, &registry_url, &creds)?;
+    upload_artifact(&jar_path, &pom_path, &sources_jar, javadoc_jar.as_deref(), &cfg, &registry_url, &creds, None)?;
 
     // Sonatype OSSRH staging flow: close + release if the URL looks like Sonatype
     if is_sonatype_url(&registry_url) {
@@ -170,7 +147,11 @@ fn publish_workspace_module(
         bail!("Module '{}' is private. Remove 'private = true' to publish.", module_name);
     }
 
-    let version = module_cfg.version.as_deref().unwrap_or("0.0.0");
+    // Inherit version from root config if module uses { workspace: true }
+    let root_cfg = config::load_config(config_path)?;
+    let version = module_cfg.version.as_deref()
+        .or(root_cfg.version.as_deref())
+        .unwrap_or("0.0.0");
     let module_path = &pkg.path;
 
     // Build the module
@@ -178,7 +159,7 @@ fn publish_workspace_module(
 
     // Generate POM for the module
     let pom_path = module_path.join("out").join("pom.xml");
-    generate_pom(module_path, module_cfg, &pom_path)?;
+    generate_pom(module_path, module_cfg, &pom_path, Some(version))?;
 
     println!(
         "  {} Generated POM for {}@{}",
@@ -189,35 +170,12 @@ fn publish_workspace_module(
 
     // Get registry from root config (registries are defined at root level)
     let root_cfg = config::load_config(config_path)?;
-    let registry_url = if let Some(name) = registry {
-        root_cfg.registries
-            .as_ref()
-            .and_then(|r| r.get(name))
-            .map(|v| v.url().to_string())
-            .ok_or_else(|| anyhow::anyhow!("Registry '{}' not found in [registries]", name))?
-    } else {
-        let regs = root_cfg.registries.as_ref();
-        match regs {
-            None => bail!("No [registries] configured in root package.toml"),
-            Some(r) if r.is_empty() => bail!("No [registries] configured in root package.toml"),
-            Some(r) => {
-                if let Some(v) = r.get("default") {
-                    v.url().to_string()
-                } else if r.len() == 1 {
-                    r.values().next().unwrap().url().to_string()
-                } else {
-                    bail!(
-                        "Multiple registries configured but no 'default' key. Use --registry <name>.\nAvailable: {}",
-                        r.keys().cloned().collect::<Vec<_>>().join(", ")
-                    );
-                }
-            }
-        }
-    };
+    let reg = resolve_registry(&root_cfg, registry)?;
+    let registry_url = reg.url;
 
-    let jar_path = find_output_jar(module_path, module_cfg)?;
-    let sources_jar = generate_sources_jar(module_path, module_cfg)?;
-    let javadoc_jar = generate_javadoc_jar(module_path, module_cfg)?;
+    let jar_path = find_output_jar(module_path, module_cfg, Some(version))?;
+    let sources_jar = generate_sources_jar(module_path, module_cfg, Some(version))?;
+    let javadoc_jar = generate_javadoc_jar(module_path, module_cfg, Some(version))?;
 
     if dry_run {
         let jar_size = std::fs::metadata(&jar_path).map(|m| m.len()).unwrap_or(0);
@@ -233,7 +191,7 @@ fn publish_workspace_module(
     }
 
     let creds_path = credentials_path();
-    let creds = load_credentials_for_registry(&creds_path, &registry_url)?;
+    let creds = load_credentials_for_registry(&creds_path, &registry_url, reg.inline_creds)?;
 
     println!(
         "  {} publishing module {} to {}",
@@ -242,7 +200,7 @@ fn publish_workspace_module(
         style(&registry_url).dim()
     );
 
-    upload_artifact(&jar_path, &pom_path, &sources_jar, javadoc_jar.as_deref(), module_cfg, &registry_url, &creds)?;
+    upload_artifact(&jar_path, &pom_path, &sources_jar, javadoc_jar.as_deref(), module_cfg, &registry_url, &creds, Some(version))?;
 
     if is_sonatype_url(&registry_url) {
         match sonatype_close_and_release(&registry_url, module_cfg, &creds) {
@@ -265,6 +223,7 @@ fn generate_pom(
     project: &Path,
     cfg: &config::schema::YmConfig,
     output: &Path,
+    version_override: Option<&str>,
 ) -> Result<()> {
     // Load workspace graph if we're in a workspace (for module dep mapping)
     let ws = config::find_workspace_root(project)
@@ -344,7 +303,7 @@ fn generate_pom(
 {dep_xml}  </dependencies>
 </project>
 "#,
-        version = cfg.version.as_deref().unwrap_or("0.0.0")
+        version = version_override.or(cfg.version.as_deref()).unwrap_or("0.0.0")
     );
 
     if let Some(parent) = output.parent() {
@@ -355,12 +314,12 @@ fn generate_pom(
 }
 
 /// Generate a sources JAR containing all .java files from src/main/java/.
-fn generate_sources_jar(project: &Path, cfg: &config::schema::YmConfig) -> Result<std::path::PathBuf> {
+fn generate_sources_jar(project: &Path, cfg: &config::schema::YmConfig, version_override: Option<&str>) -> Result<std::path::PathBuf> {
     let source_dir = config::source_dir(project);
     let jar_name = format!(
         "{}-{}-sources.jar",
         cfg.name,
-        cfg.version.as_deref().unwrap_or("0.0.0")
+        version_override.or(cfg.version.as_deref()).unwrap_or("0.0.0")
     );
     let jar_path = project.join("out").join(&jar_name);
 
@@ -400,7 +359,7 @@ fn generate_sources_jar(project: &Path, cfg: &config::schema::YmConfig) -> Resul
 }
 
 /// Generate a Javadoc JAR by running `javadoc` on sources and packaging output.
-fn generate_javadoc_jar(project: &Path, cfg: &config::schema::YmConfig) -> Result<Option<std::path::PathBuf>> {
+fn generate_javadoc_jar(project: &Path, cfg: &config::schema::YmConfig, version_override: Option<&str>) -> Result<Option<std::path::PathBuf>> {
     let source_dir = config::source_dir(project);
     if !source_dir.exists() {
         return Ok(None);
@@ -474,7 +433,7 @@ fn generate_javadoc_jar(project: &Path, cfg: &config::schema::YmConfig) -> Resul
     let jar_name = format!(
         "{}-{}-javadoc.jar",
         cfg.name,
-        cfg.version.as_deref().unwrap_or("0.0.0")
+        version_override.or(cfg.version.as_deref()).unwrap_or("0.0.0")
     );
     let jar_path = project.join("out").join(&jar_name);
 
@@ -498,13 +457,13 @@ fn generate_javadoc_jar(project: &Path, cfg: &config::schema::YmConfig) -> Resul
     Ok(Some(jar_path))
 }
 
-fn find_output_jar(project: &Path, cfg: &config::schema::YmConfig) -> Result<std::path::PathBuf> {
+fn find_output_jar(project: &Path, cfg: &config::schema::YmConfig, version_override: Option<&str>) -> Result<std::path::PathBuf> {
     // For release builds, we should create a JAR from out/classes
     let classes_dir = config::output_classes_dir(project);
     let jar_name = format!(
         "{}-{}.jar",
         cfg.name,
-        cfg.version.as_deref().unwrap_or("0.0.0")
+        version_override.or(cfg.version.as_deref()).unwrap_or("0.0.0")
     );
     let jar_path = project.join("out").join(&jar_name);
 
@@ -524,6 +483,75 @@ fn find_output_jar(project: &Path, cfg: &config::schema::YmConfig) -> Result<std
     Ok(jar_path)
 }
 
+/// Resolved registry info: URL + optional inline credentials.
+struct ResolvedRegistry {
+    url: String,
+    inline_creds: Option<Credentials>,
+}
+
+fn resolve_env(s: &str) -> String {
+    if s.contains("${") {
+        config::schema::YmConfig::resolve_env_vars(s)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Find the RegistryValue from config by name or default.
+fn find_registry_value<'a>(
+    cfg: &'a config::schema::YmConfig,
+    registry: Option<&str>,
+) -> Result<&'a config::schema::RegistryValue> {
+    if let Some(name) = registry {
+        cfg.registries
+            .as_ref()
+            .and_then(|r| r.get(name))
+            .ok_or_else(|| anyhow::anyhow!("Registry '{}' not found in [registries]", name))
+    } else {
+        let regs = cfg.registries.as_ref();
+        match regs {
+            None => bail!("No [registries] configured. Add a registry to publish."),
+            Some(r) if r.is_empty() => bail!("No [registries] configured. Add a registry to publish."),
+            Some(r) => {
+                if let Some(v) = r.get("default") {
+                    Ok(v)
+                } else if r.len() == 1 {
+                    Ok(r.values().next().unwrap())
+                } else {
+                    bail!(
+                        "Multiple registries configured but no 'default' key. Use --registry <name> to specify.\nAvailable: {}",
+                        r.keys().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Resolve registry URL and inline credentials from config.
+fn resolve_registry(cfg: &config::schema::YmConfig, registry: Option<&str>) -> Result<ResolvedRegistry> {
+    let value = find_registry_value(cfg, registry)?;
+    let url = resolve_env(value.url());
+    let inline_creds = match (value.username(), value.password()) {
+        (Some(u), Some(p)) => Some(Credentials {
+            username: resolve_env(u),
+            password: resolve_env(p),
+        }),
+        _ => None,
+    };
+    Ok(ResolvedRegistry { url, inline_creds })
+}
+
+/// Resolve registry URL by name, for use in login command.
+pub fn resolve_registry_url_by_name(registry_name: &str) -> Result<String> {
+    let (_config_path, cfg) = config::load_or_find_config()?;
+    let value = cfg.registries
+        .as_ref()
+        .and_then(|r| r.get(registry_name))
+        .ok_or_else(|| anyhow::anyhow!("Registry '{}' not found in [registries]", registry_name))?;
+    Ok(resolve_env(value.url()))
+}
+
 struct Credentials {
     username: String,
     password: String,
@@ -533,30 +561,20 @@ fn credentials_path() -> std::path::PathBuf {
     crate::home_dir().join(".ym").join("credentials.json")
 }
 
-fn load_credentials_for_registry(path: &Path, registry_url: &str) -> Result<Credentials> {
-    // Priority 1: Environment variables
-    if let (Ok(username), Ok(password)) = (
-        std::env::var("YM_REGISTRY_USERNAME"),
-        std::env::var("YM_REGISTRY_PASSWORD"),
-    ) {
-        return Ok(Credentials { username, password });
-    }
-    if let Ok(token) = std::env::var("YM_REGISTRY_TOKEN") {
-        return Ok(Credentials { username: token, password: String::new() });
-    }
-
-    // Priority 1.5: GitHub Token for GitHub Packages
-    if registry_url.contains("maven.pkg.github.com") {
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            return Ok(Credentials { username: "github-actions".to_string(), password: token });
+/// Load credentials: inline config > credentials.json
+fn load_credentials_for_registry(path: &Path, registry_url: &str, inline: Option<Credentials>) -> Result<Credentials> {
+    // Priority 1: inline credentials from registry config
+    if let Some(creds) = inline {
+        if !creds.username.is_empty() {
+            return Ok(creds);
         }
     }
 
-    // Priority 2: credentials.json file
+    // Priority 2: credentials.json (managed by `ym login`)
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => bail!(
-            "No credentials found for '{}'. Run 'ym login' first, or set YM_REGISTRY_USERNAME/YM_REGISTRY_PASSWORD env vars.",
+            "No credentials found for '{}'. Run 'ym login' or add username/password to registry config.",
             registry_url
         ),
     };
@@ -569,7 +587,6 @@ fn load_credentials_for_registry(path: &Path, registry_url: &str) -> Result<Cred
 
     match entry {
         Some(v) => {
-            // Support both {"username","password"} and {"token"} formats
             if let Some(token) = v.get("token").and_then(|t| t.as_str()) {
                 Ok(Credentials { username: token.to_string(), password: String::new() })
             } else {
@@ -580,7 +597,7 @@ fn load_credentials_for_registry(path: &Path, registry_url: &str) -> Result<Cred
             }
         }
         None => bail!(
-            "No credentials found for '{}'. Run 'ym login' first, or set YM_REGISTRY_USERNAME/YM_REGISTRY_PASSWORD env vars.",
+            "No credentials found for '{}'. Run 'ym login' or add username/password to registry config.",
             registry_url
         ),
     }
@@ -667,10 +684,11 @@ fn upload_artifact(
     cfg: &config::schema::YmConfig,
     registry: &str,
     creds: &Credentials,
+    version_override: Option<&str>,
 ) -> Result<()> {
     let group_id = &cfg.group_id;
     let artifact_id = &cfg.name;
-    let version = cfg.version.as_deref().unwrap_or("0.0.0");
+    let version = version_override.or(cfg.version.as_deref()).unwrap_or("0.0.0");
     let group_path = group_id.replace('.', "/");
     let base_url = format!(
         "{}/{}/{}/{}",

@@ -16,43 +16,79 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
         return execute_json(&project, &cfg, target.as_deref(), java_version);
     }
 
-    // .idea/ is created by IDEA itself — skip silently if not present
-    if !project.join(".idea").is_dir() {
+    // Non-JSON mode: only generate misc.xml (JDK config) for bootstrapping.
+    // Module/library/compiler configuration is handled by the Yummy IntelliJ plugin
+    // via External System integration (ymc idea --json).
+    let idea_dir = project.join(".idea");
+    if !idea_dir.is_dir() {
         return Ok(());
     }
 
-    if cfg.workspaces.is_some() {
-        let ws = WorkspaceGraph::build(&project)?;
+    // misc.xml - JDK version + ExternalStorageConfigurationManager (prevents .iml generation)
+    let misc = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ExternalStorageConfigurationManager" enabled="true" />
+  <component name="ProjectRootManager" version="2" languageLevel="JDK_{java_version}" default="true" project-jdk-name="{java_version}" project-jdk-type="JavaSDK">
+    <output url="file://$PROJECT_DIR$/out" />
+  </component>
+</project>
+"#
+    );
+    std::fs::write(idea_dir.join("misc.xml"), misc)?;
 
-        let packages = if let Some(ref target) = target {
-            // Generate for target and its dependencies
-            ws.transitive_closure(target)?
+    // Download sources if requested (still useful for offline caching)
+    if download_sources {
+        let jars = if cfg.workspaces.is_some() {
+            let ws = WorkspaceGraph::build(&project)?;
+            let root_config_path = project.join(config::CONFIG_FILE);
+            let root_cfg = config::load_config(&root_config_path)?;
+            let root_registries = root_cfg.registry_entries();
+            let root_resolutions = root_cfg.resolved_resolutions();
+            let cache_dir = config::maven_cache_dir(&project);
+
+            let packages = if let Some(ref target) = target {
+                ws.transitive_closure(target)?
+            } else {
+                let mut all = ws.all_packages();
+                all.sort();
+                all
+            };
+
+            let mut all_module_deps = Vec::new();
+            for pkg_name in &packages {
+                let pkg = ws.get_package(pkg_name).unwrap();
+                let deps = pkg.config.maven_dependencies_with_root(&root_cfg);
+                all_module_deps.push((pkg_name.clone(), deps));
+            }
+
+            let mut resolved = config::load_resolved_cache(&project)?;
+            let exclusions: Vec<String> = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
+            let per_module_jars = crate::workspace::resolver::resolve_workspace_deps_with_resolutions(
+                &all_module_deps, &cache_dir, &mut resolved, &root_registries, &exclusions, &root_resolutions,
+            )?;
+            config::save_resolved_cache(&project, &resolved)?;
+
+            let mut all_jars: Vec<PathBuf> = Vec::new();
+            for jars in per_module_jars.values() {
+                all_jars.extend(jars.clone());
+            }
+            all_jars.sort();
+            all_jars.dedup();
+            all_jars
         } else {
-            // No target: generate for ALL modules
-            let mut all = ws.all_packages();
-            all.sort();
-            all
+            super::build::resolve_deps(&project, &cfg)?
         };
 
-        generate_idea_project(&project, &packages, &ws, java_version, download_sources)?;
-
-        println!(
-            "{} IDEA project ({} modules)",
-            style(format!("{:>12}", "Finished")).green().bold(),
-            packages.len()
-        );
-    } else {
-        // Single project mode
-        generate_single_project_idea(&project, &cfg, java_version, download_sources)?;
-
-        println!(
-            "{} IDEA project for {}",
-            style(format!("{:>12}", "Finished")).green().bold(),
-            style(&cfg.name).bold()
-        );
+        for jar in &jars {
+            make_sources_section(jar, true);
+        }
     }
 
-    println!("  Open this directory in IntelliJ IDEA to get started.");
+    println!(
+        "{} IDEA project (misc.xml updated, use Yummy plugin for full sync)",
+        style(format!("{:>12}", "Finished")).green().bold(),
+    );
     Ok(())
 }
 
@@ -357,241 +393,6 @@ fn detect_source_folders_structured(project: &Path) -> Vec<IdeaSourceFolder> {
     folders
 }
 
-fn generate_idea_project(
-    root: &Path,
-    packages: &[String],
-    ws: &WorkspaceGraph,
-    java_version: &str,
-    download_sources: bool,
-) -> Result<()> {
-    let idea_dir = root.join(".idea");
-
-    // misc.xml - JDK version
-    let misc = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="ProjectRootManager" version="2" languageLevel="JDK_{java_version}" default="true" project-jdk-name="{java_version}" project-jdk-type="JavaSDK">
-    <output url="file://$PROJECT_DIR$/out" />
-  </component>
-</project>
-"#
-    );
-    std::fs::write(idea_dir.join("misc.xml"), misc)?;
-
-    // Generate .iml for each module
-    let mut module_refs = Vec::new();
-    let libraries_dir = idea_dir.join("libraries");
-    std::fs::create_dir_all(&libraries_dir)?;
-    let modules_dir = idea_dir.join("modules");
-    std::fs::create_dir_all(&modules_dir)?;
-
-    let mut all_jars: Vec<PathBuf> = Vec::new();
-
-    // Pre-load root config ONCE
-    let root_config_path = root.join(config::CONFIG_FILE);
-    let root_cfg = config::load_config(&root_config_path)?;
-    let root_registries = root_cfg.registry_entries();
-    let root_resolutions = root_cfg.resolved_resolutions();
-    let shared_cache_dir = config::maven_cache_dir(root);
-
-    for pkg_name in packages {
-        let pkg = ws.get_package(pkg_name).unwrap();
-        let rel_path = pathdiff(root, &pkg.path);
-        let iml_path = modules_dir.join(format!("{}.iml", pkg_name));
-
-        // Resolve Maven deps for this package
-        let jars = super::build::resolve_deps_no_download_with_root(
-            &pkg.path, &pkg.config, &root_cfg, &shared_cache_dir,
-            &root_registries, &root_resolutions,
-        )?;
-        all_jars.extend(jars.clone());
-
-        // Build module dependencies
-        let ws_deps = pkg.config.workspace_module_deps();
-
-        let mut dep_entries = String::new();
-        for dep in &ws_deps {
-            dep_entries.push_str(&format!(
-                "    <orderEntry type=\"module\" module-name=\"{}\" />\n",
-                dep
-            ));
-        }
-
-        // Add library dependencies with scope mapping
-        for jar in &jars {
-            let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
-            let scope_attr = jar_to_idea_scope(jar, &pkg.config);
-            dep_entries.push_str(&format!(
-                "    <orderEntry type=\"library\" name=\"{}\" level=\"project\"{} />\n",
-                jar_name, scope_attr
-            ));
-        }
-
-        let base_url = format!("$PROJECT_DIR$/{}", rel_path);
-            let source_folders = detect_source_folders(&pkg.path, &base_url);
-
-        let iml = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<module type="JAVA_MODULE" version="4">
-  <component name="NewModuleRootManager" inherit-compiler-output="false">
-    <output url="file://{base_url}/out/classes" />
-    <output-test url="file://{base_url}/out/test-classes" />
-    <content url="file://{base_url}">
-{source_folders}      <excludeFolder url="file://{base_url}/out" />
-    </content>
-    <orderEntry type="inheritedJdk" />
-    <orderEntry type="sourceFolder" forTests="false" />
-{dep_entries}  </component>
-</module>
-"#
-        );
-        std::fs::write(&iml_path, iml)?;
-
-        module_refs.push(format!(
-            "      <module fileurl=\"file://$PROJECT_DIR$/.idea/modules/{name}.iml\" filepath=\"$PROJECT_DIR$/.idea/modules/{name}.iml\" />",
-            name = pkg_name
-        ));
-    }
-
-    // Generate library XMLs for Maven deps
-    all_jars.sort();
-    all_jars.dedup();
-    for jar in &all_jars {
-        let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
-        let jar_abs = to_idea_path(&jar.to_string_lossy());
-        let sources_section = make_sources_section(jar, download_sources);
-        let lib_xml = format!(
-            r#"<component name="libraryTable">
-  <library name="{jar_name}">
-    <CLASSES>
-      <root url="jar://{jar_abs}!/" />
-    </CLASSES>
-{sources_section}  </library>
-</component>
-"#
-        );
-        std::fs::write(
-            libraries_dir.join(format!("{}.xml", jar_name)),
-            lib_xml,
-        )?;
-    }
-
-    // compiler.xml — annotation processor config
-    generate_compiler_xml(&idea_dir, packages, ws)?;
-
-    // modules.xml
-    let modules_xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="ProjectModuleManager">
-    <modules>
-{}
-    </modules>
-  </component>
-</project>
-"#,
-        module_refs.join("\n")
-    );
-    std::fs::write(idea_dir.join("modules.xml"), modules_xml)?;
-
-    Ok(())
-}
-
-fn generate_single_project_idea(
-    project: &Path,
-    cfg: &config::schema::YmConfig,
-    java_version: &str,
-    download_sources: bool,
-) -> Result<()> {
-    let idea_dir = project.join(".idea");
-
-    let misc = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="ProjectRootManager" version="2" languageLevel="JDK_{java_version}" default="true" project-jdk-name="{java_version}" project-jdk-type="JavaSDK">
-    <output url="file://$PROJECT_DIR$/out" />
-  </component>
-</project>
-"#
-    );
-    std::fs::write(idea_dir.join("misc.xml"), misc)?;
-
-    // Resolve deps for library references
-    let jars = super::build::resolve_deps_no_download(project, cfg)?;
-    let libraries_dir = idea_dir.join("libraries");
-    std::fs::create_dir_all(&libraries_dir)?;
-
-    let mut dep_entries = String::new();
-    for jar in &jars {
-        let jar_name = jar.file_stem().unwrap().to_string_lossy().to_string();
-        let jar_abs = to_idea_path(&jar.to_string_lossy());
-        let scope_attr = jar_to_idea_scope(jar, cfg);
-        dep_entries.push_str(&format!(
-            "    <orderEntry type=\"library\" name=\"{}\" level=\"project\"{} />\n",
-            jar_name, scope_attr
-        ));
-
-        let sources_section = make_sources_section(jar, download_sources);
-        let lib_xml = format!(
-            r#"<component name="libraryTable">
-  <library name="{jar_name}">
-    <CLASSES>
-      <root url="jar://{jar_abs}!/" />
-    </CLASSES>
-{sources_section}  </library>
-</component>
-"#
-        );
-        std::fs::write(
-            libraries_dir.join(format!("{}.xml", jar_name)),
-            lib_xml,
-        )?;
-    }
-
-    let base_url = "$PROJECT_DIR$";
-    let source_folders = detect_source_folders(project, base_url);
-
-    let iml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<module type="JAVA_MODULE" version="4">
-  <component name="NewModuleRootManager" inherit-compiler-output="false">
-    <output url="file://{base_url}/out/classes" />
-    <output-test url="file://{base_url}/out/test-classes" />
-    <content url="file://{base_url}">
-{source_folders}      <excludeFolder url="file://{base_url}/out" />
-    </content>
-    <orderEntry type="inheritedJdk" />
-    <orderEntry type="sourceFolder" forTests="false" />
-{dep_entries}  </component>
-</module>
-"#
-    );
-    let modules_dir = idea_dir.join("modules");
-    std::fs::create_dir_all(&modules_dir)?;
-    std::fs::write(
-        modules_dir.join(format!("{}.iml", cfg.name)),
-        iml,
-    )?;
-
-    // compiler.xml — annotation processor config
-    generate_compiler_xml_single(&idea_dir, project, cfg)?;
-
-    let modules_xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="ProjectModuleManager">
-    <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/modules/{name}.iml" filepath="$PROJECT_DIR$/.idea/modules/{name}.iml" />
-    </modules>
-  </component>
-</project>
-"#,
-        name = cfg.name
-    );
-    std::fs::write(idea_dir.join("modules.xml"), modules_xml)?;
-
-    Ok(())
-}
 
 /// Generate the <SOURCES> section for a library XML.
 /// If download_sources is true, tries to download the -sources.jar next to the main JAR.
@@ -660,100 +461,6 @@ fn make_sources_section(jar: &std::path::Path, download_sources: bool) -> String
     }
 }
 
-/// Generate `.idea/compiler.xml` with annotation processor config for workspace mode.
-fn generate_compiler_xml(
-    idea_dir: &Path,
-    packages: &[String],
-    ws: &WorkspaceGraph,
-) -> Result<()> {
-    let mut ap_entries = Vec::new();
-
-    for pkg_name in packages {
-        let pkg = ws.get_package(pkg_name).unwrap();
-        let jars = super::build::resolve_deps_no_download(&pkg.path, &pkg.config)?;
-        let ap_jars = collect_annotation_processor_jars(&pkg.config, &jars);
-        if !ap_jars.is_empty() {
-            ap_entries.push((pkg_name.clone(), ap_jars));
-        }
-    }
-
-    if ap_entries.is_empty() {
-        return Ok(());
-    }
-
-    let mut profiles = String::new();
-    for (module_name, jars) in &ap_entries {
-        let mut processor_path = String::new();
-        for jar in jars {
-            let jar_abs = to_idea_path(&jar.to_string_lossy());
-            processor_path.push_str(&format!(
-                "        <entry name=\"{}\" />\n",
-                jar_abs
-            ));
-        }
-        profiles.push_str(&format!(
-            r#"    <profile name="{module_name}" enabled="true">
-      <processorPath useClasspath="false">
-{processor_path}      </processorPath>
-      <module name="{module_name}" />
-    </profile>
-"#
-        ));
-    }
-
-    let compiler_xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="CompilerConfiguration">
-    <annotationProcessing>
-{profiles}    </annotationProcessing>
-  </component>
-</project>
-"#
-    );
-    std::fs::write(idea_dir.join("compiler.xml"), compiler_xml)?;
-    Ok(())
-}
-
-/// Generate `.idea/compiler.xml` with annotation processor config for single project mode.
-fn generate_compiler_xml_single(
-    idea_dir: &Path,
-    project: &Path,
-    cfg: &config::schema::YmConfig,
-) -> Result<()> {
-    let jars = super::build::resolve_deps_no_download(project, cfg)?;
-    let ap_jars = collect_annotation_processor_jars(cfg, &jars);
-
-    if ap_jars.is_empty() {
-        return Ok(());
-    }
-
-    let mut processor_path = String::new();
-    for jar in &ap_jars {
-        let jar_abs = to_idea_path(&jar.to_string_lossy());
-        processor_path.push_str(&format!(
-            "        <entry name=\"{}\" />\n",
-            jar_abs
-        ));
-    }
-
-    let compiler_xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="CompilerConfiguration">
-    <annotationProcessing>
-    <profile name="Default" enabled="true">
-      <processorPath useClasspath="false">
-{processor_path}      </processorPath>
-    </profile>
-    </annotationProcessing>
-  </component>
-</project>
-"#
-    );
-    std::fs::write(idea_dir.join("compiler.xml"), compiler_xml)?;
-    Ok(())
-}
 
 /// Collect annotation processor JARs from config and classpath.
 /// Uses explicit `compiler.annotationProcessors` if set, otherwise auto-discovers.
@@ -794,88 +501,6 @@ fn collect_annotation_processor_jars(
         .collect()
 }
 
-/// Detect source/test/resource folders for IDEA project generation.
-/// Supports both Maven convention (src/main/java, src/test/java) and flat (src/, test/).
-/// `base_url` is the IDEA URL prefix for the module root (e.g. "$PROJECT_DIR$" or "$PROJECT_DIR$/submodule").
-fn detect_source_folders(project: &Path, base_url: &str) -> String {
-    let mut folders = String::new();
-
-    // Main sources
-    let maven_src = project.join("src").join("main").join("java");
-    if maven_src.exists() {
-        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/main/java\" isTestSource=\"false\" />\n", base_url));
-    } else if project.join("src").exists() {
-        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src\" isTestSource=\"false\" />\n", base_url));
-    }
-
-    // Main resources
-    let maven_res = project.join("src").join("main").join("resources");
-    if maven_res.exists() {
-        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/main/resources\" type=\"java-resource\" />\n", base_url));
-    }
-
-    // Test sources
-    let maven_test = project.join("src").join("test").join("java");
-    if maven_test.exists() {
-        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/test/java\" isTestSource=\"true\" />\n", base_url));
-    } else if project.join("test").exists() {
-        folders.push_str(&format!("      <sourceFolder url=\"file://{}/test\" isTestSource=\"true\" />\n", base_url));
-    }
-
-    // Test resources
-    let maven_test_res = project.join("src").join("test").join("resources");
-    if maven_test_res.exists() {
-        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src/test/resources\" type=\"java-test-resource\" />\n", base_url));
-    }
-
-    // Fallback if nothing detected
-    if folders.is_empty() {
-        folders.push_str(&format!("      <sourceFolder url=\"file://{}/src\" isTestSource=\"false\" />\n", base_url));
-    }
-
-    folders
-}
-
-/// Map a JAR file to its IDEA scope attribute based on the dependency's scope in config.
-/// Returns empty string for COMPILE (default), or ` scope="RUNTIME"` etc.
-fn jar_to_idea_scope(jar: &Path, cfg: &config::schema::YmConfig) -> String {
-    use config::schema::{is_maven_dep, artifact_id_from_key};
-    // Extract artifactId from JAR filename to match against dependencies
-    let jar_stem = jar.file_stem().unwrap_or_default().to_string_lossy();
-
-    if let Some(ref deps) = cfg.dependencies {
-        for (key, value) in deps {
-            if !is_maven_dep(key) { continue; }
-            let artifact_id = artifact_id_from_key(key);
-            if jar_stem.starts_with(artifact_id) {
-                return match value.scope() {
-                    "runtime" => " scope=\"RUNTIME\"".to_string(),
-                    "provided" => " scope=\"PROVIDED\"".to_string(),
-                    "test" => " scope=\"TEST\"".to_string(),
-                    _ => String::new(),
-                };
-            }
-        }
-    }
-    // devDependencies → PROVIDED
-    if let Some(ref dev_deps) = cfg.dev_dependencies {
-        for (key, _value) in dev_deps {
-            if !is_maven_dep(key) { continue; }
-            let artifact_id = artifact_id_from_key(key);
-            if jar_stem.starts_with(artifact_id) {
-                return " scope=\"PROVIDED\"".to_string();
-            }
-        }
-    }
-    String::new() // transitive deps default to COMPILE
-}
-
-fn pathdiff(base: &Path, target: &Path) -> String {
-    target
-        .strip_prefix(base)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| target.to_string_lossy().to_string())
-}
 
 /// Detect if running under WSL (Windows Subsystem for Linux).
 fn is_wsl() -> bool {
@@ -927,37 +552,6 @@ fn to_idea_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_detect_source_folders_fallback() {
-        let tmpdir = std::env::temp_dir().join("ym-idea-src-test");
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        std::fs::create_dir_all(&tmpdir).unwrap();
-
-        // No src dir at all -> fallback
-        let folders = detect_source_folders(&tmpdir, "$MODULE_DIR$");
-        assert!(folders.contains("$MODULE_DIR$/src"));
-
-        let _ = std::fs::remove_dir_all(&tmpdir);
-    }
-
-    #[test]
-    fn test_detect_source_folders_maven_convention() {
-        let tmpdir = std::env::temp_dir().join("ym-idea-maven-test");
-        let _ = std::fs::remove_dir_all(&tmpdir);
-        std::fs::create_dir_all(tmpdir.join("src/main/java")).unwrap();
-        std::fs::create_dir_all(tmpdir.join("src/test/java")).unwrap();
-        std::fs::create_dir_all(tmpdir.join("src/main/resources")).unwrap();
-
-        let folders = detect_source_folders(&tmpdir, "$MODULE_DIR$");
-        assert!(folders.contains("src/main/java"));
-        assert!(folders.contains("src/test/java"));
-        assert!(folders.contains("src/main/resources"));
-
-        let _ = std::fs::remove_dir_all(&tmpdir);
-    }
-
     #[test]
     fn test_to_idea_path_mnt_conversion() {
         // Only test the path conversion logic (not WSL detection)
@@ -971,19 +565,5 @@ mod tests {
                 assert_eq!(result, "C:/Users/foo/project");
             }
         }
-    }
-
-    #[test]
-    fn test_pathdiff_relative() {
-        let base = Path::new("/home/user/project");
-        let target = Path::new("/home/user/project/modules/core");
-        assert_eq!(pathdiff(base, target), "modules/core");
-    }
-
-    #[test]
-    fn test_pathdiff_absolute_fallback() {
-        let base = Path::new("/home/user/project");
-        let target = Path::new("/other/path");
-        assert_eq!(pathdiff(base, target), "/other/path");
     }
 }
