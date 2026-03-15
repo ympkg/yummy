@@ -135,6 +135,34 @@ pub struct RegistrySpec {
     pub password: Option<String>,
 }
 
+/// Resolution value: version override string, or `false` to exclude a dependency.
+/// Examples:
+///   "org.slf4j:slf4j-simple": "2.0.17"  → force version
+///   "org.slf4j:slf4j-simple": false       → exclude from dependency tree
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ResolutionValue {
+    /// Version override: `"2.0.17"`
+    Version(String),
+    /// Exclusion: `false`
+    Exclude(bool),
+}
+
+impl ResolutionValue {
+    /// Returns true if this resolution excludes the dependency.
+    pub fn is_excluded(&self) -> bool {
+        matches!(self, ResolutionValue::Exclude(false))
+    }
+
+    /// Returns the version if this is a version override.
+    pub fn version(&self) -> Option<&str> {
+        match self {
+            ResolutionValue::Version(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
 /// Script value — either a simple command string or a detailed spec with timeout
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
@@ -328,9 +356,10 @@ pub struct YmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scripts: Option<BTreeMap<String, ScriptValue>>,
 
-    /// Version overrides (always win over any other version)
+    /// Version overrides and exclusions.
+    /// String value = force version, `false` = exclude from dependency tree.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolutions: Option<BTreeMap<String, String>>,
+    pub resolutions: Option<BTreeMap<String, ResolutionValue>>,
 
     /// Maven registries
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -477,14 +506,26 @@ impl YmConfig {
     /// scopeMapping supports:
     /// - Exact: `"@scope/name" → "groupId:artifactId"`
     /// - Prefix: `"@scope" → "groupId"` (constructs `groupId:name`)
-    /// Return resolutions with keys resolved to Maven coordinates.
+    /// Return version overrides from resolutions (keys resolved to Maven coordinates).
     pub fn resolved_resolutions(&self) -> BTreeMap<String, String> {
         match self.resolutions {
             Some(ref res) => res
                 .iter()
-                .map(|(k, v)| (self.resolve_key(k), v.clone()))
+                .filter_map(|(k, v)| v.version().map(|ver| (self.resolve_key(k), ver.to_string())))
                 .collect(),
             None => BTreeMap::new(),
+        }
+    }
+
+    /// Return excluded dependency coordinates from resolutions (entries with `false`).
+    pub fn resolved_exclusions(&self) -> Vec<String> {
+        match self.resolutions {
+            Some(ref res) => res
+                .iter()
+                .filter(|(_, v)| v.is_excluded())
+                .map(|(k, _)| self.resolve_key(k))
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -726,7 +767,10 @@ impl YmConfig {
         // [resolutions]
         if let Some(ref res) = self.resolutions {
             for (k, v) in res {
-                let _ = writeln!(data, "res:{}={}", k, v);
+                match v {
+                    ResolutionValue::Version(ver) => { let _ = writeln!(data, "res:{}={}", k, ver); },
+                    ResolutionValue::Exclude(b) => { let _ = writeln!(data, "res:{}=exclude:{}", k, b); },
+                }
             }
         }
 

@@ -63,7 +63,8 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
             }
 
             let mut resolved = config::load_resolved_cache(&project)?;
-            let exclusions: Vec<String> = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
+            let mut exclusions: Vec<String> = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
+            exclusions.extend(root_cfg.resolved_exclusions());
             let per_module_jars = crate::workspace::resolver::resolve_workspace_deps_with_resolutions(
                 &all_module_deps, &cache_dir, &mut resolved, &root_registries, &exclusions, &root_resolutions,
             )?;

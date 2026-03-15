@@ -419,7 +419,8 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
     let cache = config::maven_cache_dir(root);
     let mut resolved = config::load_resolved_cache_checked(root, root_cfg)?;
     let registries = root_cfg.registry_entries();
-    let exclusions = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
+    let mut exclusions = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
+    exclusions.extend(root_cfg.resolved_exclusions());
 
     let resolutions = root_cfg.resolved_resolutions();
     // Spinner stays alive during resolve — resolver updates spinner message with progress
@@ -1635,6 +1636,15 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
     let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
+    exclusions.extend(cfg.resolved_exclusions());
+    // Also inherit exclusions from workspace root
+    if let Some(ws_root) = config::find_workspace_root(project) {
+        if ws_root != project {
+            if let Ok(root_cfg) = config::load_config(&ws_root.join(config::CONFIG_FILE)) {
+                exclusions.extend(root_cfg.resolved_exclusions());
+            }
+        }
+    }
 
     // Build dep_scopes: map each direct dep's GA to its declared scope
     let dep_scopes = build_dep_scope_map(cfg, scopes);
@@ -1779,6 +1789,7 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
+    exclusions.extend(cfg.resolved_exclusions());
 
     // Build dep_scopes: map each direct dep's GA to its declared scope (all scopes)
     let dep_scopes = build_dep_scope_map(cfg, &["compile", "provided", "runtime", "test"]);
@@ -1852,6 +1863,7 @@ pub fn resolve_deps_no_download_with_root(
     let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
+    exclusions.extend(cfg.resolved_exclusions());
 
     let dep_scopes = build_dep_scope_map(cfg, &["compile", "provided", "runtime", "test"]);
     let jars = crate::workspace::resolver::resolve_no_download(
@@ -1912,6 +1924,7 @@ pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<Pa
     let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
+    exclusions.extend(cfg.resolved_exclusions());
 
     let dep_scopes = build_dep_scope_map(cfg, &["compile", "provided", "runtime", "test"]);
     let jars = crate::workspace::resolver::resolve_no_download(
