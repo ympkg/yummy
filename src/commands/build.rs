@@ -1715,13 +1715,10 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
     let mut registries: Vec<RegistryEntry> = Vec::new();
     let mut resolutions = cfg.resolved_resolutions();
 
-    // TODO: Apply BOM managed versions from plugins.
-    // Requires adding a `managed_versions` parameter to resolver (separate from `resolutions`).
-    // `resolutions` = forced overrides (user-specified), `managed_versions` = suggestions (BOM).
-    // Current blocker: resolutions force ALL version overrides, which breaks artifacts like
-    // kotlin-stdlib-common that don't exist at BOM-managed versions.
-    // See: collect_plugin_managed_versions() — BOM download and parse works,
-    // but integration with resolver needs a new parameter.
+    // Apply BOM managed versions from plugins as constraints ("at least this version").
+    // Unlike resolutions (forced), constraints only upgrade versions, never downgrade.
+    // Artifacts not in the dependency tree are ignored (constraints don't introduce new deps).
+    let constraints = collect_plugin_managed_versions(project, cfg).unwrap_or_default();
 
     // Resolve deps: if inside a workspace, resolve { workspace = true } from root
     let deps = if let Some(ws_root) = config::find_workspace_root(project) {
@@ -1787,8 +1784,8 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
     // Build dep_scopes: map each direct dep's GA to its declared scope
     let dep_scopes = build_dep_scope_map(cfg, scopes);
 
-    let jars = crate::workspace::resolver::resolve_and_download_with_scopes(
-        &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &dep_scopes,
+    let jars = crate::workspace::resolver::resolve_and_download_with_constraints(
+        &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &constraints, &dep_scopes,
     )?;
     config::save_resolved_cache(project, &resolved)?;
 
@@ -1931,8 +1928,9 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
 
     // Build dep_scopes: map each direct dep's GA to its declared scope (all scopes)
     let dep_scopes = build_dep_scope_map(cfg, &["compile", "provided", "runtime", "test"]);
-    let jars = crate::workspace::resolver::resolve_and_download_with_scopes(
-        &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &dep_scopes,
+    let constraints = collect_plugin_managed_versions(project, cfg).unwrap_or_default();
+    let jars = crate::workspace::resolver::resolve_and_download_with_constraints(
+        &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &constraints, &dep_scopes,
     )?;
     config::save_resolved_cache(project, &resolved)?;
 

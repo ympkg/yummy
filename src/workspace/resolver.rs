@@ -254,6 +254,26 @@ impl MavenCoord {
     }
 }
 
+/// Compare two Maven version strings. Returns -1, 0, or 1.
+/// Splits by '.', '-', compares segments numerically when possible.
+fn version_compare(a: &str, b: &str) -> i32 {
+    let parse = |s: &str| -> Vec<i64> {
+        s.split(|c: char| c == '.' || c == '-')
+            .map(|seg| seg.parse::<i64>().unwrap_or(0))
+            .collect()
+    };
+    let va = parse(a);
+    let vb = parse(b);
+    let len = va.len().max(vb.len());
+    for i in 0..len {
+        let sa = va.get(i).copied().unwrap_or(0);
+        let sb = vb.get(i).copied().unwrap_or(0);
+        if sa < sb { return -1; }
+        if sa > sb { return 1; }
+    }
+    0
+}
+
 /// Scope strength: lower number = stronger scope.
 fn scope_strength(scope: &str) -> u8 {
     match scope {
@@ -330,7 +350,21 @@ pub fn resolve_and_download_with_scopes(
     resolutions: &BTreeMap<String, String>,
     dep_scopes: &HashMap<String, String>,
 ) -> Result<Vec<PathBuf>> {
-    resolve_inner(dependencies, cache_dir, lock, registries, exclusions, resolutions, dep_scopes, true)
+    resolve_inner(dependencies, cache_dir, lock, registries, exclusions, resolutions, &BTreeMap::new(), dep_scopes, true)
+}
+
+/// Full resolve with constraints (BOM managed versions, "at least this version" semantics).
+pub fn resolve_and_download_with_constraints(
+    dependencies: &BTreeMap<String, String>,
+    cache_dir: &Path,
+    lock: &mut ResolvedCache,
+    registries: &[RegistryEntry],
+    exclusions: &[String],
+    resolutions: &BTreeMap<String, String>,
+    constraints: &BTreeMap<String, String>,
+    dep_scopes: &HashMap<String, String>,
+) -> Result<Vec<PathBuf>> {
+    resolve_inner(dependencies, cache_dir, lock, registries, exclusions, resolutions, constraints, dep_scopes, true)
 }
 
 /// Resolve dependency graph and return expected JAR paths without downloading.
@@ -344,9 +378,13 @@ pub fn resolve_no_download(
     resolutions: &BTreeMap<String, String>,
     dep_scopes: &HashMap<String, String>,
 ) -> Result<Vec<PathBuf>> {
-    resolve_inner(dependencies, cache_dir, lock, registries, exclusions, resolutions, dep_scopes, false)
+    resolve_inner(dependencies, cache_dir, lock, registries, exclusions, resolutions, &BTreeMap::new(), dep_scopes, false)
 }
 
+/// Core resolver.
+/// - `resolutions`: forced version overrides (always win, like enforcedPlatform)
+/// - `constraints`: BOM managed versions ("at least this version", like platform())
+///   Only applies to deps already in the tree. Higher transitive version wins over constraint.
 fn resolve_inner(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
@@ -354,6 +392,7 @@ fn resolve_inner(
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
+    constraints: &BTreeMap<String, String>,
     dep_scopes: &HashMap<String, String>,
     download: bool,
 ) -> Result<Vec<PathBuf>> {
@@ -520,10 +559,18 @@ fn resolve_inner(
             let child_depth = current_depth + 1;
 
             for mut dep in transitive {
-                // Apply resolutions: override transitive dep version if matched
                 let ga_key = format!("{}:{}", dep.group_id, dep.artifact_id);
+
+                // Apply resolutions: forced override (like enforcedPlatform)
                 if let Some(forced_version) = resolutions.get(&ga_key) {
                     dep.version = forced_version.clone();
+                }
+                // Apply constraints: "at least this version" (like platform())
+                // Only upgrade, never downgrade. Higher transitive version wins.
+                else if let Some(constraint_version) = constraints.get(&ga_key) {
+                    if version_compare(&dep.version, constraint_version) < 0 {
+                        dep.version = constraint_version.clone();
+                    }
                 }
                 let dep_vk = dep.versioned_key();
                 depth_map.entry(dep_vk.clone()).or_insert(child_depth);
