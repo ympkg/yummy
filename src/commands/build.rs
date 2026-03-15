@@ -691,16 +691,24 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
             let pkg = ws.get_package(jar_target).unwrap();
             let closure = ws.transitive_closure(jar_target)?;
             let mut all_deps = Vec::new();
+            crate::RESOLVER_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
             for pkg_name in &closure {
                 let p = ws.get_package(pkg_name).unwrap();
                 if pkg_name != *jar_target {
                     all_deps.push(config::output_classes_dir(&p.path));
                 }
+                // Resolve each workspace module's external Maven deps (e.g. @aws/ec2)
+                // so they're included in the fat JAR / Spring Boot JAR
+                let module_jars = resolve_deps_with_scopes(&p.path, &p.config, &["compile", "runtime"])?;
+                all_deps.extend(module_jars);
             }
-            crate::RESOLVER_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Also resolve the target app module's own Maven deps
             let runtime_jars = resolve_deps_with_scopes(&pkg.path, &pkg.config, &["compile", "runtime"])?;
             crate::RESOLVER_QUIET.store(false, std::sync::atomic::Ordering::Relaxed);
             all_deps.extend(runtime_jars);
+            // Deduplicate: same JAR path might appear from multiple modules
+            all_deps.sort();
+            all_deps.dedup();
 
             let class_dir = config::output_classes_dir(&pkg.path);
             let resource_dir = pkg.path.join("src").join("main").join("resources");
