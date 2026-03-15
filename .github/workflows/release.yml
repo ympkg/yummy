@@ -240,6 +240,7 @@ jobs:
     name: Publish Docker Image
     needs: [check-version, build-agent, build-binary]
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
