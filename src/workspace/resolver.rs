@@ -1214,7 +1214,7 @@ fn parse_pom_dependencies_with_props(
 }
 
 /// Collect <properties> from POM, including built-in Maven properties.
-fn collect_pom_properties(doc: &roxmltree::Document) -> HashMap<String, String> {
+pub fn collect_pom_properties(doc: &roxmltree::Document) -> HashMap<String, String> {
     let mut props = HashMap::new();
     let root = doc.root_element();
 
@@ -1295,7 +1295,7 @@ fn collect_pom_properties(doc: &roxmltree::Document) -> HashMap<String, String> 
 /// Collect versions from <dependencyManagement>, including BOM imports.
 /// When a dependency has scope=import and type=pom, recursively fetch and
 /// merge its dependencyManagement entries (outer takes precedence).
-fn collect_managed_versions_with_bom(
+pub fn collect_managed_versions_with_bom(
     doc: &roxmltree::Document,
     properties: &HashMap<String, String>,
     client: &reqwest::blocking::Client,

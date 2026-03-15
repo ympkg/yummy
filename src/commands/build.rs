@@ -1236,6 +1236,136 @@ fn resolve_plugin_classpath(project: &Path, cfg: &YmConfig) -> Result<String> {
         .join(":"))
 }
 
+/// Scan all yummy-plugin JARs in Maven cache for `dependencyManagement` declarations.
+/// Downloads BOM POMs and extracts managed versions.
+/// Plugin version is used as BOM version (e.g., yummy-plugin-spring-boot:4.0.3 → spring-boot-dependencies:4.0.3).
+pub fn collect_plugin_managed_versions(project: &Path, cfg: &YmConfig) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut managed = std::collections::BTreeMap::new();
+    let cache_dir = config::maven_cache_dir(project);
+    let plugin_base = cache_dir.join("sh.yummy");
+
+    if !plugin_base.exists() { return Ok(managed); }
+
+    // Scan sh.yummy/<artifact>/<version>/<artifact>-<version>.jar
+    for artifact_dir in std::fs::read_dir(&plugin_base)?.flatten() {
+        let artifact_name = artifact_dir.file_name().to_string_lossy().to_string();
+        if !artifact_name.contains("yummy-plugin") { continue; }
+
+        for version_dir in std::fs::read_dir(artifact_dir.path())?.flatten() {
+            let version = version_dir.file_name().to_string_lossy().to_string();
+            let jar_path = version_dir.path().join(format!("{}-{}.jar", artifact_name, version));
+            if !jar_path.exists() { continue; }
+
+            // Read plugin metadata from JAR
+            let file = match std::fs::File::open(&jar_path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut archive = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            for i in 0..archive.len() {
+                let mut entry = match archive.by_index(i) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let name = entry.name().to_string();
+                if !name.starts_with("META-INF/ym-plugins/") || !name.ends_with(".json") { continue; }
+
+                let mut content = String::new();
+                use std::io::Read;
+                let _ = entry.read_to_string(&mut content);
+
+                // Extract dependencyManagement field (format: "groupId:artifactId" or "groupId:artifactId:version")
+                let dm_coord = extract_json_field(&content, "dependencyManagement");
+                if let Some(bom_ga) = dm_coord {
+                    let bom_parts: Vec<&str> = bom_ga.split(':').collect();
+                    if bom_parts.len() < 2 { continue; }
+
+                    // BOM version: from metadata GAV if present, otherwise use plugin version
+                    let bom_version = if bom_parts.len() >= 3 {
+                        bom_parts[2].to_string()
+                    } else {
+                        version.clone()
+                    };
+
+                    let bom_pom_path = cache_dir
+                        .join(bom_parts[0])
+                        .join(bom_parts[1])
+                        .join(&bom_version)
+                        .join(format!("{}-{}.pom", bom_parts[1], bom_version));
+
+                    // Download BOM POM if not cached
+                    if !bom_pom_path.exists() {
+                        let url = format!(
+                            "https://repo1.maven.org/maven2/{}/{}/{}/{}-{}.pom",
+                            bom_parts[0].replace('.', "/"),
+                            bom_parts[1], bom_version, bom_parts[1], bom_version
+                        );
+                        if let Some(parent) = bom_pom_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Ok(client) = client_for_bom() {
+                            if let Ok(resp) = client.get(&url).send() {
+                                if resp.status().is_success() {
+                                    if let Ok(bytes) = resp.bytes() {
+                                        let _ = std::fs::write(&bom_pom_path, &bytes);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Parse BOM POM and extract managed versions
+                    if bom_pom_path.exists() {
+                        if let Ok(pom_content) = std::fs::read_to_string(&bom_pom_path) {
+                            if let Ok(doc) = roxmltree::Document::parse(&pom_content) {
+                                let props = crate::workspace::resolver::collect_pom_properties(&doc);
+                                if let Ok(client) = client_for_bom() {
+                                    let bom_managed = crate::workspace::resolver::collect_managed_versions_with_bom(
+                                        &doc, &props, &client, &cache_dir,
+                                        &cfg.registry_entries(), 0,
+                                    );
+                                    for (k, v) in bom_managed {
+                                        managed.entry(k).or_insert(v);
+                                    }
+                                    eprintln!(
+                                        "{} Applied {} ({} version constraints)",
+                                        console::style(format!("{:>12}", "BOM")).cyan().bold(),
+                                        bom_ga,
+                                        managed.len()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(managed)
+}
+
+fn client_for_bom() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?)
+}
+
+fn extract_json_field(json: &str, field: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", field);
+    let idx = json.find(&pattern)?;
+    let rest = &json[idx + pattern.len()..];
+    let colon = rest.find(':')?;
+    let rest = &rest[colon + 1..];
+    let quote_start = rest.find('"')?;
+    let rest = &rest[quote_start + 1..];
+    let quote_end = rest.find('"')?;
+    Some(rest[..quote_end].to_string())
+}
 
 /// Compute a fingerprint for packaging inputs (class files, dependencies, resources, config).
 /// If all inputs are unchanged and the output JAR exists, packaging can be skipped.
@@ -1584,6 +1714,14 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
     let mut resolutions = cfg.resolved_resolutions();
+
+    // TODO: Apply BOM managed versions from plugins.
+    // Requires adding a `managed_versions` parameter to resolver (separate from `resolutions`).
+    // `resolutions` = forced overrides (user-specified), `managed_versions` = suggestions (BOM).
+    // Current blocker: resolutions force ALL version overrides, which breaks artifacts like
+    // kotlin-stdlib-common that don't exist at BOM-managed versions.
+    // See: collect_plugin_managed_versions() — BOM download and parse works,
+    // but integration with resolver needs a new parameter.
 
     // Resolve deps: if inside a workspace, resolve { workspace = true } from root
     let deps = if let Some(ws_root) = config::find_workspace_root(project) {
