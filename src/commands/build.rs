@@ -1340,6 +1340,10 @@ fn resolve_plugin_classpath(project: &Path, cfg: &YmConfig) -> Result<String> {
 /// Downloads BOM POMs and extracts managed versions.
 /// Plugin version is used as BOM version (e.g., yummy-plugin-spring-boot:4.0.3 → spring-boot-dependencies:4.0.3).
 pub fn collect_plugin_managed_versions(project: &Path, cfg: &YmConfig) -> Result<std::collections::BTreeMap<String, String>> {
+    use std::sync::Mutex;
+    static LOGGED_BOMS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
     let mut managed = std::collections::BTreeMap::new();
     let cache_dir = config::maven_cache_dir(project);
     let plugin_base = cache_dir.join("sh.yummy");
@@ -1431,12 +1435,15 @@ pub fn collect_plugin_managed_versions(project: &Path, cfg: &YmConfig) -> Result
                                     for (k, v) in bom_managed {
                                         managed.entry(k).or_insert(v);
                                     }
-                                    eprintln!(
-                                        "{} Applied {} ({} version constraints)",
-                                        console::style(format!("{:>12}", "BOM")).cyan().bold(),
-                                        bom_ga,
-                                        managed.len()
-                                    );
+                                    let bom_key = format!("{}:{}", bom_ga, managed.len());
+                                    if LOGGED_BOMS.lock().unwrap().insert(bom_key) {
+                                        eprintln!(
+                                            "{} Applied {} ({} version constraints)",
+                                            console::style(format!("{:>12}", "BOM")).cyan().bold(),
+                                            bom_ga,
+                                            managed.len()
+                                        );
+                                    }
                                 }
                             }
                         }

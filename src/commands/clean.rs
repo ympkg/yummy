@@ -29,16 +29,26 @@ pub fn execute(all: bool, yes: bool) -> Result<()> {
         }
     }
 
-    // Remove workspace build fingerprints
+    // Remove workspace build fingerprints and incremental compilation fingerprints
     let cache = config::cache_dir(&project);
     if cache.exists() {
         if let Ok(entries) = std::fs::read_dir(&cache) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                if name.to_string_lossy().starts_with("workspace-build-fingerprint-") {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("workspace-build-fingerprint-")
+                    || name_str.starts_with("workspace-module-fps-")
+                {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
+        }
+        // Remove per-module incremental fingerprints (must be cleared when out/ is deleted,
+        // otherwise incremental compiler sees stale fingerprints + empty out/classes
+        // and incorrectly returns UpToDate without restoring from cache)
+        let fp_dir = cache.join("fingerprints");
+        if fp_dir.exists() {
+            let _ = std::fs::remove_dir_all(&fp_dir);
         }
     }
 
