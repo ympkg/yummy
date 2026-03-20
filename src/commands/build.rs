@@ -896,32 +896,36 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
                     .join("caches")
                     .join("org.springframework.boot")
                     .join("spring-boot-loader");
-                // Try to find the loader JAR in the cache
+                // Try to find the loader JAR in the cache, or download it
                 let candidate = cache_dir.join(&ver).join(format!("spring-boot-loader-{}.jar", ver));
                 if candidate.exists() {
                     Some(candidate)
                 } else {
-                    // Walk the cache directory looking for any version
-                    let mut found = None;
-                    if cache_dir.exists() {
-                        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.is_dir() {
-                                    for child in std::fs::read_dir(&p).into_iter().flatten().flatten() {
-                                        let cp = child.path();
-                                        let cn = cp.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                                        if cn.starts_with("spring-boot-loader-") && cn.ends_with(".jar") && !cn.contains("tools") {
-                                            found = Some(cp);
-                                            break;
-                                        }
-                                    }
+                    // Download from Maven Central
+                    let url = format!(
+                        "https://repo1.maven.org/maven2/org/springframework/boot/spring-boot-loader/{}/spring-boot-loader-{}.jar",
+                        ver, ver
+                    );
+                    let dest_dir = cache_dir.join(&ver);
+                    let _ = std::fs::create_dir_all(&dest_dir);
+                    let dest = dest_dir.join(format!("spring-boot-loader-{}.jar", ver));
+                    println!(
+                        "{} spring-boot-loader-{}.jar from Maven Central",
+                        style(format!("{:>12}", "Downloading")).green().bold(),
+                        ver
+                    );
+                    match reqwest::blocking::get(&url) {
+                        Ok(resp) if resp.status().is_success() => {
+                            match resp.bytes() {
+                                Ok(bytes) => {
+                                    let _ = std::fs::write(&dest, &bytes);
+                                    if dest.exists() { Some(dest) } else { None }
                                 }
-                                if found.is_some() { break; }
+                                Err(_) => None,
                             }
                         }
+                        _ => None,
                     }
-                    found
                 }
             } else {
                 None
