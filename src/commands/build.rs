@@ -281,49 +281,58 @@ fn build_impl(targets: Vec<String>, package: bool, keep_going: bool) -> Result<(
     Ok(())
 }
 
-/// Deduplicate JAR paths by Maven artifact ID (groupId:artifactId), keeping the highest version.
-/// Parses filename pattern: `artifactId-version.jar` where version starts at the first `-digit`.
+/// Deduplicate JAR paths by Maven groupId:artifactId, keeping the highest version.
+/// Extracts groupId from the cache path structure: `~/.ym/caches/{groupId}/{artifactId}/{version}/`.
+/// For JARs outside the cache (e.g. workspace thin JARs), uses filename as unique key (no dedup).
 fn dedup_jars_by_artifact(jars: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut ga_map: std::collections::HashMap<String, (PathBuf, String)> = std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let mut non_jar: Vec<PathBuf> = Vec::new();
+    let mut non_cache: Vec<PathBuf> = Vec::new();
 
     for jar in jars {
+        if jar.is_dir() {
+            non_cache.push(jar);
+            continue;
+        }
         let filename = jar.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if !filename.ends_with(".jar") || jar.is_dir() {
-            non_jar.push(jar);
+        if !filename.ends_with(".jar") {
+            non_cache.push(jar);
             continue;
         }
-        let stem = filename.strip_suffix(".jar").unwrap_or(&filename);
-        // Find artifact ID: everything before the first "-digit" sequence
-        let artifact_id = {
-            let bytes = stem.as_bytes();
-            let mut split = stem.len();
-            for i in 0..bytes.len().saturating_sub(1) {
-                if bytes[i] == b'-' && bytes[i + 1].is_ascii_digit() {
-                    split = i;
-                    break;
-                }
-            }
-            &stem[..split]
-        };
-        let version = if artifact_id.len() < stem.len() {
-            &stem[artifact_id.len() + 1..]
-        } else {
-            ""
-        };
-        let key = artifact_id.to_string();
 
-        if let Some((_, existing_ver)) = ga_map.get(&key) {
-            // Compare versions segment by segment
+        // Try to extract groupId:artifactId from cache path:
+        // .ym/caches/{groupId}/{artifactId}/{version}/{artifactId}-{version}.jar
+        let path_str = jar.to_string_lossy();
+        let ga_key = if let Some(caches_pos) = path_str.find("/caches/") {
+            let after_caches = &path_str[caches_pos + 8..]; // skip "/caches/"
+            let parts: Vec<&str> = after_caches.split('/').collect();
+            if parts.len() >= 3 {
+                // parts[0] = groupId, parts[1] = artifactId, parts[2] = version
+                format!("{}:{}", parts[0], parts[1])
+            } else {
+                filename.clone()
+            }
+        } else {
+            // Non-cache JAR (e.g. workspace thin JAR) — use filename, no dedup
+            non_cache.push(jar);
+            continue;
+        };
+
+        // Extract version from path: parent dir name is the version
+        let version = jar.parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if let Some((_, existing_ver)) = ga_map.get(&ga_key) {
             let parse_ver = |s: &str| -> Vec<i64> {
                 s.split(|c: char| c == '.' || c == '-')
                     .map(|seg| seg.parse::<i64>().unwrap_or(0))
                     .collect()
             };
-            let va = parse_ver(version);
+            let va = parse_ver(&version);
             let vb = parse_ver(existing_ver);
             let len = va.len().max(vb.len());
             let mut higher = false;
@@ -334,15 +343,15 @@ fn dedup_jars_by_artifact(jars: Vec<PathBuf>) -> Vec<PathBuf> {
                 if a < b { break; }
             }
             if higher {
-                ga_map.insert(key, (jar, version.to_string()));
+                ga_map.insert(ga_key, (jar, version));
             }
         } else {
-            order.push(key.clone());
-            ga_map.insert(key, (jar, version.to_string()));
+            order.push(ga_key.clone());
+            ga_map.insert(ga_key, (jar, version));
         }
     }
 
-    let mut result = non_jar;
+    let mut result = non_cache;
     for key in &order {
         if let Some((path, _)) = ga_map.get(key) {
             result.push(path.clone());
