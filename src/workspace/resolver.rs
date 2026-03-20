@@ -847,20 +847,26 @@ fn resolve_inner(
     }
 
     // Phase 3: build lock entries and collect JAR paths
-    let mut all_jars = Vec::new();
+    // Deduplicate by groupId:artifactId — keep the highest version for each GA.
+    let mut ga_winners: HashMap<String, (MavenCoord, String)> = HashMap::new(); // GA → (coord, key)
+    let mut ga_order: Vec<String> = Vec::new(); // insertion order of GAs
     for key in &ordered_keys {
         let Some(coord) = MavenCoord::from_versioned_key(key) else {
             continue;
         };
-        let jar_path = coord.jar_path(cache_dir);
-        // Skip pom-only artifacts (no JAR to add to classpath)
-        if jar_path.exists() {
-            all_jars.push(jar_path);
+        let ga = format!("{}:{}", coord.group_id, coord.artifact_id);
+        if let Some((existing, _)) = ga_winners.get(&ga) {
+            if version_compare(&coord.version, &existing.version) > 0 {
+                ga_winners.insert(ga, (coord, key.clone()));
+            }
+        } else {
+            ga_order.push(ga.clone());
+            ga_winners.insert(ga, (coord, key.clone()));
         }
 
+        // Always insert lock entries for all resolved versions
         let dep_keys = dep_map.remove(key).unwrap_or_default();
         let effective_scope = scope_map.get(key).cloned();
-        // Insert lock entry if not already present (download phase may have set sha)
         lock.dependencies.entry(key.clone()).or_insert(ResolvedDependency {
             sha256: None,
             dependencies: if dep_keys.is_empty() {
@@ -870,6 +876,15 @@ fn resolve_inner(
             },
             scope: effective_scope,
         });
+    }
+
+    let mut all_jars = Vec::new();
+    for ga in &ga_order {
+        let Some((coord, _)) = ga_winners.get(ga) else { continue };
+        let jar_path = coord.jar_path(cache_dir);
+        if jar_path.exists() {
+            all_jars.push(jar_path);
+        }
     }
 
     append_native_jars(&mut all_jars);
@@ -930,7 +945,9 @@ fn try_resolve_from_lock(
         }
     }
 
-    let mut all_jars = Vec::new();
+    // Deduplicate by groupId:artifactId — keep the highest version for each GA.
+    let mut ga_winners: HashMap<String, MavenCoord> = HashMap::new();
+    let mut ga_order: Vec<String> = Vec::new();
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
 
@@ -961,17 +978,32 @@ fn try_resolve_from_lock(
         // Check lock file entry exists
         let locked = lock.dependencies.get(&key)?;
 
-        // SHA-256 was already verified at download time; skip re-verification
-        // to avoid reading hundreds of MBs of JARs on every build.
-
         if !pom_only {
-            all_jars.push(jar_path);
+            // Track highest version per GA
+            if let Some(existing) = ga_winners.get(&ga_key) {
+                if version_compare(&coord.version, &existing.version) > 0 {
+                    ga_winners.insert(ga_key.clone(), coord.clone());
+                }
+            } else {
+                ga_order.push(ga_key.clone());
+                ga_winners.insert(ga_key.clone(), coord.clone());
+            }
         }
         if let Some(ref dep_keys) = locked.dependencies {
             for dep_key in dep_keys {
                 if let Some(mc) = MavenCoord::from_versioned_key(dep_key) {
                     queue.push_back(mc);
                 }
+            }
+        }
+    }
+
+    let mut all_jars = Vec::new();
+    for ga in &ga_order {
+        if let Some(coord) = ga_winners.get(ga) {
+            let jar_path = coord.jar_path(cache_dir);
+            if jar_path.exists() {
+                all_jars.push(jar_path);
             }
         }
     }
