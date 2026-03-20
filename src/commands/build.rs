@@ -281,10 +281,12 @@ fn build_impl(targets: Vec<String>, package: bool, keep_going: bool) -> Result<(
     Ok(())
 }
 
-/// Deduplicate JAR paths by Maven groupId:artifactId, keeping the highest version.
+/// Deduplicate JAR paths by Maven groupId:artifactId.
+/// If BOM constraints specify a version for a GA, use that version.
+/// Otherwise keep the highest version.
 /// Extracts groupId from the cache path structure: `~/.ym/caches/{groupId}/{artifactId}/{version}/`.
 /// For JARs outside the cache (e.g. workspace thin JARs), uses filename as unique key (no dedup).
-fn dedup_jars_by_artifact(jars: Vec<PathBuf>) -> Vec<PathBuf> {
+fn dedup_jars_by_artifact(jars: Vec<PathBuf>, bom_constraints: &std::collections::BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut ga_map: std::collections::HashMap<String, (PathBuf, String)> = std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut non_cache: Vec<PathBuf> = Vec::new();
@@ -326,23 +328,33 @@ fn dedup_jars_by_artifact(jars: Vec<PathBuf>) -> Vec<PathBuf> {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // Check if BOM specifies a version for this GA
+        let bom_version = bom_constraints.get(&ga_key);
+
         if let Some((_, existing_ver)) = ga_map.get(&ga_key) {
-            let parse_ver = |s: &str| -> Vec<i64> {
-                s.split(|c: char| c == '.' || c == '-')
-                    .map(|seg| seg.parse::<i64>().unwrap_or(0))
-                    .collect()
+            let should_replace = if let Some(bv) = bom_version {
+                // BOM wins: replace if current version matches BOM but existing doesn't
+                version == *bv && existing_ver != bv
+            } else {
+                // No BOM: keep highest version
+                let parse_ver = |s: &str| -> Vec<i64> {
+                    s.split(|c: char| c == '.' || c == '-')
+                        .map(|seg| seg.parse::<i64>().unwrap_or(0))
+                        .collect()
+                };
+                let va = parse_ver(&version);
+                let vb = parse_ver(existing_ver);
+                let len = va.len().max(vb.len());
+                let mut higher = false;
+                for i in 0..len {
+                    let a = va.get(i).copied().unwrap_or(0);
+                    let b = vb.get(i).copied().unwrap_or(0);
+                    if a > b { higher = true; break; }
+                    if a < b { break; }
+                }
+                higher
             };
-            let va = parse_ver(&version);
-            let vb = parse_ver(existing_ver);
-            let len = va.len().max(vb.len());
-            let mut higher = false;
-            for i in 0..len {
-                let a = va.get(i).copied().unwrap_or(0);
-                let b = vb.get(i).copied().unwrap_or(0);
-                if a > b { higher = true; break; }
-                if a < b { break; }
-            }
-            if higher {
+            if should_replace {
                 ga_map.insert(ga_key, (jar, version));
             }
         } else {
@@ -810,10 +822,15 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
             crate::RESOLVER_QUIET.store(false, std::sync::atomic::Ordering::Relaxed);
             all_deps.extend(runtime_jars);
 
-            // Deduplicate: by path first, then by groupId:artifactId (keep highest version)
+            // Collect BOM constraints for version selection during dedup
+            let bom_constraints = collect_plugin_managed_versions(&pkg.path, &pkg.config)
+                .unwrap_or_default();
+
+            // Deduplicate: by path first, then by groupId:artifactId
+            // Use BOM-managed version when available, otherwise keep highest version
             all_deps.sort();
             all_deps.dedup();
-            all_deps = dedup_jars_by_artifact(all_deps);
+            all_deps = dedup_jars_by_artifact(all_deps, &bom_constraints);
             all_deps.retain(|path| {
                 if path.is_dir() { return true; }
                 let file_name = path.file_name()
