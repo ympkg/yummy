@@ -201,8 +201,7 @@ fn publish_all_workspace_modules(
             generate_pom(module_path, module_cfg, &pom_path, Some(version))?;
             let jar_path = find_output_jar(module_path, module_cfg, Some(version))?;
             let sources_jar = generate_sources_jar(module_path, module_cfg, Some(version))?;
-            let javadoc_jar = generate_javadoc_jar(module_path, module_cfg, Some(version))?;
-            upload_artifact(&jar_path, &pom_path, &sources_jar, javadoc_jar.as_deref(), module_cfg, &registry_url, &creds, Some(version.as_str()))?;
+            upload_artifact(&jar_path, &pom_path, &sources_jar, None, module_cfg, &registry_url, &creds, Some(version.as_str()))?;
             Ok(())
         })();
         match &result {
@@ -282,7 +281,6 @@ fn publish_workspace_module(
 
     let jar_path = find_output_jar(module_path, module_cfg, Some(version))?;
     let sources_jar = generate_sources_jar(module_path, module_cfg, Some(version))?;
-    let javadoc_jar = generate_javadoc_jar(module_path, module_cfg, Some(version))?;
 
     if dry_run {
         let jar_size = std::fs::metadata(&jar_path).map(|m| m.len()).unwrap_or(0);
@@ -307,7 +305,7 @@ fn publish_workspace_module(
         style(&registry_url).dim()
     );
 
-    upload_artifact(&jar_path, &pom_path, &sources_jar, javadoc_jar.as_deref(), module_cfg, &registry_url, &creds, Some(version))?;
+    upload_artifact(&jar_path, &pom_path, &sources_jar, None, module_cfg, &registry_url, &creds, Some(version))?;
 
     if is_sonatype_url(&registry_url) {
         match sonatype_close_and_release(&registry_url, module_cfg, &creds) {
@@ -456,13 +454,6 @@ fn generate_sources_jar(project: &Path, cfg: &config::schema::YmConfig, version_
     if !status.success() {
         bail!("Failed to create sources JAR");
     }
-
-    println!(
-        "  {} Generated sources JAR for {}@{}",
-        style("✓").green(),
-        cfg.name,
-        version_override.or(cfg.version.as_deref()).unwrap_or("0.0.0")
-    );
 
     Ok(jar_path)
 }
