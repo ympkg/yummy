@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use console::style;
 use std::path::Path;
+use std::time::Instant;
 
 use crate::config;
 
@@ -145,6 +146,7 @@ fn publish_all_workspace_modules(
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let publish_start = Instant::now();
     let ws = crate::workspace::graph::WorkspaceGraph::build(workspace_root)?;
 
     // Build all modules first
@@ -220,13 +222,20 @@ fn publish_all_workspace_modules(
     let pub_count = published.load(Ordering::Relaxed);
     let fail_count = failed.load(Ordering::Relaxed);
 
+    let elapsed = publish_start.elapsed();
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{:.1}m", elapsed.as_secs_f64() / 60.0)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    };
     println!();
     println!(
-        "  {} {} published, {} failed, {} skipped (private)",
+        "  {} {} published, {} failed, {} skipped (private) in {}",
         style("✓").green(),
         pub_count,
         fail_count,
-        skipped
+        skipped,
+        style(elapsed_str).bold()
     );
 
     if fail_count > 0 {
