@@ -5,9 +5,17 @@ use std::time::Instant;
 
 use crate::config;
 
-pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) -> Result<()> {
+pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool, local: bool) -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
+
+    // Local publish: install to ~/.ym/caches/
+    if local {
+        if cfg.workspaces.is_some() {
+            return publish_all_local(&config_path, &project);
+        }
+        return publish_single_local(&project, &cfg, None);
+    }
 
     // Workspace mode
     if cfg.workspaces.is_some() {
@@ -132,6 +140,105 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
 
     // Run postpublish script
     crate::scripts::run_script(&cfg, "postpublish", &project)?;
+
+    Ok(())
+}
+
+/// Install a single module to local Maven cache (~/.ym/caches/).
+fn publish_single_local(project: &Path, cfg: &config::schema::YmConfig, root_version: Option<&str>) -> Result<()> {
+    let version = cfg.version.as_deref()
+        .or(root_version)
+        .unwrap_or("0.0.0");
+    let cache_dir = config::maven_cache_dir(project);
+    let dest = cache_dir
+        .join(&cfg.group_id)
+        .join(&cfg.name)
+        .join(version);
+    std::fs::create_dir_all(&dest)?;
+
+    // Generate POM
+    let pom_path = project.join("out").join("pom.xml");
+    generate_pom(project, cfg, &pom_path, Some(version))?;
+
+    // Generate thin JAR
+    let jar_path = find_output_jar(project, cfg, Some(version))?;
+
+    // Copy to cache
+    let dest_jar = dest.join(format!("{}-{}.jar", cfg.name, version));
+    let dest_pom = dest.join(format!("{}-{}.pom", cfg.name, version));
+    std::fs::copy(&jar_path, &dest_jar)?;
+    std::fs::copy(&pom_path, &dest_pom)?;
+
+    // Remove stale pom-only marker
+    let marker = dest_jar.with_extension("jar.pom-only");
+    let _ = std::fs::remove_file(&marker);
+
+    Ok(())
+}
+
+/// Install all workspace modules to local Maven cache (~/.ym/caches/).
+fn publish_all_local(config_path: &Path, workspace_root: &Path) -> Result<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let publish_start = Instant::now();
+    let ws = crate::workspace::graph::WorkspaceGraph::build(workspace_root)?;
+
+    // Build all modules first
+    super::build::execute(vec![], true)?;
+
+    let root_cfg = config::load_config(config_path)?;
+    let root_version = root_cfg.version.as_deref().unwrap_or("0.0.0");
+
+    let mut modules: Vec<_> = Vec::new();
+    for pkg_name in &ws.all_packages() {
+        let pkg = ws.get_package(pkg_name).unwrap();
+        if pkg.config.private.unwrap_or(false) { continue; }
+        modules.push((pkg.path.clone(), pkg.config.clone()));
+    }
+
+    let total = modules.len();
+    println!(
+        "  {} installing {} modules to local cache",
+        style("➜").green(),
+        total
+    );
+
+    let installed = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+    pool.install(|| modules.par_iter().for_each(|(module_path, module_cfg)| {
+        match publish_single_local(module_path, module_cfg, Some(root_version)) {
+            Ok(()) => {
+                let n = installed.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!("\r  {} Installed [{}/{}] {}", style("✓").green(), n, total, &module_cfg.name);
+            }
+            Err(e) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                eprintln!("\r  {} Failed {} : {}", style("✗").red(), &module_cfg.name, e);
+            }
+        }
+    }));
+
+    let elapsed = publish_start.elapsed();
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{:.1} minutes", elapsed.as_secs_f64() / 60.0)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    };
+
+    println!();
+    println!(
+        "  {} {} installed, {} failed in {}",
+        style("✓").green(),
+        installed.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+        style(elapsed_str).bold()
+    );
 
     Ok(())
 }

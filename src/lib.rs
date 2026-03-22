@@ -208,6 +208,9 @@ enum YmCommands {
         /// Simulate publish without uploading
         #[arg(long)]
         dry_run: bool,
+        /// Install to local Maven cache (~/.ym/caches/) instead of remote registry
+        #[arg(long)]
+        local: bool,
     },
     /// Login to a Maven repository
     Login {
@@ -532,8 +535,8 @@ fn ym_main() -> Result<()> {
             commands::upgrade::execute(interactive, yes, json)
         }
         YmCommands::Convert { verify } => commands::migrate::execute(verify),
-        YmCommands::Publish { target, registry, dry_run } => {
-            commands::publish::execute(target, registry.as_deref(), dry_run)
+        YmCommands::Publish { target, registry, dry_run, local } => {
+            commands::publish::execute(target, registry.as_deref(), dry_run, local)
         }
         YmCommands::Login { list, remove, registry_url, registry, username, password } => {
             commands::login::execute(
