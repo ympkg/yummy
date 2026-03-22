@@ -8,11 +8,16 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
-    // If target specified in workspace, redirect to that module
-    if let Some(ref module_name) = target {
-        if cfg.workspaces.is_some() {
+    // Workspace mode
+    if cfg.workspaces.is_some() {
+        if let Some(ref module_name) = target {
+            // Single module
             return publish_workspace_module(&config_path, &project, module_name, registry, dry_run);
         }
+        // Publish all non-private modules
+        return publish_all_workspace_modules(&config_path, &project, registry, dry_run);
+    }
+    if target.is_some() {
         bail!("--target only works in workspace mode. Current project is not a workspace.");
     }
 
@@ -126,6 +131,69 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool) ->
 
     // Run postpublish script
     crate::scripts::run_script(&cfg, "postpublish", &project)?;
+
+    Ok(())
+}
+
+/// Publish all non-private workspace modules.
+fn publish_all_workspace_modules(
+    config_path: &Path,
+    workspace_root: &Path,
+    registry: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let ws = crate::workspace::graph::WorkspaceGraph::build(workspace_root)?;
+
+    // Build all modules first
+    super::build::execute(vec![], true)?;
+
+    let root_cfg = config::load_config(config_path)?;
+    let reg = resolve_registry(&root_cfg, registry)?;
+    let registry_url = &reg.url;
+    let creds_path = credentials_path();
+    let creds = load_credentials_for_registry(&creds_path, registry_url, reg.inline_creds)?;
+
+    let mut published = 0;
+    let mut skipped = 0;
+
+    for pkg_name in &ws.all_packages() {
+        let pkg = ws.get_package(pkg_name).unwrap();
+        let module_cfg = &pkg.config;
+        if module_cfg.private.unwrap_or(false) {
+            skipped += 1;
+            continue;
+        }
+
+        let version = module_cfg.version.as_deref()
+            .or(root_cfg.version.as_deref())
+            .unwrap_or("0.0.0");
+        let module_path = &pkg.path;
+
+        // Generate POM
+        let pom_path = module_path.join("out").join("pom.xml");
+        generate_pom(module_path, module_cfg, &pom_path, Some(version))?;
+
+        // Find/create thin JAR
+        let jar_path = find_output_jar(module_path, module_cfg, Some(version))?;
+        let sources_jar = generate_sources_jar(module_path, module_cfg, Some(version))?;
+        let javadoc_jar = generate_javadoc_jar(module_path, module_cfg, Some(version))?;
+
+        if dry_run {
+            println!("  {} would publish {}@{}", style("·").dim(), style(&module_cfg.name).bold(), version);
+        } else {
+            upload_artifact(&jar_path, &pom_path, &sources_jar, javadoc_jar.as_deref(), module_cfg, registry_url, &creds, Some(version))?;
+            println!("  {} Published {}@{}", style("✓").green(), style(&module_cfg.name).bold(), version);
+        }
+        published += 1;
+    }
+
+    println!();
+    println!(
+        "  {} {} modules published, {} skipped (private)",
+        style("✓").green(),
+        published,
+        skipped
+    );
 
     Ok(())
 }
