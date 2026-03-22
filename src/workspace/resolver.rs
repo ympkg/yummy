@@ -476,6 +476,13 @@ fn resolve_inner(
     let resolved_count = AtomicUsize::new(0);
     let show_resolve_progress = !crate::is_json_quiet() && !crate::RESOLVER_QUIET.load(Ordering::Relaxed);
 
+    // Use a dedicated thread pool (32 threads) for POM resolution — network-bound,
+    // benefits from high parallelism unlike CPU-bound compilation.
+    let resolve_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(32)
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
     while !queue.is_empty() {
         // Drain the current level for batched processing
         let mut current_level: Vec<MavenCoord> = Vec::new();
@@ -516,8 +523,8 @@ fn resolve_inner(
             break;
         }
 
-        // Resolve transitive deps for this level (parallel if > 1 item and POMs not cached)
-        let level_results: Vec<(MavenCoord, Vec<MavenCoord>)> = if current_level.len() > 1 {
+        // Resolve transitive deps for this level using dedicated 32-thread pool
+        let level_results: Vec<(MavenCoord, Vec<MavenCoord>)> = resolve_pool.install(|| {
             current_level
                 .par_iter()
                 .map(|coord| {
@@ -531,21 +538,7 @@ fn resolve_inner(
                     (coord.clone(), transitive)
                 })
                 .collect()
-        } else {
-            current_level
-                .iter()
-                .map(|coord| {
-                    let transitive = resolve_transitive_cached(
-                        &client, coord, cache_dir, registries, Some(&pom_cache),
-                    ).unwrap_or_default();
-                    let n = resolved_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if show_resolve_progress && n % 20 == 0 {
-                        resolver_progress(&format!("Resolving dependency graph ({} artifacts)...", n));
-                    }
-                    (coord.clone(), transitive)
-                })
-                .collect()
-        };
+        });
         // Clear progress line after level completes (only needed without spinner)
         if show_resolve_progress && resolved_count.load(Ordering::Relaxed) >= 20 && !crate::SPINNER_ACTIVE.load(Ordering::Relaxed) {
             eprint!("\r{}\r", " ".repeat(60));
