@@ -231,13 +231,15 @@ fn publish_all_local(config_path: &Path, workspace_root: &Path) -> Result<()> {
         format!("{:.1}s", elapsed.as_secs_f64())
     };
 
+    let cache_dir = config::maven_cache_dir(workspace_root);
     println!();
     println!(
-        "  {} {} installed, {} failed in {}",
+        "  {} {} installed, {} failed in {} → {}",
         style("✓").green(),
         installed.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed),
-        style(elapsed_str).bold()
+        style(elapsed_str).bold(),
+        style(cache_dir.display()).dim()
     );
 
     Ok(())
