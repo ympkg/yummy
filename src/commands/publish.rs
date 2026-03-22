@@ -188,11 +188,14 @@ fn publish_all_workspace_modules(
         style(&registry_url).dim()
     );
 
-    // Parallel: generate artifacts + upload (8 threads)
+    // Parallel: generate artifacts + upload (2x CPU cores for IO-bound work)
+    let num_threads = std::thread::available_parallelism().map(|n| n.get() * 2).unwrap_or(16);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
     let published = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
-    let results: Vec<_> = modules.par_iter().map(|(module_path, module_cfg, version)| {
+    let results: Vec<_> = pool.install(|| modules.par_iter().map(|(module_path, module_cfg, version)| {
         let result = (|| -> Result<()> {
             let pom_path = module_path.join("out").join("pom.xml");
             generate_pom(module_path, module_cfg, &pom_path, Some(version))?;
@@ -213,7 +216,7 @@ fn publish_all_workspace_modules(
             }
         }
         (module_cfg.name.clone(), result)
-    }).collect();
+    }).collect());
 
     let pub_count = published.load(Ordering::Relaxed);
     let fail_count = failed.load(Ordering::Relaxed);
