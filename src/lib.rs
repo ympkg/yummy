@@ -491,7 +491,8 @@ fn apply_quiet_mode(quiet: bool) {
     let is_ci = std::env::var("CI").map(|v| v == "true").unwrap_or(false);
     if quiet || is_ci {
         PROGRESS_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
-        RESOLVER_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Don't set RESOLVER_QUIET — resolver_progress() handles quiet mode
+        // by printing static lines instead of animations
     }
 }
 

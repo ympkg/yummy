@@ -24,6 +24,7 @@ struct SimpleSpinner {
 impl SimpleSpinner {
     fn new(msg: &str) -> Self {
         if crate::is_progress_quiet() {
+            eprintln!("  {}", msg);
             return Self {
                 running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 handle: None,

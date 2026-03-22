@@ -29,9 +29,12 @@ fn format_eta(secs: u64) -> String {
 }
 
 /// Update progress: updates spinner message when active, otherwise raw eprint.
+/// In quiet mode: static line output (no animation), only called at key milestones.
 fn resolver_progress(msg: &str) {
     if crate::SPINNER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         crate::set_spinner_msg(msg);
+    } else if crate::is_progress_quiet() {
+        eprintln!("{} {}", style(format!("{:>12}", "Resolving")).green().bold(), msg);
     } else {
         eprint!("\r{} {}   ", style(format!("{:>12}", "Resolving")).green().bold(), msg);
     }
@@ -532,8 +535,9 @@ fn resolve_inner(
                         &client, coord, cache_dir, registries, Some(&pom_cache),
                     ).unwrap_or_default();
                     let n = resolved_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if show_resolve_progress && n % 20 == 0 {
-                        resolver_progress(&format!("Resolving dependency graph ({} artifacts)...", n));
+                    let interval = if crate::is_progress_quiet() { 100 } else { 20 };
+                    if show_resolve_progress && n % interval == 0 {
+                        resolver_progress(&format!("dependency graph ({} artifacts)...", n));
                     }
                     (coord.clone(), transitive)
                 })
