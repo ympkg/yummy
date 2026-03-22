@@ -1746,6 +1746,10 @@ fn verify_gpg_signature(
     jar_path: &Path,
     registries: &[RegistryEntry],
 ) {
+    // Skip GPG verification in quiet/CI mode — avoids unnecessary .asc downloads
+    if crate::is_progress_quiet() {
+        return;
+    }
     let asc_path = jar_path.with_extension("jar.asc");
 
     // Try to download the .asc signature file
