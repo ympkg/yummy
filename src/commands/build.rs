@@ -694,9 +694,12 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
                         compiler.args = Some(args);
                     }
                 }
-                // Inherit devDependencies from workspace root for annotation processor auto-discovery
-                if module_cfg.dev_dependencies.is_none() {
-                    module_cfg.dev_dependencies = root_cfg_snapshot.dev_dependencies.clone();
+                // Merge devDependencies from workspace root for annotation processor auto-discovery
+                if let Some(ref root_dev) = root_cfg_snapshot.dev_dependencies {
+                    let module_dev = module_cfg.dev_dependencies.get_or_insert_with(Default::default);
+                    for (k, v) in root_dev {
+                        module_dev.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
                 }
                 let result = compile_project_with_pool(&pkg.path, &module_cfg, &classpath, worker_pool.as_ref());
                 (pkg_name.to_string(), result, start.elapsed())
