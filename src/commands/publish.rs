@@ -856,10 +856,6 @@ fn upload_artifact(
         }
     }
 
-    if gpg_available {
-        println!("  {} GPG signatures uploaded", style("✓").green());
-    }
-    println!("  {} SHA-256/MD5 checksums uploaded", style("✓").green());
 
     Ok(())
 }
