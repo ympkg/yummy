@@ -9,7 +9,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool, lo
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
-    // Local publish: install to ~/.ym/caches/
+    // Local publish: install to ~/.ym/maven/
     if local {
         if cfg.workspaces.is_some() {
             return publish_all_local(&config_path, &project);
@@ -144,7 +144,7 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool, lo
     Ok(())
 }
 
-/// Install a single module to local Maven cache (~/.ym/caches/).
+/// Install a single module to local Maven cache (~/.ym/maven/).
 fn publish_single_local(project: &Path, cfg: &config::schema::YmConfig, root_version: Option<&str>) -> Result<()> {
     let version = cfg.version.as_deref()
         .or(root_version)
@@ -176,7 +176,7 @@ fn publish_single_local(project: &Path, cfg: &config::schema::YmConfig, root_ver
     Ok(())
 }
 
-/// Install all workspace modules to local Maven cache (~/.ym/caches/).
+/// Install all workspace modules to local Maven cache (~/.ym/maven/).
 fn publish_all_local(config_path: &Path, workspace_root: &Path) -> Result<()> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

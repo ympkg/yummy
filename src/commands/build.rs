@@ -291,7 +291,7 @@ fn build_impl(targets: Vec<String>, package: bool, keep_going: bool) -> Result<(
 /// Deduplicate JAR paths by Maven groupId:artifactId.
 /// If BOM constraints specify a version for a GA, use that version.
 /// Otherwise keep the highest version.
-/// Extracts groupId from the cache path structure: `~/.ym/caches/{groupId}/{artifactId}/{version}/`.
+/// Extracts groupId from the cache path structure: `~/.ym/maven/{groupId}/{artifactId}/{version}/`.
 /// For JARs outside the cache (e.g. workspace thin JARs), uses filename as unique key (no dedup).
 fn dedup_jars_by_artifact(jars: Vec<PathBuf>, bom_constraints: &std::collections::BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut ga_map: std::collections::HashMap<String, (PathBuf, String)> = std::collections::HashMap::new();
@@ -312,10 +312,10 @@ fn dedup_jars_by_artifact(jars: Vec<PathBuf>, bom_constraints: &std::collections
         }
 
         // Try to extract groupId:artifactId from cache path:
-        // .ym/caches/{groupId}/{artifactId}/{version}/{artifactId}-{version}.jar
+        // .ym/maven/{groupId}/{artifactId}/{version}/{artifactId}-{version}.jar
         let path_str = jar.to_string_lossy();
-        let ga_key = if let Some(caches_pos) = path_str.find("/caches/") {
-            let after_caches = &path_str[caches_pos + 8..]; // skip "/caches/"
+        let ga_key = if let Some(maven_pos) = path_str.find("/maven/") {
+            let after_caches = &path_str[maven_pos + 7..]; // skip "/maven/"
             let parts: Vec<&str> = after_caches.split('/').collect();
             if parts.len() >= 3 {
                 // parts[0] = groupId, parts[1] = artifactId, parts[2] = version
@@ -1081,8 +1081,8 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
             if let Some(ver) = version {
                 let cache_dir = dirs::home_dir()
                     .expect("Cannot determine home directory")
-                    .join(".ym")
-                    .join("caches")
+                    .join(crate::config::CACHE_DIR)
+                    .join(crate::config::MAVEN_CACHE_DIR)
                     .join("org.springframework.boot")
                     .join("spring-boot-loader");
                 // Try to find the loader JAR in the cache, or download it

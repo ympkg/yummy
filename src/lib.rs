@@ -208,7 +208,7 @@ enum YmCommands {
         /// Simulate publish without uploading
         #[arg(long)]
         dry_run: bool,
-        /// Install to local Maven cache (~/.ym/caches/) instead of remote registry
+        /// Install to local Maven cache (~/.ym/maven/) instead of remote registry
         #[arg(long)]
         local: bool,
     },
