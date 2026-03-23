@@ -276,15 +276,28 @@ impl MavenCoord {
 }
 
 /// Compare two Maven version strings. Returns -1, 0, or 1.
-/// Splits by '.', '-', compares segments numerically when possible.
+/// Splits base version by '.', qualifier by '-'.
+/// Release (no qualifier) > any qualifier (Maven convention).
+/// e.g., 4.0.3 > 4.0.3-5 > 4.0.3-4
 fn version_compare(a: &str, b: &str) -> i32 {
-    let parse = |s: &str| -> Vec<i64> {
-        s.split(|c: char| c == '.' || c == '-')
-            .map(|seg| seg.parse::<i64>().unwrap_or(0))
-            .collect()
+    // Split into base and qualifier: "4.0.3-5" → ("4.0.3", Some("5"))
+    let (base_a, qual_a) = if let Some(pos) = a.find('-') {
+        (&a[..pos], Some(&a[pos + 1..]))
+    } else {
+        (a, None)
     };
-    let va = parse(a);
-    let vb = parse(b);
+    let (base_b, qual_b) = if let Some(pos) = b.find('-') {
+        (&b[..pos], Some(&b[pos + 1..]))
+    } else {
+        (b, None)
+    };
+
+    // Compare base versions numerically
+    let parse_base = |s: &str| -> Vec<i64> {
+        s.split('.').map(|seg| seg.parse::<i64>().unwrap_or(0)).collect()
+    };
+    let va = parse_base(base_a);
+    let vb = parse_base(base_b);
     let len = va.len().max(vb.len());
     for i in 0..len {
         let sa = va.get(i).copied().unwrap_or(0);
@@ -292,7 +305,32 @@ fn version_compare(a: &str, b: &str) -> i32 {
         if sa < sb { return -1; }
         if sa > sb { return 1; }
     }
-    0
+
+    // Same base version — compare qualifiers
+    // Release (None) > any qualifier (Some)
+    match (qual_a, qual_b) {
+        (None, None) => 0,
+        (None, Some(_)) => 1,   // release > qualifier
+        (Some(_), None) => -1,  // qualifier < release
+        (Some(qa), Some(qb)) => {
+            // Compare qualifier segments: "5" vs "8", or "beta.1" vs "beta.2"
+            let parse_qual = |s: &str| -> Vec<i64> {
+                s.split(|c: char| c == '.' || c == '-')
+                    .map(|seg| seg.parse::<i64>().unwrap_or(0))
+                    .collect()
+            };
+            let vqa = parse_qual(qa);
+            let vqb = parse_qual(qb);
+            let qlen = vqa.len().max(vqb.len());
+            for i in 0..qlen {
+                let sa = vqa.get(i).copied().unwrap_or(0);
+                let sb = vqb.get(i).copied().unwrap_or(0);
+                if sa < sb { return -1; }
+                if sa > sb { return 1; }
+            }
+            0
+        }
+    }
 }
 
 /// Scope strength: lower number = stronger scope.
