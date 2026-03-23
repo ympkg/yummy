@@ -24,6 +24,8 @@ pub struct CompileResult {
     pub success: bool,
     pub outcome: CompileOutcome,
     pub errors: String,
+    /// Aggregated module-level ABI hash from per-file fingerprints (if available).
+    pub module_abi_hash: Option<String>,
 }
 
 pub struct CompileConfig {

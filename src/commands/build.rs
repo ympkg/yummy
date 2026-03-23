@@ -553,15 +553,66 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
         dep_time.as_millis()
     );
 
-    // Workspace-level build fingerprint: skip entire compilation if nothing changed
-    let (ws_build_fp, current_module_fps) = compute_workspace_build_fingerprint(root, targets, &packages, &ws)?;
+    let cache_dir = config::cache_dir(root);
+    // Pre-compute source + resource hashes for all modules (parallel, mtime fast path)
+    let source_hashes_map: std::collections::HashMap<String, Vec<(String, String)>> = packages
+        .par_iter()
+        .filter_map(|name| {
+            let pkg = ws.get_package(name)?;
+            let src_dirs = vec![config::source_dir_for(&pkg.path, &pkg.config)];
+            let output_dir = config::output_classes_dir(&pkg.path);
+            let mut hashes = compiler::incremental::compute_source_content_hashes(
+                &src_dirs, &cache_dir, &output_dir,
+            ).unwrap_or_default();
+            // Include resource files in cache key (resource changes must invalidate cache)
+            let res_dir = pkg.path.join("src").join("main").join("resources");
+            if res_dir.exists() {
+                for entry in walkdir::WalkDir::new(&res_dir).into_iter().filter_map(|e| e.ok()) {
+                    if entry.file_type().is_file() {
+                        let rel = format!("res:{}", entry.path().strip_prefix(&res_dir)
+                            .unwrap_or(entry.path()).to_string_lossy());
+                        let hash = compiler::incremental::hash_file(entry.path())
+                            .unwrap_or_default();
+                        hashes.push((rel, hash));
+                    }
+                }
+                hashes.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+            Some((name.clone(), hashes))
+        })
+        .collect();
 
-    if should_skip_workspace_build(root, targets, &ws_build_fp, &packages, &ws) {
-        print_workspace_summary(0, 0, packages.len(), 0, 0, total_start.elapsed());
-    } else {
+    let jar_sha256_index: std::collections::HashMap<String, String> = resolved.dependencies.iter()
+        .filter_map(|(key, dep)| {
+            let sha = dep.sha256.as_ref()?;
+            let mc = crate::workspace::resolver::MavenCoord::from_versioned_key(key)?;
+            let fname = mc.jar_path(std::path::Path::new(""))
+                .file_name()?.to_string_lossy().to_string();
+            Some((fname, sha.clone()))
+        })
+        .collect();
 
-    // Load stored per-module fingerprints for shortcut comparison
-    let stored_module_fps = load_module_fingerprints(root, targets);
+    let maven_sha256_map: std::collections::HashMap<String, Vec<(String, String)>> = packages
+        .iter()
+        .map(|name| {
+            let jars = per_module_jars.get(name.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            let mut sha256s: Vec<(String, String)> = jars.iter()
+                .filter_map(|jar_path| {
+                    let fname = jar_path.file_name()?.to_string_lossy().to_string();
+                    let sha = jar_sha256_index.get(&fname)
+                        .cloned()
+                        .unwrap_or_else(|| compiler::incremental::hash_bytes(fname.as_bytes()));
+                    Some((fname, sha))
+                })
+                .collect();
+            sha256s.sort_by(|a, b| a.0.cmp(&b.0));
+            (name.clone(), sha256s)
+        })
+        .collect();
+
+    let mut abi_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    {
 
     // Wave scheduling: in-degree based parallel compilation
     let mut in_degree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -657,35 +708,19 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
         let cp_snapshot = workspace_classpath.clone();
         let root_cfg_snapshot = root_cfg.clone();
 
+        // Snapshot abi_map for this wave (immutable during parallel iteration)
+        let abi_snapshot = abi_map.clone();
+
         let results: Vec<_> = compilable
             .par_iter()
             .map(|pkg_name| {
-                // Per-module fingerprint shortcut: skip compile_project() if unchanged
-                // Also verify output directory exists and is non-empty to avoid stale cache hits
-                if let (Some(current), Some(stored)) = (
-                    current_module_fps.get(pkg_name.as_str()),
-                    stored_module_fps.get(pkg_name.as_str()),
-                ) {
-                    let pkg = ws.get_package(pkg_name.as_str()).unwrap();
-                    let out_dir = config::output_classes_dir(&pkg.path);
-                    let has_output = out_dir.exists()
-                        && std::fs::read_dir(&out_dir)
-                            .map(|mut d| d.next().is_some())
-                            .unwrap_or(false);
-                    if current == stored && has_output {
-                        return (pkg_name.to_string(), Ok(compiler::CompileResult {
-                            success: true,
-                            outcome: compiler::CompileOutcome::UpToDate,
-                            errors: String::new(),
-                        }), std::time::Duration::ZERO);
-                    }
-                }
                 let pkg = ws.get_package(pkg_name.as_str()).unwrap();
-                let start = Instant::now();
+                let out_dir = config::output_classes_dir(&pkg.path);
+
+                // ── Build compile config (needed for both cache key and compilation) ──
                 let jars = per_module_jars.get(pkg_name.as_str()).cloned().unwrap_or_default();
                 let mut classpath = jars;
                 classpath.extend(cp_snapshot.clone());
-                // Inherit compiler args from workspace root if module doesn't specify them
                 let mut module_cfg = pkg.config.clone();
                 if module_cfg.compiler.as_ref().and_then(|c| c.args.as_ref()).is_none() {
                     let root_args = root_cfg_snapshot.compiler.as_ref().and_then(|c| c.args.clone());
@@ -694,19 +729,94 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
                         compiler.args = Some(args);
                     }
                 }
-                // Merge devDependencies from workspace root for annotation processor auto-discovery
                 if let Some(ref root_dev) = root_cfg_snapshot.dev_dependencies {
                     let module_dev = module_cfg.dev_dependencies.get_or_insert_with(Default::default);
                     for (k, v) in root_dev {
                         module_dev.entry(k.clone()).or_insert_with(|| v.clone());
                     }
                 }
+
+                let src_hashes = source_hashes_map.get(pkg_name.as_str())
+                    .map(|v| v.as_slice()).unwrap_or(&[]);
+                let mvn_sha256s = maven_sha256_map.get(pkg_name.as_str())
+                    .map(|v| v.as_slice()).unwrap_or(&[]);
+
+                // Collect workspace dependency ABI hashes from abi_snapshot
+                let ws_deps = pkg.config.workspace_module_deps();
+                let mut dep_abi_hashes: Vec<(String, String)> = ws_deps.iter()
+                    .filter_map(|dep| {
+                        abi_snapshot.get(dep.as_str())
+                            .map(|abi| (dep.clone(), abi.clone()))
+                    })
+                    .collect();
+                dep_abi_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+
+                // Build a CompileConfig for cache key computation (AP JARs covered by maven SHA-256s)
+                let compile_cfg = compiler::CompileConfig {
+                    source_dirs: Vec::new(),
+                    output_dir: std::path::PathBuf::new(),
+                    classpath: Vec::new(),
+                    java_version: module_cfg.target.clone(),
+                    encoding: module_cfg.compiler.as_ref().and_then(|c| c.encoding.clone()),
+                    annotation_processors: Vec::new(),
+                    lint: module_cfg.compiler.as_ref().and_then(|c| c.lint.clone()).unwrap_or_default(),
+                    extra_args: module_cfg.compiler.as_ref().and_then(|c| c.args.clone()).unwrap_or_default(),
+                };
+
+                let cache_key = compiler::incremental::compute_module_cache_key(
+                    &compiler::incremental::ModuleCacheInput {
+                        source_hashes: src_hashes,
+                        dep_abi_hashes: &dep_abi_hashes,
+                        maven_jar_sha256s: mvn_sha256s,
+                        config: &compile_cfg,
+                        ap_jar_sha256s: &[],
+                    },
+                );
+
+                if let Ok(Some(abi_hash)) = compiler::incremental::try_restore_module_cache(
+                    &cache_key, &out_dir,
+                ) {
+                    return (pkg_name.to_string(), Ok(compiler::CompileResult {
+                        success: true,
+                        outcome: compiler::CompileOutcome::Cached,
+                        errors: String::new(),
+                        module_abi_hash: Some(abi_hash.clone()),
+                    }), std::time::Duration::ZERO, abi_hash);
+                }
+
+                let start = Instant::now();
                 let result = compile_project_with_pool(&pkg.path, &module_cfg, &classpath, worker_pool.as_ref());
-                (pkg_name.to_string(), result, start.elapsed())
+                let elapsed = start.elapsed();
+
+                // Prefer ABI hash from compile result (avoids re-reading .class files)
+                let abi_hash = result.as_ref().ok()
+                    .and_then(|r| r.module_abi_hash.clone())
+                    .unwrap_or_else(|| {
+                        if result.as_ref().map(|r| r.success).unwrap_or(false) {
+                            compiler::incremental::compute_module_abi_hash(&out_dir)
+                                .unwrap_or_else(|_| compiler::incremental::hash_bytes(b"error"))
+                        } else {
+                            compiler::incremental::hash_bytes(b"error")
+                        }
+                    });
+
+                // Save to content-addressed cache on successful compilation
+                if result.as_ref().map(|r| r.success).unwrap_or(false) {
+                    if let Err(e) = compiler::incremental::save_module_cache(
+                        &cache_key, &out_dir, &abi_hash, pkg_name,
+                    ) {
+                        eprintln!("  Warning: failed to save build cache for '{}': {}", pkg_name, e);
+                    }
+                }
+
+                (pkg_name.to_string(), result, elapsed, abi_hash)
             })
             .collect();
 
-        for (pkg_name, result, elapsed) in results {
+        for (pkg_name, result, elapsed, module_abi) in results {
+            // Record ABI hash for downstream modules
+            abi_map.insert(pkg_name.clone(), module_abi);
+
             let success = match &result {
                 Ok(r) if r.success => {
                     processed += 1;
@@ -788,14 +898,10 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
         bail!("Workspace build failed ({} module(s))", failed_modules.len());
     }
 
-    // Save workspace build fingerprint after successful compilation
-    save_workspace_build_fingerprint(root, targets, &ws_build_fp)?;
-    save_module_fingerprints(root, targets, &current_module_fps)?;
-
     print_workspace_summary(compiled_count, cached_count, up_to_date_count,
         0, skipped_count, total_start.elapsed());
 
-    } // end of else block (workspace fingerprint skip)
+    } // end of content-addressed cache block
 
     if package {
         // Package JARs for all modules:
@@ -1411,7 +1517,7 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
     }
     std::fs::create_dir_all(&staging)?;
 
-    copy_dir_recursive(&out, &staging)?;
+    incremental::copy_dir_recursive(&out, &staging)?;
 
     let mut mergeable: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
 
@@ -1432,7 +1538,7 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
         );
 
         if dep.is_dir() {
-            copy_dir_recursive(dep, &staging)?;
+            incremental::copy_dir_recursive(dep, &staging)?;
         } else {
             let file = match std::fs::File::open(dep) {
                 Ok(f) => f,
@@ -2101,219 +2207,10 @@ fn load_packaging_fingerprints(project: &Path) -> std::collections::HashMap<Stri
         .unwrap_or_default()
 }
 
-/// Compute a workspace-level build fingerprint from source mtimes, config mtimes, and dep state.
-fn compute_workspace_build_fingerprint(
-    root: &Path,
-    targets: &[String],
-    packages: &[String],
-    ws: &WorkspaceGraph,
-) -> Result<(String, std::collections::HashMap<String, String>)> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-
-    // 1. Target names (different targets produce different fingerprints)
-    hasher.update(b"target:");
-    hasher.update(targets_cache_key(targets).as_bytes());
-
-    // 2. Root package.toml mtime
-    let root_config = root.join(config::CONFIG_FILE);
-    if let Ok(meta) = std::fs::metadata(&root_config) {
-        let mtime = meta.modified().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        hasher.update(b"root_cfg:");
-        hasher.update(&mtime.to_le_bytes());
-    }
-
-    // 3. resolved.json content hash (dependency changes)
-    let resolved_path = root.join(config::CACHE_DIR).join(config::RESOLVED_FILE);
-    if let Ok(content) = std::fs::read(&resolved_path) {
-        hasher.update(b"resolved:");
-        hasher.update(&content);
-    }
-
-    // 4. Per-module: config mtime + source file mtimes + resource file mtimes
-    // Use rayon for parallel scanning of module source directories
-    let module_fingerprints: Vec<(String, String)> = packages
-        .par_iter()
-        .filter_map(|name| {
-            let pkg = ws.get_package(name)?;
-            let mut mod_hasher = Sha256::new();
-
-            // Module config mtime
-            let config_path = pkg.path.join(config::CONFIG_FILE);
-            if let Ok(meta) = std::fs::metadata(&config_path) {
-                let mtime = meta.modified().ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                mod_hasher.update(&mtime.to_le_bytes());
-            }
-
-            // Source files: collect (relative_path, mtime_millis, size) sorted by path
-            let src_dir = config::source_dir_for(&pkg.path, &pkg.config);
-            if src_dir.exists() {
-                let mut entries: Vec<(String, u128, u64)> = Vec::new();
-                for entry in walkdir::WalkDir::new(&src_dir).into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file() {
-                        let rel = entry.path().strip_prefix(&src_dir)
-                            .unwrap_or(entry.path())
-                            .to_string_lossy().to_string();
-                        if let Ok(meta) = entry.metadata() {
-                            let mtime = meta.modified().ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_millis())
-                                .unwrap_or(0);
-                            entries.push((rel, mtime, meta.len()));
-                        }
-                    }
-                }
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
-                for (path, mtime, size) in &entries {
-                    mod_hasher.update(path.as_bytes());
-                    mod_hasher.update(&mtime.to_le_bytes());
-                    mod_hasher.update(&size.to_le_bytes());
-                }
-            }
-
-            // Resource files
-            let res_dir = pkg.path.join("src").join("main").join("resources");
-            if res_dir.exists() {
-                let mut entries: Vec<(String, u128, u64)> = Vec::new();
-                for entry in walkdir::WalkDir::new(&res_dir).into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file() {
-                        let rel = entry.path().strip_prefix(&res_dir)
-                            .unwrap_or(entry.path())
-                            .to_string_lossy().to_string();
-                        if let Ok(meta) = entry.metadata() {
-                            let mtime = meta.modified().ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_millis())
-                                .unwrap_or(0);
-                            entries.push((rel, mtime, meta.len()));
-                        }
-                    }
-                }
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
-                for (path, mtime, size) in &entries {
-                    mod_hasher.update(path.as_bytes());
-                    mod_hasher.update(&mtime.to_le_bytes());
-                    mod_hasher.update(&size.to_le_bytes());
-                }
-            }
-
-            Some((name.clone(), format!("{:x}", mod_hasher.finalize())))
-        })
-        .collect();
-
-    // Merge module fingerprints in sorted order for determinism
-    let mut sorted_fps = module_fingerprints;
-    sorted_fps.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, fp) in &sorted_fps {
-        hasher.update(b"mod:");
-        hasher.update(name.as_bytes());
-        hasher.update(fp.as_bytes());
-    }
-
-    let per_module: std::collections::HashMap<String, String> = sorted_fps.into_iter().collect();
-
-    Ok((format!("{:x}", hasher.finalize()), per_module))
-}
-
-/// Get the fingerprint file path for a workspace build target.
-/// Build a stable cache key from the targets list.
-fn targets_cache_key(targets: &[String]) -> String {
-    if targets.is_empty() {
-        "__all__".to_string()
-    } else {
-        let mut sorted = targets.to_vec();
-        sorted.sort();
-        sorted.join(",")
-    }
-}
-
-fn workspace_build_fp_path(root: &Path, targets: &[String]) -> PathBuf {
-    let key = targets_cache_key(targets);
-    let target_hash = incremental::hash_bytes(key.as_bytes());
-    root.join(config::CACHE_DIR).join(format!("workspace-build-fingerprint-{}", &target_hash[..12]))
-}
-
-/// Check if the workspace build can be skipped.
-/// Requires both fingerprint match AND output directories exist (guards against
-/// stale fingerprints on self-hosted runners where .ym/ persists but out/ is cleaned).
-fn should_skip_workspace_build(root: &Path, targets: &[String], fingerprint: &str, packages: &[String], ws: &crate::workspace::graph::WorkspaceGraph) -> bool {
-    let fp_path = workspace_build_fp_path(root, targets);
-    match std::fs::read_to_string(&fp_path) {
-        Ok(stored) if stored.trim() == fingerprint => {
-            // Verify ALL modules have out/classes dir — if any is missing, rebuild
-            let all_output = packages.iter().all(|name| {
-                ws.get_package(name).map_or(true, |pkg| {
-                    let out = pkg.path.join(config::OUTPUT_DIR).join(config::CLASSES_DIR);
-                    out.exists() && std::fs::read_dir(&out).map(|mut d| d.next().is_some()).unwrap_or(false)
-                })
-            });
-            if !all_output {
-                eprintln!("  {} Stale build fingerprint (output dirs missing), rebuilding...",
-                    console::style("!").yellow());
-            }
-            all_output
-        }
-        _ => false,
-    }
-}
-
-/// Save the workspace build fingerprint after a successful build.
-fn save_workspace_build_fingerprint(root: &Path, targets: &[String], fingerprint: &str) -> Result<()> {
-    let fp_path = workspace_build_fp_path(root, targets);
-    if let Some(parent) = fp_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&fp_path, fingerprint)?;
-    Ok(())
-}
-
-/// Load per-module fingerprints from disk.
-fn load_module_fingerprints(root: &Path, targets: &[String]) -> std::collections::HashMap<String, String> {
-    let key = targets_cache_key(targets);
-    let target_hash = incremental::hash_bytes(key.as_bytes());
-    let path = root.join(config::CACHE_DIR)
-        .join(format!("workspace-module-fps-{}", &target_hash[..12]));
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => std::collections::HashMap::new(),
-    }
-}
-
-/// Save per-module fingerprints to disk after a successful build.
-fn save_module_fingerprints(root: &Path, targets: &[String], fps: &std::collections::HashMap<String, String>) -> Result<()> {
-    let key = targets_cache_key(targets);
-    let target_hash = incremental::hash_bytes(key.as_bytes());
-    let path = root.join(config::CACHE_DIR)
-        .join(format!("workspace-module-fps-{}", &target_hash[..12]));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string(fps)?)?;
-    Ok(())
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    for entry in walkdir::WalkDir::new(src) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(src)?;
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
+// Content-addressed cache replaces the old mtime+size workspace/module fingerprint system.
+// Module-level cache keys are computed in the wave loop using:
+//   compute_module_cache_key() + try_restore_module_cache() + save_module_cache()
+// from compiler::incremental.
 
 /// Resolve dependencies filtered by scope. Used for scope-specific classpath construction.
 pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str]) -> Result<Vec<PathBuf>> {

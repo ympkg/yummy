@@ -301,6 +301,7 @@ fn parse_response(line: &str, expected_files: usize) -> Result<CompileResult> {
         success,
         outcome: CompileOutcome::Compiled(files_compiled),
         errors: diagnostics,
+        module_abi_hash: None,
     })
 }
 

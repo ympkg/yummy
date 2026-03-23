@@ -18,6 +18,7 @@ pub fn compile(config: &CompileConfig) -> Result<CompileResult> {
             success: true,
             outcome: super::CompileOutcome::UpToDate,
             errors: String::new(),
+            module_abi_hash: None,
         });
     }
 
@@ -110,6 +111,7 @@ pub fn compile(config: &CompileConfig) -> Result<CompileResult> {
         success: output.status.success(),
         outcome: super::CompileOutcome::Compiled(file_count),
         errors: stderr,
+        module_abi_hash: None,
     })
 }
 

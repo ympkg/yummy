@@ -6,6 +6,19 @@ use std::path::{Path, PathBuf};
 
 const FINGERPRINT_FILE: &str = "fingerprints.json";
 
+// Hash domain separator tags for cache key computation
+mod tag {
+    pub const SRC: &[u8] = b"src:";
+    pub const DEP: &[u8] = b"dep:";
+    pub const MVN: &[u8] = b"mvn:";
+    pub const CP: &[u8] = b"cp:";
+    pub const AP: &[u8] = b"ap:";
+    pub const VER: &[u8] = b"ver:";
+    pub const ENC: &[u8] = b"enc:";
+    pub const LINT: &[u8] = b"lint:";
+    pub const ARG: &[u8] = b"arg:";
+}
+
 /// Tracks source file fingerprints for incremental compilation.
 ///
 /// Strategy:
@@ -50,44 +63,18 @@ impl Fingerprints {
     pub fn get_changed_files(&self, source_dirs: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let mut changed = Vec::new();
         let mut all = Vec::new();
-
-        for src_dir in source_dirs {
-            if !src_dir.exists() {
-                continue;
-            }
-            for entry in walkdir::WalkDir::new(src_dir) {
-                let entry = entry?;
-                if entry.path().extension().and_then(|e| e.to_str()) != Some("java") {
+        for (path, rel_key, mtime) in walk_java_files(source_dirs)? {
+            all.push(path.clone());
+            if let Some(existing) = self.entries.get(&rel_key) {
+                if existing.mtime_secs == mtime {
                     continue;
                 }
-                let path = entry.path().to_path_buf();
-                all.push(path.clone());
-
-                let rel_key = crate::normalize_cache_path(&path);
-
-                // Quick check: modification time
-                let mtime = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                if let Some(existing) = self.entries.get(&rel_key) {
-                    if existing.mtime_secs == mtime {
-                        continue; // mtime unchanged, skip hash check
-                    }
-                    // mtime changed, check content hash
-                    let hash = hash_file(&path)?;
-                    if hash == existing.source_hash {
-                        continue; // content unchanged despite mtime change
-                    }
+                if hash_file(&path)? == existing.source_hash {
+                    continue;
                 }
-                changed.push(path);
             }
+            changed.push(path);
         }
-
         Ok((changed, all))
     }
 
@@ -136,6 +123,61 @@ impl Fingerprints {
         self.entries.retain(|k, _| existing_keys.contains(k));
         removed
     }
+}
+
+fn file_mtime_secs(entry: &walkdir::DirEntry) -> u64 {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Aggregate a module-level ABI hash from per-file fingerprint entries.
+/// Reuses already-computed per-file ABI hashes, avoiding re-reading .class files.
+fn aggregate_abi_from_fingerprints(fingerprints: &Fingerprints) -> String {
+    let mut entries: Vec<(&str, &str)> = fingerprints
+        .entries
+        .iter()
+        .filter_map(|(k, e)| e.abi_hash.as_deref().map(|h| (k.as_str(), h)))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (key, abi) in &entries {
+        hasher.update(key.as_bytes());
+        hasher.update(abi.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn cache_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Walk source directories and collect all .java files with their normalized key and mtime.
+fn walk_java_files(source_dirs: &[PathBuf]) -> Result<Vec<(PathBuf, String, u64)>> {
+    let mut files = Vec::new();
+    for src_dir in source_dirs {
+        if !src_dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(src_dir) {
+            let entry = entry?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("java") {
+                continue;
+            }
+            let path = entry.path().to_path_buf();
+            let rel_key = crate::normalize_cache_path(&path);
+            let mtime = file_mtime_secs(&entry);
+            files.push((path, rel_key, mtime));
+        }
+    }
+    Ok(files)
 }
 
 /// Compute SHA-256 hash of file content.
@@ -484,6 +526,7 @@ pub fn incremental_compile(
                 success: true,
                 outcome: super::CompileOutcome::UpToDate,
                 errors: String::new(),
+                module_abi_hash: Some(aggregate_abi_from_fingerprints(&fingerprints)),
             });
         }
         missing
@@ -551,6 +594,12 @@ pub fn incremental_compile(
         }
     }
 
+    let abi = if result.success {
+        Some(aggregate_abi_from_fingerprints(&fingerprints))
+    } else {
+        None
+    };
+
     Ok(super::CompileResult {
         success: result.success,
         outcome: if files_to_compile.is_empty() {
@@ -559,6 +608,7 @@ pub fn incremental_compile(
             super::CompileOutcome::Compiled(files_to_compile.len())
         },
         errors: result.errors,
+        module_abi_hash: abi,
     })
 }
 
@@ -584,8 +634,28 @@ fn fingerprint_dir_for(cache_dir: &Path, output_dir: &Path) -> PathBuf {
     cache_dir.join("fingerprints").join(&hash[..16])
 }
 
+/// Feed compiler configuration fields into a hasher (shared by both cache key functions).
+fn feed_compiler_config(hasher: &mut Sha256, config: &super::CompileConfig) {
+    if let Some(ref v) = config.java_version {
+        hasher.update(tag::VER);
+        hasher.update(v.as_bytes());
+    }
+    if let Some(ref e) = config.encoding {
+        hasher.update(tag::ENC);
+        hasher.update(e.as_bytes());
+    }
+    for l in &config.lint {
+        hasher.update(tag::LINT);
+        hasher.update(l.as_bytes());
+    }
+    for arg in &config.extra_args {
+        hasher.update(tag::ARG);
+        hasher.update(arg.as_bytes());
+    }
+}
+
 /// Compute a content-addressable key from all compilation inputs.
-/// Key = hash(sorted source hashes + classpath paths + compiler options)
+/// Used internally by incremental_compile for single-module cache.
 fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBuf]) -> Result<String> {
     let mut hasher = Sha256::new();
 
@@ -608,26 +678,13 @@ fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBu
         .collect();
     cp.sort();
     for p in &cp {
-        hasher.update(b"cp:");
+        hasher.update(tag::CP);
         hasher.update(p.as_bytes());
     }
 
-    // Compiler options
-    if let Some(ref v) = config.java_version {
-        hasher.update(b"ver:");
-        hasher.update(v.as_bytes());
-    }
-    if let Some(ref e) = config.encoding {
-        hasher.update(b"enc:");
-        hasher.update(e.as_bytes());
-    }
-    for arg in &config.extra_args {
-        hasher.update(b"arg:");
-        hasher.update(arg.as_bytes());
-    }
-    // Annotation processor jars affect compilation output
+    feed_compiler_config(&mut hasher, config);
     for ap in &config.annotation_processors {
-        hasher.update(b"ap:");
+        hasher.update(tag::AP);
         hasher.update(crate::normalize_cache_path(ap).as_bytes());
     }
 
@@ -684,6 +741,7 @@ fn try_restore_build_cache(
         success: true,
         outcome: super::CompileOutcome::Cached,
         errors: String::new(),
+        module_abi_hash: Some(aggregate_abi_from_fingerprints(&fingerprints)),
     }))
 }
 
@@ -702,8 +760,39 @@ fn save_build_cache(config: &super::CompileConfig, source_files: &[PathBuf]) -> 
     Ok(())
 }
 
+/// Recursively hardlink directory contents, falling back to copy on cross-filesystem.
+/// Hardlink files when possible (same filesystem), fall back to copy.
+/// Detects cross-filesystem (EXDEV) on first failure and switches to copy-only.
+fn hardlink_or_copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    let mut use_hardlink = true;
+    for entry in walkdir::WalkDir::new(src) {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(src)?;
+        let dest = dst.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&dest)?;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if use_hardlink {
+                match std::fs::hard_link(entry.path(), &dest) {
+                    Ok(()) => continue,
+                    Err(_) => {
+                        use_hardlink = false;
+                        std::fs::copy(entry.path(), &dest)?;
+                    }
+                }
+            } else {
+                std::fs::copy(entry.path(), &dest)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Recursively copy directory contents.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     for entry in walkdir::WalkDir::new(src) {
         let entry = entry?;
         let rel = entry.path().strip_prefix(src)?;
@@ -731,6 +820,7 @@ fn compile_files(
             success: true,
             outcome: super::CompileOutcome::UpToDate,
             errors: String::new(),
+            module_abi_hash: None,
         });
     }
 
@@ -753,6 +843,7 @@ pub fn compile_files_direct(
             success: true,
             outcome: super::CompileOutcome::UpToDate,
             errors: String::new(),
+            module_abi_hash: None,
         });
     }
     std::fs::create_dir_all(&config.output_dir)?;
@@ -847,6 +938,7 @@ fn compile_with_javac(
         success: output.status.success(),
         outcome: super::CompileOutcome::Compiled(files.len()),
         errors: stderr,
+        module_abi_hash: None,
     })
 }
 
@@ -856,6 +948,178 @@ impl Drop for ArgfileCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Content-addressed build cache: public API for workspace wave scheduling
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Compute content hashes for all source files in the given directories,
+/// using mtime fast path to avoid rehashing unchanged files.
+///
+/// Returns sorted Vec<(relative_path, content_sha256)>.
+pub fn compute_source_content_hashes(
+    source_dirs: &[PathBuf],
+    cache_dir: &Path,
+    output_dir: &Path,
+) -> Result<Vec<(String, String)>> {
+    let fp_dir = fingerprint_dir_for(cache_dir, output_dir);
+    let fingerprints = Fingerprints::load(&fp_dir);
+
+    let mut hashes: Vec<(String, String)> = Vec::new();
+    for (path, rel_key, mtime) in walk_java_files(source_dirs)? {
+        let content_hash = match fingerprints.entries.get(&rel_key) {
+            Some(e) if e.mtime_secs == mtime => e.source_hash.clone(),
+            _ => hash_file(&path)?,
+        };
+        hashes.push((rel_key, content_hash));
+    }
+    hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(hashes)
+}
+
+/// Compute a module-level ABI hash by aggregating ABI hashes of all .class files
+/// in the output directory.
+///
+/// Module ABI hash = SHA-256(sorted(class_file_path + abi_hash))
+pub fn compute_module_abi_hash(output_dir: &Path) -> Result<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+
+    if !output_dir.exists() {
+        return Ok(hash_bytes(b"empty"));
+    }
+
+    for entry in walkdir::WalkDir::new(output_dir) {
+        let entry = entry?;
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("class") {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(output_dir)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .to_string();
+        let abi_hash = compute_class_abi_hash(entry.path()).unwrap_or_else(|_| {
+            hash_file(entry.path()).unwrap_or_else(|_| hash_bytes(b"unreadable"))
+        });
+        entries.push((rel, abi_hash));
+    }
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    for (path, hash) in &entries {
+        hasher.update(path.as_bytes());
+        hasher.update(hash.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Inputs for computing a content-addressed module cache key.
+/// All slice fields must be sorted by first element for deterministic hashing.
+pub struct ModuleCacheInput<'a> {
+    pub source_hashes: &'a [(String, String)],
+    pub dep_abi_hashes: &'a [(String, String)],
+    pub maven_jar_sha256s: &'a [(String, String)],
+    pub config: &'a super::CompileConfig,
+    pub ap_jar_sha256s: &'a [(String, String)],
+}
+
+/// Compute a content-addressed module cache key for workspace wave scheduling.
+pub fn compute_module_cache_key(input: &ModuleCacheInput) -> String {
+    let mut hasher = Sha256::new();
+
+    hasher.update(b"v1:");
+
+    // All input slices are pre-sorted by caller (see ModuleCacheInput doc)
+    for (path, hash) in input.source_hashes {
+        hasher.update(tag::SRC);
+        hasher.update(path.as_bytes());
+        hasher.update(hash.as_bytes());
+    }
+    for (name, abi) in input.dep_abi_hashes {
+        hasher.update(tag::DEP);
+        hasher.update(name.as_bytes());
+        hasher.update(abi.as_bytes());
+    }
+    for (coord, sha) in input.maven_jar_sha256s {
+        hasher.update(tag::MVN);
+        hasher.update(coord.as_bytes());
+        hasher.update(sha.as_bytes());
+    }
+    feed_compiler_config(&mut hasher, input.config);
+    for (path, sha) in input.ap_jar_sha256s {
+        hasher.update(tag::AP);
+        hasher.update(path.as_bytes());
+        hasher.update(sha.as_bytes());
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+/// Try to restore a module from the content-addressed build cache.
+/// Returns Some(abi_hash) on cache hit, None on miss.
+pub fn try_restore_module_cache(
+    cache_key: &str,
+    output_dir: &Path,
+) -> Result<Option<String>> {
+    let cache_dir = build_cache_dir(cache_key);
+    let classes_dir = cache_dir.join("classes");
+
+    if !classes_dir.exists() {
+        return Ok(None);
+    }
+
+    // Clear stale output before restoring to avoid leftover .class files from previous builds
+    if output_dir.exists() {
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+    std::fs::create_dir_all(output_dir)?;
+    copy_dir_recursive(&classes_dir, output_dir)?;
+
+    // Read stored ABI hash
+    let abi_path = cache_dir.join("abi_hash");
+    let abi_hash = std::fs::read_to_string(&abi_path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    // Touch meta.json mtime for LRU eviction (avoids JSON parse overhead on hot path)
+    let meta_path = cache_dir.join("meta.json");
+    let _ = std::fs::OpenOptions::new().write(true).open(&meta_path);
+
+    Ok(Some(abi_hash))
+}
+
+/// Save a module's compilation output to the content-addressed build cache.
+pub fn save_module_cache(
+    cache_key: &str,
+    output_dir: &Path,
+    abi_hash: &str,
+    module_name: &str,
+) -> Result<()> {
+    let cache_dir = build_cache_dir(cache_key);
+    let classes_dir = cache_dir.join("classes");
+
+    if classes_dir.exists() {
+        return Ok(()); // Already cached
+    }
+
+    std::fs::create_dir_all(&classes_dir)?;
+    hardlink_or_copy_dir(output_dir, &classes_dir)?;
+
+    // Write ABI hash
+    std::fs::write(cache_dir.join("abi_hash"), abi_hash)?;
+
+    let now = cache_timestamp();
+    let meta = serde_json::json!({
+        "created_at": now,
+        "last_accessed": now,
+        "module": module_name,
+    });
+    std::fs::write(cache_dir.join("meta.json"), meta.to_string())?;
+
+    Ok(())
 }
 
 #[cfg(test)]
