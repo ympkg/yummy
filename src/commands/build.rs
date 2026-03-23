@@ -1651,9 +1651,6 @@ pub fn build_with_plugins(
         jar_name,
     );
 
-    // Pre-download spring-boot-loader if not cached (needed by spring-boot plugin)
-    ensure_spring_boot_loader(runtime_jars);
-
     // 收集插件 JAR 的 classpath
     let plugin_cp = resolve_plugin_classpath(project, cfg)?;
     if plugin_cp.is_empty() {
