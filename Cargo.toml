@@ -1,6 +1,6 @@
 [package]
 name = "ym"
-version = "0.3.55"
+version = "0.3.56"
 edition = "2024"
 rust-version = "1.85"
 description = "Yummy - A modern Java build tool"
