@@ -3082,6 +3082,7 @@ pub fn write_classes_jar(
     ).as_bytes())?;
 
     // Classes + directory entries
+    let mut class_count = 0u32;
     if classes_dir.exists() {
         let mut added_dirs = std::collections::HashSet::new();
         for entry in walkdir::WalkDir::new(classes_dir) {
@@ -3097,11 +3098,21 @@ pub fn write_classes_jar(
                     zip.add_directory(&dir_name, options)?;
                 }
             } else {
+                if name.ends_with(".class") {
+                    class_count += 1;
+                }
                 zip.start_file(&name, options)?;
                 let mut f = std::fs::File::open(path)?;
                 std::io::copy(&mut f, &mut zip)?;
             }
         }
+    }
+
+    if class_count == 0 {
+        anyhow::bail!(
+            "JAR for '{}' contains no .class files — classes dir '{}' is empty or missing. Build the module first.",
+            name, classes_dir.display()
+        );
     }
 
     zip.finish()?;
