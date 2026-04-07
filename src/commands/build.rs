@@ -3109,9 +3109,9 @@ pub fn write_classes_jar(
     }
 
     if class_count == 0 {
-        anyhow::bail!(
-            "JAR for '{}' contains no .class files — classes dir '{}' is empty or missing. Build the module first.",
-            name, classes_dir.display()
+        eprintln!(
+            "  {} JAR for '{}' contains no .class files — classes dir '{}' is empty or missing. Skipping.",
+            console::style("Warning:").yellow().bold(), name, classes_dir.display()
         );
     }
 
