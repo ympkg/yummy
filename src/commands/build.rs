@@ -489,7 +489,7 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
         .map(|name| {
             let pkg = ws.get_package(name).unwrap();
             let mut deps = pkg.config.maven_dependencies_with_root(root_cfg);
-            for (k, v) in root_cfg.resolved_resolutions() {
+            for (k, v) in root_cfg.resolved_resolutions(root_cfg) {
                 if deps.contains_key(&k) {
                     deps.insert(k, v);
                 }
@@ -535,7 +535,7 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
     exclusions.extend(root_cfg.per_dependency_exclusions());
     exclusions.extend(root_cfg.resolved_exclusions());
 
-    let resolutions = root_cfg.resolved_resolutions();
+    let resolutions = root_cfg.resolved_resolutions(root_cfg);
     // Spinner stays alive during resolve — resolver updates spinner message with progress
     crate::SPINNER_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     let per_module_jars = crate::workspace::resolver::resolve_workspace_deps_with_resolutions(
@@ -2219,7 +2219,7 @@ fn load_packaging_fingerprints(project: &Path) -> std::collections::HashMap<Stri
 pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str]) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
-    let mut resolutions = cfg.resolved_resolutions();
+    let mut resolutions = cfg.resolved_resolutions(cfg);
 
     // Apply BOM managed versions from plugins as constraints ("at least this version").
     // Unlike resolutions (forced), constraints only upgrade versions, never downgrade.
@@ -2236,7 +2236,7 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
                     anyhow::bail!("{}", errors.join("; "));
                 }
                 let mut d = cfg.maven_dependencies_for_scopes_with_root(scopes, &root_cfg);
-                for (k, v) in root_cfg.resolved_resolutions() {
+                for (k, v) in root_cfg.resolved_resolutions(&root_cfg) {
                     if d.contains_key(&k) {
                         d.insert(k.clone(), v.clone());
                     }
@@ -2381,7 +2381,7 @@ fn jar_path_to_versioned_key(jar: &std::path::Path, cache: &std::path::Path) -> 
 pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
-    let mut resolutions = cfg.resolved_resolutions();
+    let mut resolutions = cfg.resolved_resolutions(cfg);
 
     // Resolve deps: if inside a workspace, resolve { workspace = true } from root
     let deps = if let Some(ws_root) = config::find_workspace_root(project) {
@@ -2393,7 +2393,7 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
                     anyhow::bail!("{}", errors.join("; "));
                 }
                 let mut d = cfg.maven_dependencies_with_root(&root_cfg);
-                for (k, v) in root_cfg.resolved_resolutions() {
+                for (k, v) in root_cfg.resolved_resolutions(&root_cfg) {
                     if d.contains_key(&k) {
                         d.insert(k.clone(), v.clone());
                     }
@@ -2496,7 +2496,7 @@ pub fn resolve_deps_no_download_with_root(
     root_resolutions: &std::collections::BTreeMap<String, String>,
 ) -> Result<Vec<PathBuf>> {
     let mut registries: Vec<crate::workspace::resolver::RegistryEntry> = root_registries.to_vec();
-    let mut resolutions = cfg.resolved_resolutions();
+    let mut resolutions = cfg.resolved_resolutions(cfg);
     for (k, v) in root_resolutions {
         resolutions.insert(k.clone(), v.clone());
     }
@@ -2532,7 +2532,7 @@ pub fn resolve_deps_no_download_with_root(
 pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
-    let mut resolutions = cfg.resolved_resolutions();
+    let mut resolutions = cfg.resolved_resolutions(cfg);
 
     let deps = if let Some(ws_root) = config::find_workspace_root(project) {
         if ws_root != project {
@@ -2543,7 +2543,7 @@ pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<Pa
                     anyhow::bail!("{}", errors.join("; "));
                 }
                 let mut d = cfg.maven_dependencies_with_root(&root_cfg);
-                for (k, v) in root_cfg.resolved_resolutions() {
+                for (k, v) in root_cfg.resolved_resolutions(&root_cfg) {
                     if d.contains_key(&k) {
                         d.insert(k.clone(), v.clone());
                     }

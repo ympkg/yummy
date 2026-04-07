@@ -458,7 +458,7 @@ fn resolve_inner(
     let exclusion_set: HashSet<String> = exclusions.iter().cloned().collect();
     // Fast path: try to resolve entirely from lock file + local cache
     if resolutions.is_empty() {
-        if let Some(jars) = try_resolve_from_lock(dependencies, cache_dir, lock, &exclusion_set) {
+        if let Some(jars) = try_resolve_from_lock(dependencies, cache_dir, lock, &exclusion_set, resolutions) {
             return Ok(jars);
         }
     } else {
@@ -469,7 +469,7 @@ fn resolve_inner(
                 resolved_deps.insert(k.clone(), v.clone());
             }
         }
-        if let Some(jars) = try_resolve_from_lock(&resolved_deps, cache_dir, lock, &exclusion_set) {
+        if let Some(jars) = try_resolve_from_lock(&resolved_deps, cache_dir, lock, &exclusion_set, resolutions) {
             return Ok(jars);
         }
     }
@@ -968,6 +968,7 @@ fn try_resolve_from_lock(
     cache_dir: &Path,
     lock: &ResolvedCache,
     exclusion_set: &HashSet<String>,
+    resolutions: &BTreeMap<String, String>,
 ) -> Option<Vec<PathBuf>> {
     if lock.dependencies.is_empty() {
         return None;
@@ -1026,7 +1027,12 @@ fn try_resolve_from_lock(
         }
         if let Some(ref dep_keys) = locked.dependencies {
             for dep_key in dep_keys {
-                if let Some(mc) = MavenCoord::from_versioned_key(dep_key) {
+                if let Some(mut mc) = MavenCoord::from_versioned_key(dep_key) {
+                    // Apply resolutions to transitive deps (same as slow path)
+                    let ga = format!("{}:{}", mc.group_id, mc.artifact_id);
+                    if let Some(forced_version) = resolutions.get(&ga) {
+                        mc.version = forced_version.clone();
+                    }
                     queue.push_back(mc);
                 }
             }
@@ -2618,7 +2624,7 @@ mod tests {
     fn test_try_resolve_from_lock_empty() {
         let deps = BTreeMap::new();
         let lock = ResolvedCache::default();
-        let result = try_resolve_from_lock(&deps, Path::new("/tmp/cache"), &lock, &HashSet::new());
+        let result = try_resolve_from_lock(&deps, Path::new("/tmp/cache"), &lock, &HashSet::new(), &BTreeMap::new());
         // Empty lock returns None
         assert!(result.is_none());
     }

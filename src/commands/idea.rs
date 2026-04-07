@@ -44,7 +44,7 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
             let root_config_path = project.join(config::CONFIG_FILE);
             let root_cfg = config::load_config(&root_config_path)?;
             let root_registries = root_cfg.registry_entries();
-            let root_resolutions = root_cfg.resolved_resolutions();
+            let root_resolutions = root_cfg.resolved_resolutions(&root_cfg);
             let cache_dir = config::maven_cache_dir(&project);
 
             let packages = if let Some(ref target) = target {
@@ -189,7 +189,7 @@ fn build_modules_workspace(
     let root_config_path = root.join(config::CONFIG_FILE);
     let root_cfg = config::load_config(&root_config_path)?;
     let root_registries = root_cfg.registry_entries();
-    let root_resolutions = root_cfg.resolved_resolutions();
+    let root_resolutions = root_cfg.resolved_resolutions(&root_cfg);
     let cache_dir = config::maven_cache_dir(root);
 
     eprintln!("  Scanning {} modules...", packages.len());

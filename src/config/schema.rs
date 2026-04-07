@@ -507,11 +507,11 @@ impl YmConfig {
     /// - Exact: `"@scope/name" → "groupId:artifactId"`
     /// - Prefix: `"@scope" → "groupId"` (constructs `groupId:name`)
     /// Return version overrides from resolutions (keys resolved to Maven coordinates).
-    pub fn resolved_resolutions(&self) -> BTreeMap<String, String> {
+    pub fn resolved_resolutions(&self, root: &YmConfig) -> BTreeMap<String, String> {
         match self.resolutions {
             Some(ref res) => res
                 .iter()
-                .filter_map(|(k, v)| v.version().map(|ver| (self.resolve_key(k), ver.to_string())))
+                .filter_map(|(k, v)| v.version().map(|ver| (self.resolve_key(k), Self::resolve_var(ver, root))))
                 .collect(),
             None => BTreeMap::new(),
         }
