@@ -93,6 +93,7 @@ ym doctor                   # Diagnose environment issues
 ym info                     # Show project and environment info
 ym publish                  # Publish to Maven registry (--dry-run to preview)
 ym login                    # Login to a Maven registry
+ym cache clean              # Clean dependency cache (--pattern <p> for selective)
 ym workspace list           # List workspace packages
 ym workspace foreach -- CMD # Run command in each package (--parallel, --keep-going)
 ym <script>                 # Run script from [scripts] in package.toml
@@ -112,8 +113,7 @@ ymc test --watch            # Watch mode: re-run on change
 ymc test --coverage         # Generate JaCoCo coverage report
 ymc test --filter "MyTest"  # Filter test classes/methods
 ymc test --tag integration  # Run tests by JUnit @Tag
-ymc clean                   # Clean build outputs
-ymc clean --all             # Also remove Maven dependency cache
+ymc build --clean           # Clean build outputs and rebuild
 ymc idea                    # Generate IntelliJ IDEA project files
 ```
 

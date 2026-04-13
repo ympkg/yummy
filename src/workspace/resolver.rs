@@ -359,6 +359,34 @@ fn weaker_scope(a: &str, b: &str) -> String {
 }
 
 const DEFAULT_REPO: &str = "https://repo1.maven.org/maven2";
+const MAVEN_CENTRAL_ALT: &str = "https://repo.maven.apache.org/maven2";
+
+/// Known immutable Maven registries. Dependencies served from these URLs
+/// skip remote sha1 validation in the fast path — Maven Central release
+/// artifacts are immutable by convention, so validation is pure overhead.
+/// Private registries (Reposilite/Nexus/Artifactory) are NOT in this list
+/// because they commonly allow republishing.
+const IMMUTABLE_REGISTRIES: &[&str] = &[DEFAULT_REPO, MAVEN_CENTRAL_ALT];
+
+fn is_immutable_registry(url: &str) -> bool {
+    // IMMUTABLE_REGISTRIES entries carry no trailing slash.
+    IMMUTABLE_REGISTRIES.contains(&url.trim_end_matches('/'))
+}
+
+/// Build a rayon thread pool sized for I/O-bound network work. Higher
+/// thread count than `num_cpus` because each thread spends most of its
+/// time blocked on HTTP. Falls back to rayon's default pool if the custom
+/// one cannot be built; panics only if the default also fails.
+fn build_io_pool(num_threads: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .unwrap_or_else(|_| {
+            rayon::ThreadPoolBuilder::new()
+                .build()
+                .expect("rayon default thread pool failed to build")
+        })
+}
 
 /// Resolve all dependencies (including transitive) and download JARs.
 /// Returns list of JAR paths.
@@ -456,9 +484,12 @@ fn resolve_inner(
     download: bool,
 ) -> Result<Vec<PathBuf>> {
     let exclusion_set: HashSet<String> = exclusions.iter().cloned().collect();
-    // Fast path: try to resolve entirely from lock file + local cache
+    // Fast path: try to resolve entirely from lock file + local cache.
+    // Sha1 remote validation only runs when network is allowed (i.e. the
+    // caller would otherwise download on miss). `resolve_no_download`
+    // callers (e.g. `ym idea --json`) skip validation for zero-network use.
     if resolutions.is_empty() {
-        if let Some(jars) = try_resolve_from_lock(dependencies, cache_dir, lock, &exclusion_set, resolutions) {
+        if let Some(jars) = try_resolve_from_lock(dependencies, cache_dir, lock, &exclusion_set, resolutions, registries, download) {
             return Ok(jars);
         }
     } else {
@@ -469,7 +500,7 @@ fn resolve_inner(
                 resolved_deps.insert(k.clone(), v.clone());
             }
         }
-        if let Some(jars) = try_resolve_from_lock(&resolved_deps, cache_dir, lock, &exclusion_set, resolutions) {
+        if let Some(jars) = try_resolve_from_lock(&resolved_deps, cache_dir, lock, &exclusion_set, resolutions, registries, download) {
             return Ok(jars);
         }
     }
@@ -517,12 +548,6 @@ fn resolve_inner(
     let resolved_count = AtomicUsize::new(0);
     let show_resolve_progress = !crate::is_json_quiet() && !crate::RESOLVER_QUIET.load(Ordering::Relaxed);
 
-    // Use a dedicated thread pool (32 threads) for POM resolution — network-bound,
-    // benefits from high parallelism unlike CPU-bound compilation.
-    let resolve_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(32)
-        .build()
-        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
     while !queue.is_empty() {
         // Drain the current level for batched processing
@@ -565,7 +590,7 @@ fn resolve_inner(
         }
 
         // Resolve transitive deps for this level using dedicated 32-thread pool
-        let level_results: Vec<(MavenCoord, Vec<MavenCoord>)> = resolve_pool.install(|| {
+        let level_results: Vec<(MavenCoord, Vec<MavenCoord>)> = network_io_pool().install(|| {
             current_level
                 .par_iter()
                 .map(|coord| {
@@ -695,12 +720,7 @@ fn resolve_inner(
             }
         }
 
-        // Use a dedicated thread pool with more threads for I/O-bound downloads
-        let download_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(32)
-            .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
-        let download_results: Vec<(String, Result<String>)> = download_pool.install(|| {
+        let download_results: Vec<(String, Result<String>)> = network_io_pool().install(|| {
             coords_to_download
             .into_par_iter()
             .map(|(key, coord)| {
@@ -961,7 +981,13 @@ fn resolve_snapshot_version(
     None
 }
 
-/// Try to resolve all dependencies from lock file without network access.
+/// Try to resolve all dependencies from lock file without (usually) hitting
+/// the network. When `validate_sha1` is true, non-whitelist registries are
+/// probed with `.jar.sha1` to catch republished artifacts; the fast path
+/// falls back to re-resolve on a real mismatch and degrades to cache-only
+/// on network errors. The source registry for each dep is computed from
+/// `registries` via the same scope-routing rules used during the original
+/// download — no per-dep registry information is stored in the lock.
 /// Returns None if any dep is missing from lock or cache.
 fn try_resolve_from_lock(
     dependencies: &BTreeMap<String, String>,
@@ -969,6 +995,8 @@ fn try_resolve_from_lock(
     lock: &ResolvedCache,
     exclusion_set: &HashSet<String>,
     resolutions: &BTreeMap<String, String>,
+    registries: &[RegistryEntry],
+    validate_sha1: bool,
 ) -> Option<Vec<PathBuf>> {
     if lock.dependencies.is_empty() {
         return None;
@@ -1036,6 +1064,45 @@ fn try_resolve_from_lock(
                     queue.push_back(mc);
                 }
             }
+        }
+    }
+
+    // Remote sha1 validation: catch republished artifacts on mutable
+    // registries. The source registry for each dep is recomputed from
+    // `registries` via scope routing — the same logic that picked it at
+    // download time. Whitelist (Maven Central) entries skip validation.
+    //
+    // `ga_winners` only contains non-pom-only coords (see the `if !pom_only`
+    // guard upstream in this function), so pom-only artifacts are not
+    // validated here. Their POM staleness is a known minor gap — pom-only
+    // artifacts are rare and rarely republished.
+    if validate_sha1 {
+        let validation_targets: Vec<ValidationTarget> = ga_winners
+            .values()
+            .filter_map(|coord| {
+                let repos = repos_for_group_id(registries, &coord.group_id);
+                let repo = repos.first()?;
+                if is_immutable_registry(&repo.url) {
+                    return None;
+                }
+                Some(ValidationTarget {
+                    coord: coord.clone(),
+                    registry_url: repo.url.clone(),
+                })
+            })
+            .collect();
+
+        if !validate_sha1_remote(&validation_targets, cache_dir) {
+            // Real mismatch — surface a one-line hint so users understand
+            // why the slow path is kicking in, then let the caller fall
+            // through to re-resolve/re-download.
+            if !crate::is_progress_quiet() {
+                eprintln!(
+                    "{} dependency cache out of date (sha1 mismatch), re-resolving",
+                    console::style(format!("{:>12}", "info")).cyan().bold()
+                );
+            }
+            return None;
         }
     }
 
@@ -1110,10 +1177,7 @@ fn resolve_transitive_cached(
     }
 
     // Check on-disk POM cache (~/.ym/pom-cache/)
-    let pom_cache_dir = cache_dir
-        .parent()  // up from maven/ to .ym/
-        .unwrap_or(cache_dir)
-        .join(crate::config::POM_CACHE_DIR);
+    let pom_cache_dir = crate::config::pom_cache_dir();
     let pom_cache_file = pom_cache_dir
         .join(&coord.group_id)
         .join(&coord.artifact_id)
@@ -1688,6 +1752,239 @@ fn download_from_repos(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No repositories configured")))
+}
+
+/// A dep queued for sha1 validation.
+struct ValidationTarget {
+    coord: MavenCoord,
+    registry_url: String,
+}
+
+/// Compute the SHA-1 hex digest of a file in streaming fashion.
+fn compute_sha1_file(path: &Path) -> Result<String> {
+    use sha1::{Digest, Sha1};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Fetch a `.sha1` sidecar file from a Maven registry.
+/// Returns `Ok(Some(hash))` on success, `Ok(None)` for 404 (no sidecar),
+/// `Err(_)` for network / protocol failures.
+fn fetch_remote_sha1(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    creds: Option<&(String, String)>,
+) -> Result<Option<String>> {
+    let mut request = client.get(url);
+    if let Some((username, password)) = creds {
+        // Matches `download_file`: token format is `(token, "")` and works
+        // with both Basic and GitHub Packages auth.
+        request = request.basic_auth(username, Some(password));
+    }
+    let response = request.send()?;
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        bail!("HTTP {} for {}", response.status(), url);
+    }
+    let text = response.text()?;
+    // Maven .sha1 format: just the hex hash, or `hash  filename`.
+    let hash = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty sha1 response from {}", url))?;
+    Ok(Some(hash.to_lowercase()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sha1CheckResult {
+    Match,
+    Mismatch,
+    NetworkError,
+}
+
+fn check_remote_sha1(
+    file_path: &Path,
+    sha1_url: &str,
+    client: &reqwest::blocking::Client,
+    creds: Option<&(String, String)>,
+) -> Sha1CheckResult {
+    // A local read/hash failure (corrupted file) is a real cache fault.
+    // Report `Mismatch` so the slow path re-downloads and overwrites it.
+    let local_sha1 = match compute_sha1_file(file_path) {
+        Ok(s) => s,
+        Err(_) => return Sha1CheckResult::Mismatch,
+    };
+    match fetch_remote_sha1(client, sha1_url, creds) {
+        Ok(None) => Sha1CheckResult::Match, // No sidecar — trust cache
+        Ok(Some(remote)) => {
+            if local_sha1 == remote {
+                Sha1CheckResult::Match
+            } else {
+                Sha1CheckResult::Mismatch
+            }
+        }
+        Err(_) => Sha1CheckResult::NetworkError,
+    }
+}
+
+// Shared resources for network-bound resolution. Re-creating these on
+// every `resolve_inner` call would cost ~10ms of pool/TLS init per
+// invocation — painful in `ymc dev` watch loops where every file change
+// re-resolves. Lazy statics amortize the cost to once per process.
+//
+// The three phases (sha1 validation → POM BFS → JAR download) run
+// sequentially within a single `resolve_inner`, so one shared pool suffices
+// — keeping them separate would just pin 2× the thread stacks for no
+// concurrency gain.
+const NETWORK_POOL_THREADS: usize = 32;
+const SHA1_VALIDATION_CONNECT_MS: u64 = 800;
+const SHA1_VALIDATION_REQUEST_MS: u64 = 1000;
+
+static NETWORK_IO_POOL: std::sync::OnceLock<rayon::ThreadPool> =
+    std::sync::OnceLock::new();
+static SHA1_VALIDATION_CLIENT: std::sync::OnceLock<reqwest::blocking::Client> =
+    std::sync::OnceLock::new();
+
+fn network_io_pool() -> &'static rayon::ThreadPool {
+    NETWORK_IO_POOL.get_or_init(|| build_io_pool(NETWORK_POOL_THREADS))
+}
+
+fn sha1_validation_client() -> &'static reqwest::blocking::Client {
+    SHA1_VALIDATION_CLIENT.get_or_init(|| {
+        // `.sha1` files are ~40 bytes; a 1s per-request timeout is generous.
+        // reqwest follows redirects by default (seen on some Nexus setups).
+        reqwest::blocking::Client::builder()
+            .user_agent(concat!("ym/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_millis(SHA1_VALIDATION_CONNECT_MS))
+            .timeout(std::time::Duration::from_millis(SHA1_VALIDATION_REQUEST_MS))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new())
+    })
+}
+
+/// Check one target's JAR and POM sha1 against the registry. A missing
+/// local JAR or POM is reported as `Mismatch` by `check_remote_sha1` so the
+/// slow path re-downloads it.
+fn check_target(
+    t: &ValidationTarget,
+    cache_dir: &Path,
+    client: &reqwest::blocking::Client,
+    creds: Option<&(String, String)>,
+) -> Sha1CheckResult {
+    let jar_url = format!("{}.sha1", t.coord.jar_url(&t.registry_url));
+    match check_remote_sha1(&t.coord.jar_path(cache_dir), &jar_url, client, creds) {
+        Sha1CheckResult::Match => {}
+        other => return other,
+    }
+
+    let pom_url = format!("{}.sha1", t.coord.pom_url(&t.registry_url));
+    check_remote_sha1(&t.coord.pom_path(cache_dir), &pom_url, client, creds)
+}
+
+/// Validate locally cached JARs and POMs against registry-provided
+/// `.sha1` files.
+///
+/// Returns `true` when the fast path can safely proceed (all hashes match
+/// or we hit network errors — offline graceful degradation). Returns
+/// `false` only when a real mismatch is detected, so the slow path must
+/// re-resolve.
+fn validate_sha1_remote(targets: &[ValidationTarget], cache_dir: &Path) -> bool {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    if targets.is_empty() {
+        return true;
+    }
+
+    let client = sha1_validation_client();
+    let pool = network_io_pool();
+
+    // Resolve credentials once per unique registry URL. Typical cardinality
+    // is 1–3, so a linear-scan Vec is both faster and simpler than a hasher.
+    let mut creds_by_registry: Vec<(&str, Option<(String, String)>)> = Vec::new();
+    for t in targets {
+        if !creds_by_registry.iter().any(|(u, _)| *u == t.registry_url) {
+            creds_by_registry.push((
+                t.registry_url.as_str(),
+                load_credentials_for_url(&t.registry_url),
+            ));
+        }
+    }
+    let lookup_creds = |registry_url: &str| -> Option<&(String, String)> {
+        creds_by_registry
+            .iter()
+            .find(|(u, _)| *u == registry_url)
+            .and_then(|(_, c)| c.as_ref())
+    };
+
+    // Parallel fold with an `AtomicBool` short-circuit. Once any task
+    // observes a mismatch, subsequent tasks bail out immediately instead of
+    // paying the HTTP round-trip. We use a per-thread `(mismatches,
+    // network_errors)` accumulator and `reduce` the tree, avoiding the
+    // intermediate `Vec<Sha1CheckResult>` allocation entirely.
+    let abort = AtomicBool::new(false);
+    let (mismatches, network_errors) = pool.install(|| {
+        targets
+            .par_iter()
+            .fold(
+                || (0usize, 0usize),
+                |(m, n), t| {
+                    if abort.load(Ordering::Relaxed) {
+                        return (m, n);
+                    }
+                    let creds = lookup_creds(&t.registry_url);
+                    let r = check_target(t, cache_dir, client, creds);
+                    if matches!(r, Sha1CheckResult::Mismatch) {
+                        abort.store(true, Ordering::Relaxed);
+                    }
+                    match r {
+                        Sha1CheckResult::Match => (m, n),
+                        Sha1CheckResult::Mismatch => (m + 1, n),
+                        Sha1CheckResult::NetworkError => (m, n + 1),
+                    }
+                },
+            )
+            .reduce(
+                || (0usize, 0usize),
+                |(m1, n1), (m2, n2)| (m1 + m2, n1 + n2),
+            )
+    });
+
+    if mismatches > 0 {
+        return false;
+    }
+
+    if network_errors > 0 && !crate::is_progress_quiet() {
+        let total = targets.len();
+        if network_errors == total {
+            eprintln!(
+                "  {} offline mode, using cache (may be stale)",
+                console::style("warning").yellow()
+            );
+        } else {
+            eprintln!(
+                "  {} sha1 validation incomplete ({}/{} unreachable), using cache",
+                console::style("warning").yellow(),
+                network_errors,
+                total
+            );
+        }
+    }
+
+    true
 }
 
 /// Download a file and return its SHA-256 hash.
@@ -2601,7 +2898,7 @@ mod tests {
     #[test]
     fn test_check_conflicts_no_conflicts() {
         let mut lock = ResolvedCache::default();
-        lock.dependencies.insert("com.example:lib:1.0".to_string(), ResolvedDependency { sha256: None, dependencies: None, scope: None });
+        lock.dependencies.insert("com.example:lib:1.0".to_string(), ResolvedDependency::default());
         let conflicts = check_conflicts(&lock);
         assert!(conflicts.is_empty());
     }
@@ -2609,8 +2906,8 @@ mod tests {
     #[test]
     fn test_check_conflicts_detects_multiple_versions() {
         let mut lock = ResolvedCache::default();
-        lock.dependencies.insert("com.example:lib:1.0".to_string(), ResolvedDependency { sha256: None, dependencies: None, scope: None });
-        lock.dependencies.insert("com.example:lib:2.0".to_string(), ResolvedDependency { sha256: None, dependencies: None, scope: None });
+        lock.dependencies.insert("com.example:lib:1.0".to_string(), ResolvedDependency::default());
+        lock.dependencies.insert("com.example:lib:2.0".to_string(), ResolvedDependency::default());
         let conflicts = check_conflicts(&lock);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].0, "com.example:lib");
@@ -2624,7 +2921,7 @@ mod tests {
     fn test_try_resolve_from_lock_empty() {
         let deps = BTreeMap::new();
         let lock = ResolvedCache::default();
-        let result = try_resolve_from_lock(&deps, Path::new("/tmp/cache"), &lock, &HashSet::new(), &BTreeMap::new());
+        let result = try_resolve_from_lock(&deps, Path::new("/tmp/cache"), &lock, &HashSet::new(), &BTreeMap::new(), &[], false);
         // Empty lock returns None
         assert!(result.is_none());
     }

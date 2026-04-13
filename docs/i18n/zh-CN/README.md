@@ -93,6 +93,7 @@ ym doctor                   # 环境诊断
 ym info                     # 项目和环境信息
 ym publish                  # 发布到 Maven 仓库（--dry-run 预览）
 ym login                    # 登录 Maven 仓库
+ym cache clean              # 清理依赖缓存（--pattern <p> 按模式匹配）
 ym workspace list           # 列出工作空间所有包
 ym workspace foreach -- CMD # 在每个包中执行命令（--parallel, --keep-going）
 ym <script>                 # 执行 package.toml 中 [scripts] 定义的脚本
@@ -112,8 +113,7 @@ ymc test --watch            # 监听模式：文件变更自动重跑
 ymc test --coverage         # 生成 JaCoCo 覆盖率报告
 ymc test --filter "MyTest"  # 过滤测试类/方法
 ymc test --tag integration  # 按 JUnit @Tag 运行
-ymc clean                   # 清理构建产物
-ymc clean --all             # 同时清理 Maven 依赖缓存
+ymc build --clean           # 清理构建产物后重新编译
 ymc idea                    # 生成 IntelliJ IDEA 工程文件
 ```
 

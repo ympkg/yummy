@@ -276,6 +276,11 @@ enum YmCommands {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
+    /// Manage the dependency cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Generate shell completions
     Completions {
         /// Shell type (bash, zsh, fish, powershell)
@@ -284,6 +289,19 @@ enum YmCommands {
     /// Catch-all: run as script from [scripts]
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Clean the dependency cache
+    Clean {
+        /// Skip confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Pattern: artifactId, groupId:*, groupId:artifactId, or groupId:artifactId:version
+        #[arg(long)]
+        pattern: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -421,15 +439,6 @@ enum YmcCommands {
         #[arg(long)]
         parallel: bool,
     },
-    /// Clean build outputs and caches
-    Clean {
-        /// Also remove Maven dependency cache
-        #[arg(long)]
-        all: bool,
-        /// Skip confirmation
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
     /// Generate IntelliJ IDEA project files
     Idea {
         /// Target module name
@@ -562,6 +571,11 @@ fn ym_main() -> Result<()> {
                 commands::workspace_cmd::foreach(args, parallel, jobs, keep_going)
             }
         },
+        YmCommands::Cache { action } => match action {
+            CacheAction::Clean { yes, pattern } => {
+                commands::cache_clean::execute(yes, pattern.as_deref())
+            }
+        },
         YmCommands::Completions { shell } => {
             let mut cmd = YmCli::command();
             generate(shell, &mut cmd, "ym", &mut std::io::stdout());
@@ -612,7 +626,7 @@ fn run_script_external(args: &[String]) -> Result<()> {
         }
         None => {
             // Fallback: delegate known ymc commands so they work without scripts
-            let ymc_commands = ["build", "dev", "test", "idea", "clean", "vscode", "native"];
+            let ymc_commands = ["build", "dev", "test", "idea", "vscode", "native"];
             if ymc_commands.contains(&name.as_str()) {
                 let mut ymc_args = vec![name.clone()];
                 ymc_args.extend(args.iter().skip(1).cloned());
@@ -737,7 +751,6 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
             YmcCommands::Build { .. } => unreachable!(),
             YmcCommands::Dev { .. } => "dev server starting...",
             YmcCommands::Test { .. } => "running tests...",
-            YmcCommands::Clean { .. } => "cleaning...",
             YmcCommands::Idea { .. } => "generating IDEA project...",
             YmcCommands::Vscode { .. } => "generating VSCode settings...",
             YmcCommands::Native { .. } => "compiling native binary...",
@@ -751,7 +764,7 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
                 commands::build::set_parallelism(n);
             }
             if clean {
-                commands::clean::execute(false, true)?;
+                commands::clean::execute()?;
             }
             if let Some(ref out) = output {
                 commands::build::set_output_dir(out);
@@ -782,7 +795,6 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
                 verbose, fail_fast, timeout, coverage, list, keep_going, report, parallel,
             )
         }
-        YmcCommands::Clean { all, yes } => commands::clean::execute(all, yes),
         YmcCommands::Idea { target, sources, json } => commands::idea::execute(target, sources, json),
         YmcCommands::Vscode { target } => commands::vscode::execute(target),
         YmcCommands::Native { docker, out, platform, install } => commands::native_cmd::execute(docker, out, platform, install),

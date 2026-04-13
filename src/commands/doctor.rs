@@ -422,15 +422,14 @@ fn validate_config_schema(cfg: &crate::config::schema::YmConfig, project: &std::
 }
 
 fn check_maven_cache() {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let cache = crate::config::maven_cache_dir(&cwd);
+    let cache = crate::config::maven_cache_dir();
     if cache.exists() {
-        let size = dir_size(&cache);
+        let size = crate::config::dir_size(&cache);
         let jar_count = count_files_with_ext(&cache, "jar");
         println!(
             "  {} Maven cache  {} ({} JARs)",
             style("✓").green(),
-            style(format_size(size)).dim(),
+            style(crate::config::format_size(size)).dim(),
             jar_count
         );
     } else {
@@ -453,7 +452,7 @@ fn check_jar_integrity(fix: bool) -> bool {
         return true;
     }
 
-    let cache = crate::config::maven_cache_dir(&cwd);
+    let cache = crate::config::maven_cache_dir();
     let mut all_ok = true;
     let mut missing = 0;
     let mut corrupt = 0;
@@ -605,24 +604,3 @@ fn check_permissions(fix: bool) {
     }
 }
 
-fn dir_size(path: &std::path::Path) -> u64 {
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
-}
-
-fn format_size(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}

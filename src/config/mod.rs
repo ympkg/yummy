@@ -65,7 +65,7 @@ pub fn save_config(path: &Path, config: &YmConfig) -> Result<()> {
 
 /// Load the resolved dependency cache from .ym/resolved.json
 pub fn load_resolved_cache(project: &Path) -> Result<ResolvedCache> {
-    let path = cache_dir(project).join(RESOLVED_FILE);
+    let path = resolved_cache_path(project);
     if !path.exists() {
         return Ok(ResolvedCache::default());
     }
@@ -91,9 +91,12 @@ pub fn load_resolved_cache_checked(project: &Path, cfg: &YmConfig) -> Result<Res
 /// Save the resolved dependency cache to .ym/resolved.json
 /// Skips writing if the content is unchanged (preserves mtime for fingerprinting).
 pub fn save_resolved_cache(project: &Path, cache: &ResolvedCache) -> Result<()> {
-    let dir = cache_dir(project);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(RESOLVED_FILE);
+    // One call to `cache_dir` (via `resolved_cache_path`) — the enclosing
+    // directory is derived from the file path for symmetry with `load`.
+    let path = resolved_cache_path(project);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let content = serde_json::to_string_pretty(cache)? + "\n";
     // Only write if content has changed, to preserve mtime for build fingerprinting
     if let Ok(existing) = std::fs::read_to_string(&path) {
@@ -174,9 +177,44 @@ pub fn cache_dir(project: &Path) -> PathBuf {
     root.join(CACHE_DIR)
 }
 
-pub fn maven_cache_dir(_project: &Path) -> PathBuf {
+pub fn maven_cache_dir() -> PathBuf {
     dirs::home_dir()
         .expect("Cannot determine home directory")
         .join(CACHE_DIR)
         .join(MAVEN_CACHE_DIR)
+}
+
+pub fn pom_cache_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("Cannot determine home directory")
+        .join(CACHE_DIR)
+        .join(POM_CACHE_DIR)
+}
+
+pub fn resolved_cache_path(project: &Path) -> PathBuf {
+    cache_dir(project).join(RESOLVED_FILE)
+}
+
+/// Missing path returns 0 rather than erroring so callers (clean, doctor)
+/// can skip existence pre-checks.
+pub fn dir_size(path: &Path) -> u64 {
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+pub fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }

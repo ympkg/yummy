@@ -199,7 +199,7 @@ pub fn execute(dep: &str, scope: Option<&str>, classifier: Option<&str>) -> Resu
 
     // Try to download immediately
     let project = config::project_dir(&config_path);
-    let cache = config::maven_cache_dir(&project);
+    let cache = config::maven_cache_dir();
     let mut resolved = config::load_resolved_cache(&project)?;
 
     let mut single_dep = std::collections::BTreeMap::new();
@@ -359,8 +359,7 @@ fn add_url_dependency(
     );
 
     // Try to download immediately
-    let project = config::project_dir(config_path);
-    let cache = config::maven_cache_dir(&project);
+    let cache = config::maven_cache_dir();
     let jar_dir = cache.join("url-deps");
     std::fs::create_dir_all(&jar_dir)?;
     let jar_path = jar_dir.join(filename);

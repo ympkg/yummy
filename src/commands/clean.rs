@@ -3,7 +3,10 @@ use console::style;
 
 use crate::config;
 
-pub fn execute(all: bool, yes: bool) -> Result<()> {
+/// Clean build outputs and incremental-compilation fingerprints.
+/// Invoked internally by `ymc build --clean`; user-facing dependency-cache
+/// cleanup lives in `cache_clean` and is exposed as `ym cache clean`.
+pub fn execute() -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
@@ -29,7 +32,9 @@ pub fn execute(all: bool, yes: bool) -> Result<()> {
         }
     }
 
-    // Remove workspace build fingerprints and incremental compilation fingerprints
+    // Incremental compiler fingerprints must be cleared when out/ is deleted,
+    // otherwise the incremental compiler sees stale fingerprints + empty
+    // out/classes and incorrectly returns UpToDate without restoring from cache.
     let cache = config::cache_dir(&project);
     if cache.exists() {
         if let Ok(entries) = std::fs::read_dir(&cache) {
@@ -43,66 +48,12 @@ pub fn execute(all: bool, yes: bool) -> Result<()> {
                 }
             }
         }
-        // Remove per-module incremental fingerprints (must be cleared when out/ is deleted,
-        // otherwise incremental compiler sees stale fingerprints + empty out/classes
-        // and incorrectly returns UpToDate without restoring from cache)
         let fp_dir = cache.join("fingerprints");
         if fp_dir.exists() {
             let _ = std::fs::remove_dir_all(&fp_dir);
         }
     }
 
-    if all {
-        // Confirm before deleting dependency cache
-        if !yes {
-            let maven_cache = config::maven_cache_dir(&project);
-            if maven_cache.exists() {
-                let size = dir_size(&maven_cache);
-                let confirm = dialoguer::Confirm::new()
-                    .with_prompt(format!(
-                        "  Delete Maven dependency cache ({:.1} MB)?",
-                        size as f64 / 1_048_576.0
-                    ))
-                    .default(false)
-                    .interact()?;
-                if !confirm {
-                    println!("  {} Skipped cache deletion", style("!").yellow());
-                    println!("  {} Clean complete", style("✓").green());
-                    return Ok(());
-                }
-            }
-        }
-
-        // Remove .ym/cache/ (Maven dependency cache)
-        let maven_cache = config::maven_cache_dir(&project);
-        if maven_cache.exists() {
-            let size = dir_size(&maven_cache);
-            std::fs::remove_dir_all(&maven_cache)?;
-            println!(
-                "  {} Removed Maven cache ({:.1} MB)",
-                style("✓").green(),
-                size as f64 / 1_048_576.0
-            );
-        }
-
-        // Remove resolved cache
-        let resolved_path = config::cache_dir(&project).join(config::RESOLVED_FILE);
-        if resolved_path.exists() {
-            std::fs::remove_file(&resolved_path)?;
-            println!("  {} Removed resolved cache", style("✓").green());
-        }
-    }
-
     println!("  {} Clean complete", style("✓").green());
     Ok(())
-}
-
-fn dir_size(path: &std::path::Path) -> u64 {
-    walkdir::WalkDir::new(path)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
 }

@@ -845,7 +845,7 @@ fn test_workspace(
     // Also resolve all Maven dependencies (including test-scoped) for the target
     {
         let all_deps = target_pkg.config.maven_dependencies();
-        let cache = config::maven_cache_dir(&target_pkg.path);
+        let cache = config::maven_cache_dir();
         let mut resolved = config::load_resolved_cache(&target_pkg.path)?;
         let extra_jars = crate::workspace::resolver::resolve_and_download(&all_deps, &cache, &mut resolved)?;
         config::save_resolved_cache(&target_pkg.path, &resolved)?;

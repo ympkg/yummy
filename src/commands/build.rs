@@ -528,7 +528,7 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
     let total_deps: usize = all_module_deps.iter().map(|(_, deps)| deps.len()).sum();
     spinner.set_message(format!("Resolving dependencies ({} modules, {} artifacts)...", packages.len(), total_deps));
 
-    let cache = config::maven_cache_dir(root);
+    let cache = config::maven_cache_dir();
     let mut resolved = config::load_resolved_cache_checked(root, root_cfg)?;
     let registries = root_cfg.registry_entries();
     let mut exclusions = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
@@ -1952,7 +1952,7 @@ pub fn collect_plugin_managed_versions(project: &Path, cfg: &YmConfig) -> Result
         std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
     let mut managed = std::collections::BTreeMap::new();
-    let cache_dir = config::maven_cache_dir(project);
+    let cache_dir = config::maven_cache_dir();
     let plugin_base = cache_dir.join("sh.yummy");
 
     if !plugin_base.exists() { return Ok(managed); }
@@ -2261,7 +2261,7 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
         }
     }
 
-    let cache = config::maven_cache_dir(project);
+    let cache = config::maven_cache_dir();
 
     if deps.is_empty() {
         // Even with no Maven deps, may have URL/Git/lib deps
@@ -2419,7 +2419,7 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
         }
     }
 
-    let cache = config::maven_cache_dir(project);
+    let cache = config::maven_cache_dir();
 
     if deps.is_empty() {
         // Even with no Maven deps, may have URL/Git/lib deps
@@ -2568,7 +2568,7 @@ pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<Pa
         }
     }
 
-    let cache = config::maven_cache_dir(project);
+    let cache = config::maven_cache_dir();
 
     if deps.is_empty() {
         let jars = resolve_lib_dirs(project, cfg);
@@ -2704,7 +2704,7 @@ fn resolve_annotation_processors(project: &Path, cfg: &YmConfig, classpath: &[Pa
     if let Some(coords) = cfg.compiler.as_ref().and_then(|c| c.annotation_processors.as_ref()) {
         if !coords.is_empty() {
             let deps = cfg.maven_dependencies();
-            let cache = config::maven_cache_dir(project);
+            let cache = config::maven_cache_dir();
             let mut jars = Vec::new();
             for coord in coords {
                 // Resolve @scope/name to groupId:artifactId for lookup

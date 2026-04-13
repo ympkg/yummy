@@ -383,9 +383,8 @@ fn default_scripts() -> BTreeMap<String, config::schema::ScriptValue> {
     s.insert("test".into(), ScriptValue::Simple("ymc test".into()));
     s.insert("test:watch".into(), ScriptValue::Simple("ymc test --watch".into()));
     s.insert("test:coverage".into(), ScriptValue::Simple("ymc test --coverage".into()));
-    // Clean
-    s.insert("clean".into(), ScriptValue::Simple("ymc clean -y".into()));
-    s.insert("clean:all".into(), ScriptValue::Simple("ymc clean --all -y".into()));
+    // Clean: dependency cache (ymc clean was removed; rebuild via `ymc build --clean`)
+    s.insert("clean".into(), ScriptValue::Simple("ym cache clean -y".into()));
     // IDE
     s.insert("idea".into(), ScriptValue::Simple("ymc idea --sources".into()));
     // Native

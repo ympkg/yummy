@@ -898,7 +898,7 @@ impl Default for ResolvedCache {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ResolvedDependency {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,

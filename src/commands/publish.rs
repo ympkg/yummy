@@ -149,7 +149,7 @@ fn publish_single_local(project: &Path, cfg: &config::schema::YmConfig, root_ver
     let version = cfg.version.as_deref()
         .or(root_version)
         .unwrap_or("0.0.0");
-    let cache_dir = config::maven_cache_dir(project);
+    let cache_dir = config::maven_cache_dir();
     let dest = cache_dir
         .join(&cfg.group_id)
         .join(&cfg.name)
@@ -231,7 +231,7 @@ fn publish_all_local(config_path: &Path, workspace_root: &Path) -> Result<()> {
         format!("{:.1}s", elapsed.as_secs_f64())
     };
 
-    let cache_dir = config::maven_cache_dir(workspace_root);
+    let cache_dir = config::maven_cache_dir();
     println!();
     println!(
         "  {} {} installed, {} failed in {} → {}",
@@ -627,7 +627,7 @@ fn generate_javadoc_jar(project: &Path, cfg: &config::schema::YmConfig, version_
     std::fs::create_dir_all(&javadoc_dir)?;
 
     // Build classpath for javadoc (same as compile classpath)
-    let cache = config::maven_cache_dir(project);
+    let cache = config::maven_cache_dir();
     let cp_str: String = walkdir::WalkDir::new(&cache)
         .into_iter()
         .filter_map(|e| e.ok())
