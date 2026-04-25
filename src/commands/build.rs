@@ -1149,8 +1149,23 @@ fn build_library_jar(project: &Path, cfg: &YmConfig, root_version: Option<&str>)
     Ok(())
 }
 
-/// Build a Spring Boot nested JAR (executable) containing loader classes at the root,
-/// application classes under BOOT-INF/classes/, and dependency JARs (STORED) under BOOT-INF/lib/.
+/// Build a Spring Boot fat jar — entry point for ADR-009 packaging dispatch.
+///
+/// Application type detection (ADR-009 / KR17.1): if the fat jar closure (compile + runtime
+/// scope, excluding provided + test) is a Spring Boot app, use Path A (nested layout);
+/// otherwise fall back to Path B (uber jar with Shadow-style transformers).
+///
+/// Detection is equivalent to the spec's "contains org.springframework.boot:spring-boot core
+/// artifact" check — SB apps transitively depend on spring-boot-autoconfigure, so we infer
+/// the SB version from its jar name and locate/download the matching spring-boot-loader.
+///
+/// Path A (this function): spring-boot-loader nested layout
+/// - loader classes at the root (org/springframework/boot/loader/**)
+/// - app .class + resources under BOOT-INF/classes/
+/// - dependency jars under BOOT-INF/lib/<artifactId>-<version>.jar (STORED, not unpacked)
+/// - MANIFEST aligned with spring-boot-maven-plugin's default output
+///
+/// Path B (`build_release_jar_flat` fallback): used when spring-boot-loader cannot be located.
 pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf], output_base: Option<&Path>, root_version: Option<&str>) -> Result<()> {
     use std::io::{Read, Write};
 
@@ -1276,32 +1291,40 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
     );
 
     let main_class = cfg.main.as_deref().unwrap_or("com.example.Application");
+    // MANIFEST fields aligned with spring-boot-maven-plugin's default output (ADR-009).
+    // Build-Jdk-Spec is taken from the app's target version rather than the host JDK.
+    let target_jdk = cfg.target.as_deref().unwrap_or("25");
     let manifest = format!(
         "Manifest-Version: 1.0\n\
+         Created-By: ym/{}\n\
+         Build-Jdk-Spec: {}\n\
+         Implementation-Title: {}\n\
+         Implementation-Version: {}\n\
          Main-Class: org.springframework.boot.loader.launch.JarLauncher\n\
          Start-Class: {}\n\
          Spring-Boot-Version: {}\n\
          Spring-Boot-Classes: BOOT-INF/classes/\n\
          Spring-Boot-Lib: BOOT-INF/lib/\n\
          Spring-Boot-Classpath-Index: BOOT-INF/classpath.idx\n\
-         Spring-Boot-Layers-Index: BOOT-INF/layers.idx\n\
-         Implementation-Title: {}\n\
-         Implementation-Version: {}\n\
-         Build-Jdk-Spec: 25\n\
-         Built-By: ym {}\n\n",
-        main_class, spring_boot_version, cfg.name, effective_version, env!("CARGO_PKG_VERSION")
+         Spring-Boot-Layers-Index: BOOT-INF/layers.idx\n\n",
+        env!("CARGO_PKG_VERSION"), target_jdk, cfg.name, effective_version,
+        main_class, spring_boot_version
     );
 
     zip_writer.add_directory("META-INF/", deflated_options)?;
     zip_writer.start_file("META-INF/MANIFEST.MF", deflated_options)?;
     zip_writer.write_all(manifest.as_bytes())?;
 
-    // ── Step 4: Write FileSystemProvider service file ─────────────────────
+    // ── Step 4: Prepare META-INF/services/ directory entry ────────────────
+    // The FileSystemProvider SPI file itself is extracted from the loader jar in Step 5
+    // (tracks loader version, avoids hardcoding the provider class name).
     zip_writer.add_directory("META-INF/services/", deflated_options)?;
-    zip_writer.start_file("META-INF/services/java.nio.file.spi.FileSystemProvider", deflated_options)?;
-    zip_writer.write_all(b"org.springframework.boot.loader.nio.file.NestedFileSystemProvider\n")?;
 
-    // ── Step 5: Extract loader classes from spring-boot-loader JAR ───────
+    // ── Step 5: Extract spring-boot-loader resources ──────────────────────
+    // From the loader jar:
+    // - org/springframework/boot/loader/** classes (recursive, all subpackages)
+    // - META-INF/services/java.nio.file.spi.FileSystemProvider (required for nested:// URL scheme)
+    // - META-INF/LICENSE.txt + NOTICE.txt (Apache 2.0 redistribution compliance)
     eprint!(
         "\r{} {} [loader classes] {:.1}s   ",
         style(format!("{:>12}", "Packaging")).green().bold(),
@@ -1352,8 +1375,13 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
                 Err(_) => continue,
             };
             let name = entry.name().to_string();
-            // Only extract org/springframework/boot/loader/** class files
-            if !name.starts_with("org/springframework/boot/loader/") || entry.is_dir() {
+            let should_extract = !entry.is_dir() && (
+                name.starts_with("org/springframework/boot/loader/")
+                || name == "META-INF/services/java.nio.file.spi.FileSystemProvider"
+                || name == "META-INF/LICENSE.txt"
+                || name == "META-INF/NOTICE.txt"
+            );
+            if !should_extract {
                 continue;
             }
             zip_writer.start_file(&name, deflated_options)?;
@@ -1401,6 +1429,9 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
 
     let mut classpath_entries: Vec<String> = Vec::new();
     let mut dep_jar_filenames: Vec<String> = Vec::new();
+    // Defensive duplicate-entry guard for BOOT-INF/lib/ (ADR-009 / KR17.4).
+    // dedup_jars_by_artifact already removes duplicates by GA; this catches edge cases.
+    let mut lib_entries_seen: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
 
     for (idx, dep) in jars.iter().enumerate() {
         if !dep.exists() || dep.is_dir() {
@@ -1432,6 +1463,12 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
 
         let lib_entry_name = format!("BOOT-INF/lib/{}", dep_filename);
 
+        if let Some(sources) = lib_entries_seen.get_mut(&lib_entry_name) {
+            sources.push(dep.display().to_string());
+            continue;
+        }
+        lib_entries_seen.insert(lib_entry_name.clone(), vec![dep.display().to_string()]);
+
         // Read the entire JAR file and write as STORED entry
         let mut jar_bytes = Vec::new();
         let mut f = std::fs::File::open(dep)?;
@@ -1446,6 +1483,24 @@ pub(crate) fn build_release_jar(project: &Path, cfg: &YmConfig, jars: &[PathBuf]
 
     // Clear progress line
     eprint!("\r{}\r", " ".repeat(80));
+
+    // Fail with all source jars listed if any BOOT-INF/lib/ entry was duplicated.
+    let dup_entries: Vec<(&String, &Vec<String>)> = lib_entries_seen.iter()
+        .filter(|(_, sources)| sources.len() > 1)
+        .collect();
+    if !dup_entries.is_empty() {
+        let mut msg = String::from("Duplicate entries in BOOT-INF/lib/:\n");
+        for (name, sources) in &dup_entries {
+            msg.push_str(&format!(
+                "  Duplicate entry: {} (from: {})\n",
+                name,
+                sources.join(", ")
+            ));
+        }
+        msg.push_str("\nThis indicates a bug in dependency deduplication. \
+                      Please report at https://github.com/ympkg/yummy/issues");
+        bail!(msg);
+    }
 
     // ── Step 8: Write BOOT-INF/classpath.idx ─────────────────────────────
     eprint!(
@@ -1522,7 +1577,14 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
 
     incremental::copy_dir_recursive(&out, &staging)?;
 
+    // Path B execution order (ADR-009 / KR17.3):
+    //   1. Collect app entries (via copy_dir_recursive above) + entries from each dependency
+    //   2. Per-path rules: whitelist merge / blacklist discard / first-wins on conflict
+    //   3. Duplicate guard (KR17.4): if anything still collides after step 2, fail
+    //   4. Write everything to the zip in one pass
     let mut mergeable: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    // For non-mergeable conflicts: record the source jars that lost (first writer wins).
+    let mut conflicts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
 
     let total_deps = jars.len();
     let pack_start = Instant::now();
@@ -1539,6 +1601,10 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
             total_deps,
             pack_start.elapsed().as_secs_f64()
         );
+
+        let dep_filename = dep.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| dep.display().to_string());
 
         if dep.is_dir() {
             incremental::copy_dir_recursive(dep, &staging)?;
@@ -1559,7 +1625,13 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
                 };
                 let name = entry.name().to_string();
 
+                // Blacklist (matches Shadow Plugin's default exclusions):
+                // - dependency MANIFEST.MF (ym generates the final one)
+                // - INDEX.LIST (jar index, invalid after flattening)
+                // - signature blocks (.SF/.DSA/.RSA/.EC, original signature invalidated)
+                // - traversal / unsafe paths
                 if name == "META-INF/MANIFEST.MF"
+                    || name == "META-INF/INDEX.LIST"
                     || name.starts_with('/')
                     || name.contains("..")
                     || (name.starts_with("META-INF/") && (
@@ -1572,6 +1644,10 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
                     continue;
                 }
 
+                // Whitelist merge (matches Shadow Plugin's recommended transformers):
+                // - META-INF/services/* (Java SPI / ServiceLoader)
+                // - META-INF/spring.factories (still used by Spring Framework)
+                // - META-INF/spring/*.imports (SB 3.0+ AutoConfiguration / EnvironmentPostProcessor)
                 let is_mergeable = !entry.is_dir() && (
                     name.starts_with("META-INF/services/") ||
                     name == "META-INF/spring.factories" ||
@@ -1591,7 +1667,10 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
                     if let Some(parent) = target.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if let Ok(mut out_file) = std::fs::File::create(&target) {
+                    if target.exists() {
+                        // First writer wins; collect every losing source for the summary warning.
+                        conflicts.entry(name).or_default().push(dep_filename.clone());
+                    } else if let Ok(mut out_file) = std::fs::File::create(&target) {
                         let _ = std::io::copy(&mut entry, &mut out_file);
                     }
                 }
@@ -1599,6 +1678,26 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
         }
     }
     eprint!("\r{}\r", " ".repeat(60));
+
+    // Summary warning: list every losing source jar for the first few conflicts.
+    if !conflicts.is_empty() {
+        let total = conflicts.len();
+        println!(
+            "{} {} conflicting entries (kept first occurrence)",
+            style(format!("{:>12}", "warning")).yellow().bold(),
+            total
+        );
+        for (path, sources) in conflicts.iter().take(5) {
+            println!(
+                "             {}: ignored from {}",
+                path,
+                sources.join(", ")
+            );
+        }
+        if total > 5 {
+            println!("             ... and {} more", total - 5);
+        }
+    }
 
     for (meta_file, contents) in &mergeable {
         let merged_path = staging.join(meta_file);
@@ -3084,7 +3183,12 @@ pub fn write_classes_jar(
     // Classes + directory entries
     let mut class_count = 0u32;
     if classes_dir.exists() {
+        // Fix for jarvis-commerce Duplicate filename bug:
+        // META-INF/ was added above; seed added_dirs so walkdir doesn't add it again.
+        // Also skip the user's META-INF/MANIFEST.MF so it doesn't overwrite the one above.
         let mut added_dirs = std::collections::HashSet::new();
+        added_dirs.insert("META-INF/".to_string());
+
         for entry in walkdir::WalkDir::new(classes_dir) {
             let entry = entry?;
             let path = entry.path();
@@ -3098,6 +3202,9 @@ pub fn write_classes_jar(
                     zip.add_directory(&dir_name, options)?;
                 }
             } else {
+                if name == "META-INF/MANIFEST.MF" {
+                    continue;
+                }
                 if name.ends_with(".class") {
                     class_count += 1;
                 }
@@ -3117,4 +3224,97 @@ pub fn write_classes_jar(
 
     zip.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Regression for the jarvis-commerce Duplicate filename bug (Phase 10 / KR17.4).
+    /// When classes_dir contains arbitrary META-INF/ resources, write_classes_jar must
+    /// not raise "invalid Zip archive: Duplicate filename" — the root cause was
+    /// META-INF/ being added once by add_directory and again by walkdir.
+    #[test]
+    fn test_write_classes_jar_with_meta_inf_resources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let classes_dir = tmp.path().join("classes");
+        let meta_inf = classes_dir.join("META-INF");
+        let spring_dir = meta_inf.join("spring");
+        std::fs::create_dir_all(&spring_dir).unwrap();
+
+        // Same shape of META-INF/ resources that triggered the jarvis-commerce bug.
+        std::fs::write(meta_inf.join("spring.factories"), "key=value\n").unwrap();
+        std::fs::write(meta_inf.join("anything.txt"), "trigger\n").unwrap();
+        std::fs::write(spring_dir.join("X.imports"), "com.example.A\n").unwrap();
+
+        let class_dir = classes_dir.join("com").join("example");
+        std::fs::create_dir_all(&class_dir).unwrap();
+        std::fs::write(class_dir.join("Foo.class"), b"\xCA\xFE\xBA\xBE").unwrap();
+
+        let jar_path = tmp.path().join("test.jar");
+        write_classes_jar(&jar_path, &classes_dir, "test", "0.1.0")
+            .expect("write_classes_jar must not fail with Duplicate filename");
+
+        let file = std::fs::File::open(&jar_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+
+        assert!(names.contains(&"META-INF/MANIFEST.MF".to_string()), "MANIFEST.MF missing");
+        assert!(names.contains(&"META-INF/spring.factories".to_string()), "spring.factories missing");
+        assert!(names.contains(&"META-INF/anything.txt".to_string()), "anything.txt (jarvis-commerce trigger) missing");
+        assert!(names.contains(&"META-INF/spring/X.imports".to_string()), "spring/*.imports missing");
+        assert!(names.contains(&"com/example/Foo.class".to_string()), "Foo.class missing");
+
+        // Core regression assertion: META-INF/ must appear exactly once.
+        let meta_inf_dir_count = names.iter().filter(|n| *n == "META-INF/").count();
+        assert_eq!(meta_inf_dir_count, 1, "META-INF/ should appear exactly once (no Duplicate)");
+    }
+
+    /// A user-supplied META-INF/MANIFEST.MF in classes_dir must not overwrite the one
+    /// generated by ym; walkdir must skip it.
+    #[test]
+    fn test_write_classes_jar_skips_user_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let classes_dir = tmp.path().join("classes");
+        let meta_inf = classes_dir.join("META-INF");
+        std::fs::create_dir_all(&meta_inf).unwrap();
+
+        let user_manifest = "Manifest-Version: 1.0\nUser-Custom: should-not-leak\n";
+        std::fs::write(meta_inf.join("MANIFEST.MF"), user_manifest).unwrap();
+        std::fs::write(classes_dir.join("Foo.class"), b"\xCA\xFE\xBA\xBE").unwrap();
+
+        let jar_path = tmp.path().join("test.jar");
+        write_classes_jar(&jar_path, &classes_dir, "mylib", "0.1.0").unwrap();
+
+        let file = std::fs::File::open(&jar_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut manifest_file = archive.by_name("META-INF/MANIFEST.MF").unwrap();
+        let mut manifest_content = String::new();
+        manifest_file.read_to_string(&mut manifest_content).unwrap();
+
+        assert!(manifest_content.contains("Implementation-Title: mylib"),
+            "manifest should be ym-generated, got:\n{}", manifest_content);
+        assert!(!manifest_content.contains("User-Custom: should-not-leak"),
+            "user-provided MANIFEST.MF should not leak into the final jar");
+    }
+
+    /// Edge case: an empty classes_dir must not panic — should still produce a jar
+    /// containing at least META-INF/ + MANIFEST.MF.
+    #[test]
+    fn test_write_classes_jar_empty_classes_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let classes_dir = tmp.path().join("classes");
+        std::fs::create_dir_all(&classes_dir).unwrap();
+
+        let jar_path = tmp.path().join("test.jar");
+        write_classes_jar(&jar_path, &classes_dir, "empty", "0.1.0").unwrap();
+
+        assert!(jar_path.exists(), "jar should be created even with empty classes_dir");
+        let file = std::fs::File::open(&jar_path).unwrap();
+        let archive = zip::ZipArchive::new(file).unwrap();
+        assert!(archive.len() >= 2, "jar should at least have META-INF/ + MANIFEST.MF");
+    }
 }
