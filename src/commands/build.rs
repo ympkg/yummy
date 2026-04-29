@@ -1979,6 +1979,7 @@ pub fn build_with_plugins(
 /// Similar to Gradle's `jar` task. Output: <module>/out/release/<name>.thin.<version>.jar
 fn package_thin_jar(project: &Path, cfg: &config::schema::YmConfig, version: &str) -> Result<PathBuf> {
     let classes_dir = config::output_classes_dir(project);
+    let source_dir = config::source_dir_for(project, cfg);
     let jar_name = format!("{}.thin.{}.jar", cfg.name, version);
     let release_dir = project.join("out").join("release");
     std::fs::create_dir_all(&release_dir)?;
@@ -2000,7 +2001,7 @@ fn package_thin_jar(project: &Path, cfg: &config::schema::YmConfig, version: &st
         }
     }
 
-    write_classes_jar(&jar_path, &classes_dir, &cfg.name, version)?;
+    write_classes_jar(&jar_path, &classes_dir, &source_dir, &cfg.name, version)?;
     Ok(jar_path)
 }
 
@@ -3162,9 +3163,16 @@ pub fn resolve_lib_dirs(project: &Path, cfg: &YmConfig) -> Vec<PathBuf> {
 
 /// Write a standard JAR from a classes directory, including META-INF/MANIFEST.MF
 /// and proper directory entries (required for Spring Boot nested JAR scanning).
+///
+/// `source_dir` is used to differentiate two failure modes (see ADR-010):
+/// - has .java sources but 0 valid .class output → bail (javac failed silently or wrong config)
+/// - no .java sources at all (placeholder module) → warn + skip (commit 267ec7b semantics)
+///
+/// Any 0-byte .class file aborts unconditionally — never a legitimate state.
 pub fn write_classes_jar(
     jar_path: &Path,
     classes_dir: &Path,
+    source_dir: &Path,
     name: &str,
     version: &str,
 ) -> anyhow::Result<()> {
@@ -3193,22 +3201,32 @@ pub fn write_classes_jar(
             let entry = entry?;
             let path = entry.path();
             let rel = path.strip_prefix(classes_dir)?;
-            let name = rel.to_string_lossy().replace('\\', "/");
-            if name.is_empty() { continue; }
+            let entry_name = rel.to_string_lossy().replace('\\', "/");
+            if entry_name.is_empty() { continue; }
 
             if entry.file_type().is_dir() {
-                let dir_name = if name.ends_with('/') { name } else { format!("{}/", name) };
+                let dir_name = if entry_name.ends_with('/') { entry_name } else { format!("{}/", entry_name) };
                 if added_dirs.insert(dir_name.clone()) {
                     zip.add_directory(&dir_name, options)?;
                 }
             } else {
-                if name == "META-INF/MANIFEST.MF" {
+                if entry_name == "META-INF/MANIFEST.MF" {
                     continue;
                 }
-                if name.ends_with(".class") {
+                if entry_name.ends_with(".class") {
+                    // ADR-010 Defense ①: refuse 0-byte class — never a legitimate state.
+                    let len = entry.metadata()?.len();
+                    if len == 0 {
+                        anyhow::bail!(
+                            "Refusing to package 0-byte class file: {}\n\
+                             This usually indicates an interrupted javac run, OOM, or filesystem error.\n\
+                             Run `ym clean && ym build` to recompile from scratch.",
+                            path.display()
+                        );
+                    }
                     class_count += 1;
                 }
-                zip.start_file(&name, options)?;
+                zip.start_file(&entry_name, options)?;
                 let mut f = std::fs::File::open(path)?;
                 std::io::copy(&mut f, &mut zip)?;
             }
@@ -3216,14 +3234,35 @@ pub fn write_classes_jar(
     }
 
     if class_count == 0 {
+        // ADR-010 Defense ②: differentiate "has sources but 0 classes" from "no sources at all".
+        // The former is a real bug (javac failed silently or misconfig); the latter is the
+        // legitimate placeholder-module case that commit 267ec7b downgraded to warn.
+        if has_java_sources(source_dir) {
+            anyhow::bail!(
+                "JAR for '{}' contains no .class files but source dir '{}' has .java files.\n\
+                 This usually indicates a silent javac failure or misconfigured sourceDir/target.\n\
+                 Inspect prior compile output, then run `ym clean && ym build`.",
+                name, source_dir.display()
+            );
+        }
         eprintln!(
-            "  {} JAR for '{}' contains no .class files — classes dir '{}' is empty or missing. Skipping.",
-            console::style("Warning:").yellow().bold(), name, classes_dir.display()
+            "  {} JAR for '{}' contains no .class files — source dir '{}' has no .java files (placeholder module). Skipping.",
+            console::style("Warning:").yellow().bold(), name, source_dir.display()
         );
     }
 
     zip.finish()?;
     Ok(())
+}
+
+/// Walk `src_dir` and return true if any `.java` file exists.
+/// Used by `write_classes_jar` to differentiate placeholder modules from compile failures.
+fn has_java_sources(src_dir: &Path) -> bool {
+    if !src_dir.exists() { return false; }
+    walkdir::WalkDir::new(src_dir)
+        .into_iter()
+        .flatten()
+        .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("java"))
 }
 
 #[cfg(test)]
@@ -3252,8 +3291,10 @@ mod tests {
         std::fs::create_dir_all(&class_dir).unwrap();
         std::fs::write(class_dir.join("Foo.class"), b"\xCA\xFE\xBA\xBE").unwrap();
 
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
         let jar_path = tmp.path().join("test.jar");
-        write_classes_jar(&jar_path, &classes_dir, "test", "0.1.0")
+        write_classes_jar(&jar_path, &classes_dir, &src_dir, "test", "0.1.0")
             .expect("write_classes_jar must not fail with Duplicate filename");
 
         let file = std::fs::File::open(&jar_path).unwrap();
@@ -3286,8 +3327,10 @@ mod tests {
         std::fs::write(meta_inf.join("MANIFEST.MF"), user_manifest).unwrap();
         std::fs::write(classes_dir.join("Foo.class"), b"\xCA\xFE\xBA\xBE").unwrap();
 
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
         let jar_path = tmp.path().join("test.jar");
-        write_classes_jar(&jar_path, &classes_dir, "mylib", "0.1.0").unwrap();
+        write_classes_jar(&jar_path, &classes_dir, &src_dir, "mylib", "0.1.0").unwrap();
 
         let file = std::fs::File::open(&jar_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -3301,20 +3344,68 @@ mod tests {
             "user-provided MANIFEST.MF should not leak into the final jar");
     }
 
-    /// Edge case: an empty classes_dir must not panic — should still produce a jar
-    /// containing at least META-INF/ + MANIFEST.MF.
+    /// Edge case: an empty classes_dir + empty source_dir (placeholder module per ADR-010 ②)
+    /// must not panic — should still produce a jar containing at least META-INF/ + MANIFEST.MF
+    /// and just print a warning.
     #[test]
-    fn test_write_classes_jar_empty_classes_dir() {
+    fn test_write_classes_jar_empty_classes_dir_no_sources() {
         let tmp = tempfile::tempdir().unwrap();
         let classes_dir = tmp.path().join("classes");
         std::fs::create_dir_all(&classes_dir).unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
 
         let jar_path = tmp.path().join("test.jar");
-        write_classes_jar(&jar_path, &classes_dir, "empty", "0.1.0").unwrap();
+        write_classes_jar(&jar_path, &classes_dir, &src_dir, "empty", "0.1.0").unwrap();
 
-        assert!(jar_path.exists(), "jar should be created even with empty classes_dir");
+        assert!(jar_path.exists(), "jar should be created for placeholder module");
         let file = std::fs::File::open(&jar_path).unwrap();
         let archive = zip::ZipArchive::new(file).unwrap();
         assert!(archive.len() >= 2, "jar should at least have META-INF/ + MANIFEST.MF");
+    }
+
+    /// ADR-010 Defense ①: a 0-byte .class file must abort packaging.
+    /// This is the core regression — interrupted javac / OOM / WSL2 fs glitch may leave
+    /// a 0-byte .class behind; previously class_count counted it as 1 and let it slip through.
+    #[test]
+    fn test_write_classes_jar_rejects_zero_byte_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let classes_dir = tmp.path().join("classes");
+        let pkg_dir = classes_dir.join("com").join("example");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        // Simulate an interrupted javac: 0-byte .class file.
+        std::fs::File::create(pkg_dir.join("Broken.class")).unwrap();
+
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("Broken.java"), "class Broken {}").unwrap();
+
+        let jar_path = tmp.path().join("test.jar");
+        let err = write_classes_jar(&jar_path, &classes_dir, &src_dir, "broken", "0.1.0")
+            .expect_err("must reject 0-byte class file");
+        let msg = err.to_string();
+        assert!(msg.contains("0-byte"), "error must mention 0-byte, got: {}", msg);
+        assert!(msg.contains("Broken.class"), "error must name the offending file, got: {}", msg);
+    }
+
+    /// ADR-010 Defense ②: classes dir empty BUT source dir has .java files → bail.
+    /// This is the "silent javac failure" path — previously commit 267ec7b downgraded
+    /// to warn and let an empty jar publish. Now we differentiate by source presence.
+    #[test]
+    fn test_write_classes_jar_bails_when_sources_exist_but_no_classes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let classes_dir = tmp.path().join("classes");
+        std::fs::create_dir_all(&classes_dir).unwrap();
+        // Source dir has a .java file but classes dir is empty — would have been a silent warn.
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("Real.java"), "class Real {}").unwrap();
+
+        let jar_path = tmp.path().join("test.jar");
+        let err = write_classes_jar(&jar_path, &classes_dir, &src_dir, "real", "0.1.0")
+            .expect_err("must bail when sources exist but 0 classes produced");
+        let msg = err.to_string();
+        assert!(msg.contains("no .class"), "error must explain 0-class, got: {}", msg);
+        assert!(msg.contains(".java files"), "error must mention .java sources, got: {}", msg);
     }
 }

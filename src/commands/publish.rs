@@ -709,6 +709,7 @@ fn generate_javadoc_jar(project: &Path, cfg: &config::schema::YmConfig, version_
 
 fn find_output_jar(project: &Path, cfg: &config::schema::YmConfig, version_override: Option<&str>) -> Result<std::path::PathBuf> {
     let classes_dir = config::output_classes_dir(project);
+    let source_dir = config::source_dir_for(project, cfg);
     let jar_name = format!(
         "{}-{}.jar",
         cfg.name,
@@ -720,7 +721,7 @@ fn find_output_jar(project: &Path, cfg: &config::schema::YmConfig, version_overr
     }
 
     let version_str = version_override.or(cfg.version.as_deref()).unwrap_or("0.0.0");
-    super::build::write_classes_jar(&jar_path, &classes_dir, &cfg.name, version_str)?;
+    super::build::write_classes_jar(&jar_path, &classes_dir, &source_dir, &cfg.name, version_str)?;
     Ok(jar_path)
 }
 

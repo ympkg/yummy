@@ -614,17 +614,36 @@ pub fn incremental_compile(
 
 /// Map a source .java file to its corresponding .class file in the output directory.
 /// E.g. src/main/java/com/example/Foo.java → output_dir/com/example/Foo.class
+///
+/// ADR-010 Defense ③: a class file is only considered "present" if its content is valid
+/// (size >= 8 bytes + 0xCAFEBABE magic header). 0-byte / truncated files left by an
+/// interrupted javac would otherwise be treated as "already compiled" and the source
+/// would be skipped on the next incremental build, propagating the corruption.
 fn find_class_for_source(source: &Path, source_dirs: &[PathBuf], output_dir: &Path) -> Option<PathBuf> {
     for src_dir in source_dirs {
         if let Ok(rel) = source.strip_prefix(src_dir) {
             let class_rel = rel.with_extension("class");
             let class_file = output_dir.join(class_rel);
-            if class_file.exists() {
+            if is_valid_class_file(&class_file) {
                 return Some(class_file);
             }
         }
     }
     None
+}
+
+/// Validate a .class file by checking size + 0xCAFEBABE magic header.
+/// Returns false if the file does not exist, is too small, or has an invalid magic.
+/// This catches 0-byte / truncated files left by interrupted javac runs (see ADR-010).
+fn is_valid_class_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else { return false };
+    // Minimum class file = magic(4) + minor_version(2) + major_version(2) = 8 bytes
+    if metadata.len() < 8 { return false; }
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut magic = [0u8; 4];
+    use std::io::Read;
+    if f.read_exact(&mut magic).is_err() { return false; }
+    magic == [0xCA, 0xFE, 0xBA, 0xBE]
 }
 
 /// Derive a per-module fingerprint directory from the output dir path.
@@ -746,6 +765,12 @@ fn try_restore_build_cache(
 }
 
 /// Save compiled output to the build cache.
+///
+/// ADR-010 Defense ④: writes are atomic — copy into a sibling `.tmp` directory first,
+/// then rename to the final cache_dir. Without this, an interrupt mid-copy would leave
+/// `cache_dir` partially populated, and the next call's `cache_dir.exists()` check would
+/// short-circuit with "already cached", causing future cache hits to restore corrupt
+/// (or 0-byte) class files.
 fn save_build_cache(config: &super::CompileConfig, source_files: &[PathBuf]) -> Result<()> {
     let key = compute_build_cache_key(config, source_files)?;
     let cache_dir = build_cache_dir(&key);
@@ -754,10 +779,32 @@ fn save_build_cache(config: &super::CompileConfig, source_files: &[PathBuf]) -> 
         return Ok(()); // Already cached
     }
 
-    std::fs::create_dir_all(&cache_dir)?;
-    copy_dir_recursive(&config.output_dir, &cache_dir)?;
+    // Sibling tmp dir under the same parent — keeps `rename` on the same filesystem
+    // (POSIX guarantees rename within a filesystem is atomic).
+    let parent = cache_dir.parent()
+        .ok_or_else(|| anyhow::anyhow!("build cache dir has no parent: {}", cache_dir.display()))?;
+    std::fs::create_dir_all(parent)?;
 
-    Ok(())
+    let tmp_dir = parent.join(format!("{}.tmp",
+        cache_dir.file_name().and_then(|s| s.to_str()).unwrap_or("cache")
+    ));
+    // Clean up any stale tmp from a previous interrupted run.
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+    copy_dir_recursive(&config.output_dir, &tmp_dir)?;
+
+    // Atomic publish. If another process raced us and already created cache_dir,
+    // discard our tmp and accept their version.
+    match std::fs::rename(&tmp_dir, &cache_dir) {
+        Ok(()) => Ok(()),
+        Err(_) if cache_dir.exists() => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Recursively hardlink directory contents, falling back to copy on cross-filesystem.
@@ -1383,5 +1430,151 @@ mod tests {
         assert!(!fp.abi_changed(path, "abi_v1"));
         assert!(fp.abi_changed(path, "abi_v2"));
         assert!(fp.abi_changed(Path::new("src/Bar.java"), "abi_v1"));
+    }
+
+    /// ADR-010 Defense ③: a class file with valid CAFEBABE magic is recognized.
+    #[test]
+    fn test_is_valid_class_file_valid_magic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let class_file = tmp.path().join("Foo.class");
+        std::fs::write(&class_file, b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+        assert!(is_valid_class_file(&class_file));
+    }
+
+    /// ADR-010 Defense ③: a 0-byte class file (interrupted javac) returns false.
+    #[test]
+    fn test_is_valid_class_file_rejects_zero_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let class_file = tmp.path().join("Broken.class");
+        std::fs::File::create(&class_file).unwrap();
+        assert_eq!(std::fs::metadata(&class_file).unwrap().len(), 0);
+        assert!(!is_valid_class_file(&class_file), "0-byte class must be invalid");
+    }
+
+    /// ADR-010 Defense ③: a truncated class file (size < 8) returns false.
+    #[test]
+    fn test_is_valid_class_file_rejects_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let class_file = tmp.path().join("Trunc.class");
+        std::fs::write(&class_file, b"\xCA\xFE\xBA").unwrap();
+        assert!(!is_valid_class_file(&class_file));
+    }
+
+    /// ADR-010 Defense ③: a file without CAFEBABE magic is invalid even if size is large.
+    #[test]
+    fn test_is_valid_class_file_rejects_wrong_magic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let class_file = tmp.path().join("Garbage.class");
+        std::fs::write(&class_file, b"\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+        assert!(!is_valid_class_file(&class_file));
+    }
+
+    /// ADR-010 Defense ③: missing file returns false (not an error).
+    #[test]
+    fn test_is_valid_class_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_valid_class_file(&tmp.path().join("nope.class")));
+    }
+
+    /// ADR-010 Defense ③: find_class_for_source must skip 0-byte class files,
+    /// forcing the source to be recompiled.
+    #[test]
+    fn test_find_class_for_source_skips_zero_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let pkg_dir = src_dir.join("com").join("example");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let source = pkg_dir.join("Foo.java");
+        std::fs::write(&source, "package com.example; class Foo {}").unwrap();
+
+        let out_dir = tmp.path().join("out");
+        let out_pkg = out_dir.join("com").join("example");
+        std::fs::create_dir_all(&out_pkg).unwrap();
+        // Simulate interrupted javac: 0-byte .class.
+        std::fs::File::create(out_pkg.join("Foo.class")).unwrap();
+
+        let result = find_class_for_source(&source, &[src_dir], &out_dir);
+        assert!(result.is_none(),
+            "0-byte class must be treated as missing → triggers recompilation");
+    }
+
+    /// ADR-010 Defense ④: save_build_cache must be atomic — sibling tmp + rename.
+    /// Verify that after a successful save, both the cache_dir exists and no .tmp leaked.
+    #[test]
+    fn test_save_build_cache_atomic_no_tmp_leak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("Foo.class"), b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+
+        let config = super::super::CompileConfig {
+            source_dirs: vec![],
+            output_dir: output_dir.clone(),
+            classpath: vec![],
+            java_version: Some("17".to_string()),
+            encoding: None,
+            annotation_processors: vec![],
+            lint: vec![],
+            extra_args: vec![],
+        };
+        let source_files = vec![tmp.path().join("Foo.java")];
+        std::fs::write(&source_files[0], "class Foo {}").unwrap();
+
+        save_build_cache(&config, &source_files).expect("save_build_cache must succeed");
+
+        // Verify cache_dir exists and contains the class file
+        let key = compute_build_cache_key(&config, &source_files).unwrap();
+        let cache_dir = build_cache_dir(&key);
+        assert!(cache_dir.exists(), "cache_dir must exist after save");
+        assert!(cache_dir.join("Foo.class").exists(), "Foo.class must be in cache");
+
+        // Verify no sibling .tmp leaked
+        let tmp_sibling = cache_dir.parent().unwrap()
+            .join(format!("{}.tmp", cache_dir.file_name().unwrap().to_str().unwrap()));
+        assert!(!tmp_sibling.exists(), ".tmp sibling must not leak after rename");
+
+        // Cleanup global cache dir we created
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// ADR-010 Defense ④: a stale .tmp from a prior interrupted run must be cleaned up,
+    /// not block the next save.
+    #[test]
+    fn test_save_build_cache_clears_stale_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("Foo.class"), b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+
+        let config = super::super::CompileConfig {
+            source_dirs: vec![],
+            output_dir: output_dir.clone(),
+            classpath: vec![],
+            java_version: Some("21".to_string()),  // distinct version → distinct cache key
+            encoding: None,
+            annotation_processors: vec![],
+            lint: vec![],
+            extra_args: vec![],
+        };
+        let source_files = vec![tmp.path().join("StaleTmp.java")];
+        std::fs::write(&source_files[0], "class StaleTmp {}").unwrap();
+
+        // Pre-create a stale .tmp (as if a previous run was interrupted mid-copy)
+        let key = compute_build_cache_key(&config, &source_files).unwrap();
+        let cache_dir = build_cache_dir(&key);
+        let parent = cache_dir.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let stale_tmp = parent.join(format!("{}.tmp", cache_dir.file_name().unwrap().to_str().unwrap()));
+        std::fs::create_dir_all(&stale_tmp).unwrap();
+        std::fs::write(stale_tmp.join("garbage"), b"residue").unwrap();
+
+        save_build_cache(&config, &source_files).expect("must clear stale tmp and succeed");
+
+        assert!(cache_dir.exists(), "cache_dir must exist");
+        assert!(!cache_dir.join("garbage").exists(),
+            "stale residue from old tmp must NOT appear in final cache");
+        assert!(cache_dir.join("Foo.class").exists(), "fresh content must be in cache");
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }
