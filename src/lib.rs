@@ -264,6 +264,20 @@ enum YmCommands {
         #[arg(long)]
         fix: bool,
     },
+    /// Pre-publish check: which internal dependencies are missing from registry
+    Prepare {
+        /// Internal module name in workspace
+        module: String,
+        /// Internal groupId prefix (matched by `.`-segment alignment, repeatable)
+        #[arg(long, required = true)]
+        group: Vec<String>,
+        /// Maven registry URL to check (repeatable)
+        #[arg(long, required = true)]
+        registry: Vec<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run one or more scripts
     Run {
         /// Script names to run
@@ -563,6 +577,9 @@ fn ym_main() -> Result<()> {
             commands::tree::execute(depth, json, flat, dot, reverse.as_deref())
         }
         YmCommands::Doctor { fix } => commands::doctor::execute(fix),
+        YmCommands::Prepare { module, group, registry, json } => {
+            commands::prepare::execute(module, group, registry, json)
+        }
         YmCommands::Run { scripts: script_names, parallel } => {
             run_scripts(&script_names, parallel)
         }

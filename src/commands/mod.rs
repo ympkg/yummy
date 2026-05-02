@@ -9,6 +9,7 @@ pub mod info;
 pub mod init;
 pub mod login;
 pub mod migrate;
+pub mod prepare;
 pub mod publish;
 pub mod remove;
 pub mod native_cmd;
