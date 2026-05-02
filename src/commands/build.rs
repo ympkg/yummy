@@ -3220,8 +3220,15 @@ pub fn write_classes_jar(
                         anyhow::bail!(
                             "Refusing to package 0-byte class file: {}\n\
                              This usually indicates an interrupted javac run, OOM, or filesystem error.\n\
-                             Run `ym clean && ym build` to recompile from scratch.",
-                            path.display()
+                             To recover, remove stale state and rebuild:\n\
+                             \n\
+                                 rm -rf {}/out ~/.ym/build-cache\n\
+                                 rm -rf {}/.ym/fingerprints\n\
+                                 ymc build {}",
+                            path.display(),
+                            classes_dir.parent().and_then(|p| p.parent()).map(|p| p.display().to_string()).unwrap_or_else(|| "<module>".to_string()),
+                            classes_dir.ancestors().nth(3).map(|p| p.display().to_string()).unwrap_or_else(|| "<workspace-root>".to_string()),
+                            name
                         );
                     }
                     class_count += 1;
@@ -3241,8 +3248,17 @@ pub fn write_classes_jar(
             anyhow::bail!(
                 "JAR for '{}' contains no .class files but source dir '{}' has .java files.\n\
                  This usually indicates a silent javac failure or misconfigured sourceDir/target.\n\
-                 Inspect prior compile output, then run `ym clean && ym build`.",
-                name, source_dir.display()
+                 To recover, remove stale state and rebuild:\n\
+                 \n\
+                     rm -rf {}/out ~/.ym/build-cache\n\
+                     ymc build {}\n\
+                 \n\
+                 If the source files are intentionally all-commented placeholder code, add at least\n\
+                 one class declaration (e.g. `public class Foo {{}}`) so javac produces a .class.",
+                name,
+                source_dir.display(),
+                source_dir.parent().map(|p| p.parent()).flatten().map(|p| p.parent()).flatten().map(|p| p.display().to_string()).unwrap_or_else(|| "<module>".to_string()),
+                name
             );
         }
         eprintln!(

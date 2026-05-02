@@ -200,8 +200,9 @@ enum YmCommands {
     },
     /// Publish to a Maven repository
     Publish {
-        /// Target module name (workspace mode)
-        target: Option<String>,
+        /// Target module name(s) (workspace mode). Multiple targets are published
+        /// together with their dependency closure in a single ym process.
+        targets: Vec<String>,
         /// Target registry name (from [registries])
         #[arg(long)]
         registry: Option<String>,
@@ -544,8 +545,8 @@ fn ym_main() -> Result<()> {
             commands::upgrade::execute(interactive, yes, json)
         }
         YmCommands::Convert { verify } => commands::migrate::execute(verify),
-        YmCommands::Publish { target, registry, dry_run, local } => {
-            commands::publish::execute(target, registry.as_deref(), dry_run, local)
+        YmCommands::Publish { targets, registry, dry_run, local } => {
+            commands::publish::execute(targets, registry.as_deref(), dry_run, local)
         }
         YmCommands::Login { list, remove, registry_url, registry, username, password } => {
             commands::login::execute(

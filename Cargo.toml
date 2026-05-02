@@ -46,6 +46,7 @@ tempfile = "3"
 md5 = "0.7"
 regex = "1"
 dirs = "6.0.0"
+fs2 = "0.4"
 
 [profile.release]
 opt-level = 3

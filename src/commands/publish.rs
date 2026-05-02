@@ -1,13 +1,21 @@
 use anyhow::{bail, Result};
 use console::style;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
 use crate::config;
 
-pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool, local: bool) -> Result<()> {
+pub fn execute(targets: Vec<String>, registry: Option<&str>, dry_run: bool, local: bool) -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
+
+    // ADR-011: workspace-level fail-fast advisory lock. Prevents concurrent
+    // `ym publish` processes from racing on shared <module>/out/classes/ and
+    // corrupting build output (see: 2026-05-01 standard-task-core incident).
+    // The lock file is held via fcntl(F_SETLK), so OS releases it on process exit
+    // even on crash — no stale-lock cleanup needed.
+    let _publish_lock = acquire_publish_lock(&project)?;
 
     // Local publish: install to ~/.ym/maven/
     if local {
@@ -19,15 +27,22 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool, lo
 
     // Workspace mode
     if cfg.workspaces.is_some() {
-        if let Some(ref module_name) = target {
-            // Single module
-            return publish_workspace_module(&config_path, &project, module_name, registry, dry_run);
+        if targets.is_empty() {
+            // Publish all non-private modules
+            return publish_all_workspace_modules(&config_path, &project, None, registry, dry_run);
         }
-        // Publish all non-private modules
-        return publish_all_workspace_modules(&config_path, &project, registry, dry_run);
+        // Publish given targets + their transitive dependency closure.
+        let ws = crate::workspace::graph::WorkspaceGraph::build(&project)?;
+        let mut wanted: HashSet<String> = HashSet::new();
+        for t in &targets {
+            for m in ws.transitive_closure(t)? {
+                wanted.insert(m);
+            }
+        }
+        return publish_all_workspace_modules(&config_path, &project, Some(&wanted), registry, dry_run);
     }
-    if target.is_some() {
-        bail!("--target only works in workspace mode. Current project is not a workspace.");
+    if !targets.is_empty() {
+        bail!("target argument(s) only work in workspace mode. Current project is not a workspace.");
     }
 
     if cfg.private.unwrap_or(false) {
@@ -144,6 +159,47 @@ pub fn execute(target: Option<String>, registry: Option<&str>, dry_run: bool, lo
     Ok(())
 }
 
+/// Acquire an exclusive advisory lock on `<workspace>/.ym/publish.lock`.
+/// Fail-fast: if another `ym publish` is already running in this workspace,
+/// this returns an error immediately (no waiting).
+///
+/// The returned `File` must stay alive for the duration of publish — when it
+/// drops, the OS releases the lock automatically. Process crashes also release
+/// the lock (fcntl semantics), so no stale-lock recovery is needed.
+fn acquire_publish_lock(project: &Path) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    let lock_dir = project.join(".ym");
+    std::fs::create_dir_all(&lock_dir)?;
+    let lock_path = lock_dir.join("publish.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    if let Err(e) = lock_file.try_lock_exclusive() {
+        // Try to read PID written by the current holder for diagnostics
+        let other = std::fs::read_to_string(&lock_path).ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!(" (held by: {})", s.trim()))
+            .unwrap_or_default();
+        bail!(
+            "another `ym publish` is already running in this workspace{}.\n\
+             Wait for it to finish, then retry.\n\
+             Lock file: {}\n\
+             OS error: {}",
+            other,
+            lock_path.display(),
+            e
+        );
+    }
+    // Write our PID so a concurrent `ym publish` can show who's holding the lock.
+    use std::io::Write;
+    let _ = (&lock_file).set_len(0);
+    let _ = writeln!(&lock_file, "pid={}", std::process::id());
+    Ok(lock_file)
+}
+
 /// Install a single module to local Maven cache (~/.ym/maven/).
 fn publish_single_local(project: &Path, cfg: &config::schema::YmConfig, root_version: Option<&str>) -> Result<()> {
     let version = cfg.version.as_deref()
@@ -245,10 +301,16 @@ fn publish_all_local(config_path: &Path, workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Publish all non-private workspace modules (parallel artifact generation + upload).
+/// Publish workspace modules (parallel artifact generation + upload).
+///
+/// `module_filter`:
+/// - `None` → publish all non-private modules in the workspace.
+/// - `Some(set)` → publish only modules whose name is in `set` (and non-private).
+///   Caller is responsible for including dependency closure in the set.
 fn publish_all_workspace_modules(
     config_path: &Path,
     workspace_root: &Path,
+    module_filter: Option<&HashSet<String>>,
     registry: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
@@ -258,8 +320,12 @@ fn publish_all_workspace_modules(
     let publish_start = Instant::now();
     let ws = crate::workspace::graph::WorkspaceGraph::build(workspace_root)?;
 
-    // Build all modules first
-    super::build::execute(vec![], true)?;
+    // Build only what we'll publish (empty list = build all when filter is None).
+    let build_targets: Vec<String> = match module_filter {
+        Some(set) => set.iter().cloned().collect(),
+        None => vec![],
+    };
+    super::build::execute(build_targets, true)?;
 
     let root_cfg = config::load_config(config_path)?;
     let reg = resolve_registry(&root_cfg, registry)?;
@@ -271,6 +337,9 @@ fn publish_all_workspace_modules(
     let mut modules: Vec<_> = Vec::new();
     let mut skipped = 0;
     for pkg_name in &ws.all_packages() {
+        if let Some(filter) = module_filter {
+            if !filter.contains(pkg_name) { continue; }
+        }
         let pkg = ws.get_package(pkg_name).unwrap();
         if pkg.config.private.unwrap_or(false) {
             skipped += 1;
@@ -292,10 +361,15 @@ fn publish_all_workspace_modules(
         return Ok(());
     }
 
+    let scope_label = if module_filter.is_some() {
+        format!("{} modules (targets + closure)", total)
+    } else {
+        format!("{} modules", total)
+    };
     println!(
-        "  {} publishing {} modules to {}",
+        "  {} publishing {} to {}",
         style("➜").green(),
-        total,
+        scope_label,
         style(&registry_url).dim()
     );
 
@@ -357,94 +431,6 @@ fn publish_all_workspace_modules(
     if fail_count > 0 {
         bail!("{} module(s) failed to publish", fail_count);
     }
-
-    Ok(())
-}
-
-/// Publish a specific workspace module.
-fn publish_workspace_module(
-    config_path: &Path,
-    workspace_root: &Path,
-    module_name: &str,
-    registry: Option<&str>,
-    dry_run: bool,
-) -> Result<()> {
-    let ws = crate::workspace::graph::WorkspaceGraph::build(workspace_root)?;
-    let pkg = ws.get_package(module_name)
-        .ok_or_else(|| anyhow::anyhow!("Module '{}' not found in workspace", module_name))?;
-
-    let module_cfg = &pkg.config;
-    if module_cfg.private.unwrap_or(false) {
-        bail!("Module '{}' is private. Remove 'private = true' to publish.", module_name);
-    }
-
-    // Inherit version from root config if module uses { workspace: true }
-    let root_cfg = config::load_config(config_path)?;
-    let version = module_cfg.version.as_deref()
-        .or(root_cfg.version.as_deref())
-        .unwrap_or("0.0.0");
-    let module_path = &pkg.path;
-
-    // Build the module
-    super::build::execute(vec![module_name.to_string()], true)?;
-
-    // Generate POM for the module
-    let pom_path = module_path.join("out").join("pom.xml");
-    generate_pom(module_path, module_cfg, &pom_path, Some(version))?;
-
-    println!(
-        "  {} Generated POM for {}@{}",
-        style("✓").green(),
-        style(&module_cfg.name).bold(),
-        version
-    );
-
-    // Get registry from root config (registries are defined at root level)
-    let root_cfg = config::load_config(config_path)?;
-    let reg = resolve_registry(&root_cfg, registry)?;
-    let registry_url = reg.url;
-
-    let jar_path = find_output_jar(module_path, module_cfg, Some(version))?;
-    let sources_jar = generate_sources_jar(module_path, module_cfg, Some(version))?;
-
-    if dry_run {
-        let jar_size = std::fs::metadata(&jar_path).map(|m| m.len()).unwrap_or(0);
-        println!();
-        println!("  {} dry run — would publish module:", style("➜").green());
-        println!("    Package:  {}@{}", style(&module_cfg.name).bold(), version);
-        println!("    GroupId:  {}", module_cfg.group_id);
-        println!("    Registry: {}", style(&registry_url).dim());
-        println!("    JAR:      {} ({:.1} KB)", jar_path.display(), jar_size as f64 / 1024.0);
-        println!();
-        println!("  {} No artifacts were uploaded", style("!").yellow());
-        return Ok(());
-    }
-
-    let creds_path = credentials_path();
-    let creds = load_credentials_for_registry(&creds_path, &registry_url, reg.inline_creds)?;
-
-    println!(
-        "  {} publishing module {} to {}",
-        style("➜").green(),
-        style(&module_cfg.name).bold(),
-        style(&registry_url).dim()
-    );
-
-    upload_artifact(&jar_path, &pom_path, &sources_jar, None, module_cfg, &registry_url, &creds, Some(version))?;
-
-    if is_sonatype_url(&registry_url) {
-        match sonatype_close_and_release(&registry_url, module_cfg, &creds) {
-            Ok(()) => println!("  {} Staging repository released", style("✓").green()),
-            Err(e) => println!("  {} Staging close/release failed: {}", style("!").yellow(), e),
-        }
-    }
-
-    println!(
-        "  {} Published {}@{}",
-        style("✓").green(),
-        style(&module_cfg.name).bold(),
-        version
-    );
 
     Ok(())
 }
