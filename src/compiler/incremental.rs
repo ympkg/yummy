@@ -646,6 +646,23 @@ fn is_valid_class_file(path: &Path) -> bool {
     magic == [0xCA, 0xFE, 0xBA, 0xBE]
 }
 
+/// ADR-011: verify every .class file under `dir` (recursively) is valid before
+/// trusting the cached output. Cache hits previously short-circuited on
+/// `dir.exists()` alone, which let corrupt content (0-byte / truncated .class
+/// from earlier interrupted builds) propagate into output_dir on every restore
+/// — packaging then produced incomplete jars (see 2026-05-01 standard-task-core
+/// incident: 18-entry jar with entity/repository class missing).
+///
+/// Empty dirs and dirs with only non-.class files (resources, graphqls) are
+/// considered valid — placeholder modules legitimately have no .class.
+fn is_cache_dir_valid(dir: &Path) -> bool {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("class"))
+        .all(|e| is_valid_class_file(e.path()))
+}
+
 /// Derive a per-module fingerprint directory from the output dir path.
 /// This ensures workspace modules have independent fingerprint files.
 fn fingerprint_dir_for(cache_dir: &Path, output_dir: &Path) -> PathBuf {
@@ -730,6 +747,19 @@ fn try_restore_build_cache(
     let cache_dir = build_cache_dir(&key);
 
     if !cache_dir.exists() {
+        return Ok(None);
+    }
+
+    // ADR-011: invalidate corrupt cache rather than restoring 0-byte / truncated
+    // .class into output_dir. Without this, a single bad cache entry propagates
+    // forever — every restore copies the corrupt content, packaging produces
+    // incomplete jars, and the only escape is manually deleting ~/.ym/build-cache.
+    if !is_cache_dir_valid(&cache_dir) {
+        eprintln!(
+            "  Warning: invalidating corrupt build cache at {} (contains 0-byte / non-CAFEBABE .class)",
+            cache_dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
         return Ok(None);
     }
 
@@ -1115,6 +1145,16 @@ pub fn try_restore_module_cache(
     let classes_dir = cache_dir.join("classes");
 
     if !classes_dir.exists() {
+        return Ok(None);
+    }
+
+    // ADR-011: invalidate corrupt cache. See is_cache_dir_valid doc comment for context.
+    if !is_cache_dir_valid(&classes_dir) {
+        eprintln!(
+            "  Warning: invalidating corrupt module cache at {} (contains 0-byte / non-CAFEBABE .class)",
+            cache_dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
         return Ok(None);
     }
 
