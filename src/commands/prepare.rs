@@ -23,17 +23,33 @@ pub fn execute(
 
     // Locate the target module via WorkspaceGraph.
     let ws = crate::workspace::graph::WorkspaceGraph::build(&project)?;
-    let pkg = ws.get_package(&module).ok_or_else(|| {
+    if ws.get_package(&module).is_none() {
         let available: Vec<String> = ws.all_packages();
-        anyhow::anyhow!(
+        bail!(
             "module '{}' not found in workspace.\nAvailable: {}",
             module,
             available.join(", ")
-        )
-    })?;
+        );
+    }
 
-    // Collect direct Maven deps (workspace = true entries inherit version from root).
-    let deps: BTreeMap<String, String> = pkg.config.maven_dependencies_with_root(&root_cfg);
+    // Walk the full transitive workspace closure (target + every workspace-internal
+    // dep, recursively) and merge each package's Maven deps. The previous
+    // implementation only collected the target's *direct* Maven deps, missing the
+    // case where target depends on a workspace-internal module that itself pulls
+    // in external Maven artifacts. Result: prepare reported "all clear" while
+    // build later failed with `package X does not exist` because a transitively-
+    // required jar wasn't in the registry.
+    let mut closure = ws.transitive_closure(&module)?;
+    closure.push(module.clone());
+
+    let mut deps: BTreeMap<String, String> = BTreeMap::new();
+    for ws_name in &closure {
+        if let Some(p) = ws.get_package(ws_name) {
+            for (k, v) in p.config.maven_dependencies_with_root(&root_cfg) {
+                deps.insert(k, v);
+            }
+        }
+    }
 
     // Filter to those whose groupId matches any --group prefix (.-segment alignment).
     let internal: Vec<(String, String, String)> = deps
