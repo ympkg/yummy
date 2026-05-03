@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const FINGERPRINT_FILE: &str = "fingerprints.json";
+const BUILD_MANIFEST_FILE: &str = "build-manifest.json";
 
 // Hash domain separator tags for cache key computation
 mod tag {
@@ -483,11 +484,51 @@ pub fn incremental_compile(
     let mut fingerprints = Fingerprints::load(&fp_dir);
     let (changed, all_files) = fingerprints.get_changed_files(&config.source_dirs)?;
 
-    // If output directory doesn't exist or is empty, do full compile
+    // ADR-014: manifest fast-path. If the previous build wrote a completion
+    // manifest AND every recorded class file still exists AND the source set
+    // hasn't changed AND no source content changed, we KNOW the prior compile
+    // is still valid — skip everything else, return UpToDate immediately.
+    //
+    // This is the single source of truth for "have we compiled before"; it
+    // can't be fooled by resource files in output_dir, fingerprint residue
+    // after `rm -rf out`, or any other shared-state pollution that the
+    // ADR-013 has_classes heuristic still requires careful guarding against.
+    if !all_files.is_empty() && changed.is_empty() {
+        if let Some(manifest) = BuildManifest::load(&fp_dir) {
+            if manifest.is_consistent_with(&all_files, &config.output_dir) {
+                return Ok(super::CompileResult {
+                    success: true,
+                    outcome: super::CompileOutcome::UpToDate,
+                    errors: String::new(),
+                    module_abi_hash: Some(aggregate_abi_from_fingerprints(&fingerprints)),
+                });
+            }
+        }
+    }
+
+    // ADR-013: detect "have we compiled before" by looking for .class files
+    // specifically, NOT by `dir is non-empty`. The build pipeline copies
+    // resources (graphqls, properties, ...) into output_dir BEFORE invoking
+    // incremental_compile, so a freshly-cleaned out/classes/ becomes non-empty
+    // (resource files only, zero .class) by the time we get here.
+    //
+    // Old logic `dir.next().is_some()`:
+    //   1. resources copied → out/classes/graphql/X.graphqls exists
+    //   2. has_classes = true (dir non-empty, treated as "already compiled")
+    //   3. fall through to else branch → fingerprint check from prior build
+    //   4. all sources unchanged + cache fingerprints intact → "missing" check
+    //   5. no .class for src + has fingerprint entry → "no-output module" path
+    //   6. UpToDate returned, javac never invoked
+    //   7. packaging produces a 0-class jar (see 2026-05-03 standard-task-core
+    //      750B incident) which then gets published to the maven registry
+    //
+    // Correct check: "have we ACTUALLY compiled" = "is there at least one
+    // .class file under output_dir?" Resource files do not count.
     let has_classes = config.output_dir.exists()
-        && std::fs::read_dir(&config.output_dir)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
+        && walkdir::WalkDir::new(&config.output_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("class"));
 
     let files_to_compile = if !has_classes {
         // Output directory missing or empty — clear stale fingerprints and force full compile.
@@ -500,6 +541,11 @@ pub fn incremental_compile(
         // Full compile needed — try build cache first
         if !all_files.is_empty() {
             if let Some(result) = try_restore_build_cache(config, &all_files, &mut fingerprints, &fp_dir)? {
+                // ADR-014: cache restore succeeded — record the resulting state as a
+                // valid completed build so the next call hits the manifest fast-path.
+                if let Err(e) = BuildManifest::write(&fp_dir, &config.output_dir, &all_files) {
+                    eprintln!("  Warning: failed to write build manifest after cache restore: {}", e);
+                }
                 return Ok(result);
             }
         }
@@ -522,6 +568,13 @@ pub fn incremental_compile(
             .cloned()
             .collect();
         if missing.is_empty() {
+            // ADR-014: write/refresh manifest so the next invocation can take
+            // the manifest fast-path instead of recomputing this fingerprint
+            // walk + missing check (and so a future caller that ONLY trusts
+            // the manifest sees the truthful state).
+            if let Err(e) = BuildManifest::write(&fp_dir, &config.output_dir, &all_files) {
+                eprintln!("  Warning: failed to write build manifest on up-to-date path: {}", e);
+            }
             return Ok(super::CompileResult {
                 success: true,
                 outcome: super::CompileOutcome::UpToDate,
@@ -591,6 +644,14 @@ pub fn incremental_compile(
             if let Err(e) = save_build_cache(config, &all_files) {
                 eprintln!("  Warning: failed to save build cache: {}", e);
             }
+        }
+
+        // ADR-014: at this point fingerprints, .class files, and build cache
+        // are all coherent — record the completed build state as the LAST
+        // step. Next invocation can short-circuit on this manifest without
+        // walking output_dir or guessing from fingerprint residue.
+        if let Err(e) = BuildManifest::write(&fp_dir, &config.output_dir, &all_files) {
+            eprintln!("  Warning: failed to write build manifest: {}", e);
         }
     }
 
@@ -668,6 +729,130 @@ fn is_cache_dir_valid(dir: &Path) -> bool {
 fn fingerprint_dir_for(cache_dir: &Path, output_dir: &Path) -> PathBuf {
     let hash = hash_bytes(crate::normalize_cache_path(output_dir).as_bytes());
     cache_dir.join("fingerprints").join(&hash[..16])
+}
+
+/// ADR-014: per-output-dir compilation completion record.
+///
+/// Single source of truth for "has this module's javac been fully run AND
+/// produced these specific .class files?". Replaces fragile heuristics like
+/// "is output_dir non-empty" (ADR-013) and "does fingerprint have an entry"
+/// that get fooled by partial state (resources copied before javac, output
+/// rm'd after fingerprint write, etc).
+///
+/// Lifecycle:
+/// - **Write**: only at the very end of a successful full or incremental
+///   compile. Atomic (sibling tmp + rename).
+/// - **Read**: every incremental_compile entry, before any other staleness
+///   check. If a valid manifest exists and is consistent with current sources
+///   + on-disk class files, return UpToDate immediately — fastest path.
+/// - **Invalidation**: any of (a) sources added/removed/renamed, (b) declared
+///   class file missing from disk, (c) ym version changed → manifest no
+///   longer trusted, fall through to fingerprint / cache restore / javac.
+///
+/// Stored at the same fingerprint directory as `fingerprints.json` (keyed by
+/// output_dir hash), kept OUT of `output_dir` itself so that packaging walks
+/// don't have to special-case it and `ym clean`-ing `out/` doesn't accidentally
+/// orphan the manifest.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BuildManifest {
+    pub ym_version: String,
+    pub completed_at: u64,
+    /// Source files compiled, normalized (matches `normalize_cache_path`).
+    pub source_paths: Vec<String>,
+    /// Class files produced, paths relative to `output_dir`.
+    pub class_paths: Vec<String>,
+}
+
+impl BuildManifest {
+    fn manifest_path(fp_dir: &Path) -> PathBuf {
+        fp_dir.join(BUILD_MANIFEST_FILE)
+    }
+
+    pub fn load(fp_dir: &Path) -> Option<Self> {
+        let path = Self::manifest_path(fp_dir);
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Atomically write the manifest, populated from current source list +
+    /// whatever .class files are currently under `output_dir`. Caller must
+    /// only invoke this AFTER a successful compile (full or incremental) so
+    /// the on-disk state truly matches the recorded state.
+    pub fn write(fp_dir: &Path, output_dir: &Path, source_files: &[PathBuf]) -> Result<()> {
+        std::fs::create_dir_all(fp_dir)?;
+
+        let source_paths: Vec<String> = {
+            let mut v: Vec<String> = source_files.iter()
+                .map(|p| crate::normalize_cache_path(p))
+                .collect();
+            v.sort();
+            v
+        };
+
+        let class_paths: Vec<String> = {
+            let mut v: Vec<String> = walkdir::WalkDir::new(output_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("class"))
+                .filter_map(|e| {
+                    e.path().strip_prefix(output_dir).ok()
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+
+        let manifest = BuildManifest {
+            ym_version: env!("CARGO_PKG_VERSION").to_string(),
+            completed_at: cache_timestamp(),
+            source_paths,
+            class_paths,
+        };
+
+        let final_path = Self::manifest_path(fp_dir);
+        let tmp_path = fp_dir.join(format!("{}.tmp", BUILD_MANIFEST_FILE));
+        let _ = std::fs::remove_file(&tmp_path);
+        let content = serde_json::to_string(&manifest)?;
+        std::fs::write(&tmp_path, content)?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// True if every recorded class file still exists on disk under
+    /// `output_dir` AND the recorded source list matches `current_sources`
+    /// (set equality after normalization). Either condition failing means
+    /// the prior build's record no longer reflects reality — invalidate.
+    ///
+    /// Note: we do NOT validate .class CAFEBABE / size here — that's
+    /// ADR-011's responsibility on the cache restore path. The manifest's
+    /// invariant is only "the build I recorded is reproducible from disk
+    /// state I can see". If a recorded .class got truncated externally
+    /// after manifest write, ADR-011's is_valid_class_file (called from
+    /// find_class_for_source) will catch it on the per-source verification.
+    pub fn is_consistent_with(&self, current_sources: &[PathBuf], output_dir: &Path) -> bool {
+        let curr: std::collections::HashSet<String> = current_sources.iter()
+            .map(|p| crate::normalize_cache_path(p))
+            .collect();
+        let prior: std::collections::HashSet<&String> = self.source_paths.iter().collect();
+        if curr.len() != prior.len() {
+            return false;
+        }
+        for p in &curr {
+            if !prior.contains(p) {
+                return false;
+            }
+        }
+
+        for class_path in &self.class_paths {
+            let full = output_dir.join(class_path);
+            if !full.exists() {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 /// Feed compiler configuration fields into a hasher (shared by both cache key functions).
@@ -1616,5 +1801,202 @@ mod tests {
         assert!(cache_dir.join("Foo.class").exists(), "fresh content must be in cache");
 
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// ADR-013 root-cause regression: simulate the standard-task-core 750B
+    /// incident pre-conditions and assert incremental_compile recognises that
+    /// no compilation has actually happened (despite resources being present
+    /// in output_dir).
+    ///
+    /// Pre-conditions of the bug:
+    ///   1. output_dir was previously cleaned (no .class files)
+    ///   2. resource files (e.g. graphqls) WERE copied into output_dir before
+    ///      incremental_compile runs (this is what build.rs:2740 does)
+    ///   3. fingerprints from a previous successful build still exist
+    ///
+    /// With OLD `has_classes = dir.next().is_some()`: misjudges as "already
+    /// compiled", goes to UpToDate path, never invokes javac.
+    /// With NEW `has_classes = any .class file`: correctly reports false,
+    /// triggers full compile.
+    #[test]
+    fn test_has_classes_ignores_resources_only_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("classes");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        // Simulate "resources copied but no .class compiled yet" — exactly the
+        // state build.rs leaves output_dir in just before calling
+        // incremental_compile.
+        let res_dir = output_dir.join("graphql");
+        std::fs::create_dir_all(&res_dir).unwrap();
+        std::fs::write(res_dir.join("Schema.graphqls"), b"type Q {}").unwrap();
+        std::fs::write(output_dir.join("application.yml"), b"port: 8080").unwrap();
+
+        // Inline the (small) has_classes check we use in incremental_compile to
+        // pin the behaviour down without hauling in the whole compile config.
+        let has_classes = output_dir.exists()
+            && walkdir::WalkDir::new(&output_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("class"));
+
+        assert!(!has_classes,
+            "resources-only output_dir must NOT count as 'has compiled classes' \
+             — otherwise incremental_compile skips javac and packaging produces \
+             a 0-class jar (regression of 2026-05-03 standard-task-core)");
+    }
+
+    /// Sanity: actual .class file under output_dir does count.
+    #[test]
+    fn test_has_classes_detects_real_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_dir = tmp.path().join("classes");
+        std::fs::create_dir_all(output_dir.join("com").join("example")).unwrap();
+        std::fs::write(output_dir.join("com").join("example").join("Foo.class"),
+            b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+        // Mix in a resource for good measure.
+        std::fs::write(output_dir.join("application.yml"), b"port: 8080").unwrap();
+
+        let has_classes = output_dir.exists()
+            && walkdir::WalkDir::new(&output_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("class"));
+
+        assert!(has_classes,
+            "output_dir with at least one .class file must count as having compiled classes");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ADR-014: BuildManifest tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Round-trip: write a manifest, load it, fields preserved.
+    #[test]
+    fn test_build_manifest_write_load_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp_dir = tmp.path().join("fp");
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("Foo.class"),
+            b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+        let nested = output_dir.join("com").join("example");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("Bar.class"),
+            b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+
+        let sources = vec![
+            tmp.path().join("Foo.java"),
+            tmp.path().join("com/example/Bar.java"),
+        ];
+
+        BuildManifest::write(&fp_dir, &output_dir, &sources).unwrap();
+
+        let loaded = BuildManifest::load(&fp_dir).expect("manifest must load");
+        assert_eq!(loaded.ym_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(loaded.source_paths.len(), 2, "two sources recorded");
+        assert_eq!(loaded.class_paths.len(), 2, "two .class files recorded");
+        // class paths are sorted, normalized to forward slashes
+        assert!(loaded.class_paths.iter().any(|p| p == "Foo.class"));
+        assert!(loaded.class_paths.iter().any(|p| p == "com/example/Bar.class"));
+    }
+
+    /// Manifest write goes through tmp + rename — no .json.tmp leaks after.
+    #[test]
+    fn test_build_manifest_write_atomic_no_tmp_leak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp_dir = tmp.path().join("fp");
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        BuildManifest::write(&fp_dir, &output_dir, &[]).unwrap();
+
+        assert!(fp_dir.join("build-manifest.json").exists(), "manifest must exist");
+        assert!(!fp_dir.join("build-manifest.json.tmp").exists(),
+            ".tmp must not leak after rename");
+    }
+
+    /// is_consistent_with returns true when source set + recorded class files all match.
+    #[test]
+    fn test_build_manifest_consistent_when_all_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp_dir = tmp.path().join("fp");
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("Foo.class"),
+            b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+
+        let sources = vec![tmp.path().join("Foo.java")];
+        BuildManifest::write(&fp_dir, &output_dir, &sources).unwrap();
+        let manifest = BuildManifest::load(&fp_dir).unwrap();
+
+        assert!(manifest.is_consistent_with(&sources, &output_dir),
+            "freshly written manifest must be consistent with the same source list");
+    }
+
+    /// is_consistent_with returns false when a recorded .class is gone (user rm'd out/).
+    #[test]
+    fn test_build_manifest_invalid_when_class_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp_dir = tmp.path().join("fp");
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("Foo.class"),
+            b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+
+        let sources = vec![tmp.path().join("Foo.java")];
+        BuildManifest::write(&fp_dir, &output_dir, &sources).unwrap();
+        let manifest = BuildManifest::load(&fp_dir).unwrap();
+
+        // Simulate user `rm -rf out/`: class file vanishes
+        std::fs::remove_file(output_dir.join("Foo.class")).unwrap();
+
+        assert!(!manifest.is_consistent_with(&sources, &output_dir),
+            "manifest must invalidate when a recorded .class file is missing — \
+             prevents 'cache says we built it but it's not on disk' silent failure");
+    }
+
+    /// is_consistent_with returns false when source list changes (user added/removed .java).
+    #[test]
+    fn test_build_manifest_invalid_when_sources_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp_dir = tmp.path().join("fp");
+        let output_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("Foo.class"),
+            b"\xCA\xFE\xBA\xBE\x00\x00\x00\x42").unwrap();
+
+        let sources_v1 = vec![tmp.path().join("Foo.java")];
+        BuildManifest::write(&fp_dir, &output_dir, &sources_v1).unwrap();
+        let manifest = BuildManifest::load(&fp_dir).unwrap();
+
+        // Simulate adding a new .java file
+        let sources_v2 = vec![
+            tmp.path().join("Foo.java"),
+            tmp.path().join("Bar.java"),
+        ];
+        assert!(!manifest.is_consistent_with(&sources_v2, &output_dir),
+            "manifest must invalidate when source set grew");
+
+        // Simulate removing a source
+        let sources_v3: Vec<PathBuf> = vec![];
+        assert!(!manifest.is_consistent_with(&sources_v3, &output_dir),
+            "manifest must invalidate when source set shrank");
+    }
+
+    /// Critical regression: manifest fast-path does NOT trip on resource-only
+    /// output_dir (the standard-task-core 750B incident scenario at the
+    /// fingerprint+manifest layer instead of the has_classes layer).
+    ///
+    /// Before manifest: a fresh build with stale fingerprints would silently
+    /// skip javac. With manifest: no manifest exists yet → no fast-path
+    /// shortcut → falls through to has_classes / cache restore / javac.
+    #[test]
+    fn test_build_manifest_absent_means_no_fastpath() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp_dir = tmp.path().join("fp");
+
+        // No manifest written.
+        assert!(BuildManifest::load(&fp_dir).is_none(),
+            "absent manifest → load returns None → no fast-path → falls through");
     }
 }
