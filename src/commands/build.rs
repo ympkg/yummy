@@ -76,6 +76,9 @@ static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// Strict mode flag (warnings as errors)
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Frozen-lockfile mode: fail if ym-lock.json is missing or out of sync with ym.json
+static FROZEN_LOCKFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set the number of parallel compilation threads.
 pub fn set_parallelism(threads: usize) {
     let threads = threads.max(1);
@@ -107,6 +110,16 @@ pub fn set_strict(v: bool) {
 /// Check if strict mode is enabled.
 pub fn is_strict() -> bool {
     STRICT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enable frozen-lockfile mode (CI: fail if lock missing or out of sync, ADR-016).
+pub fn set_frozen_lockfile(v: bool) {
+    FROZEN_LOCKFILE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Check if frozen-lockfile mode is enabled.
+pub fn is_frozen_lockfile() -> bool {
+    FROZEN_LOCKFILE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Build with per-phase timing breakdown
@@ -529,7 +542,27 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
     spinner.set_message(format!("Resolving dependencies ({} modules, {} artifacts)...", packages.len(), total_deps));
 
     let cache = config::maven_cache_dir();
-    let mut resolved = config::load_resolved_cache_checked(root, root_cfg)?;
+
+    // Frozen-lockfile mode (ADR-016, CI use): fail fast if ym-lock.json is missing or
+    // out of sync with ym.json. Replaces the legacy `find . -name resolved.json -delete`
+    // CI hack with deterministic build behavior.
+    if is_frozen_lockfile() {
+        let raw_lock = config::load_lockfile(root)?;
+        let current_hash = root_cfg.dependency_fingerprint();
+        if raw_lock.config_hash.is_empty() {
+            anyhow::bail!(
+                "Lockfile not found at {}. \
+                 --frozen-lockfile requires ym-lock.json to exist (commit it to git, see ADR-016).",
+                config::lockfile_path(root).display()
+            );
+        }
+        if raw_lock.config_hash != current_hash {
+            let diff = crate::workspace::lockfile_diff::compute_diff(root_cfg, &raw_lock);
+            anyhow::bail!("{}", crate::workspace::lockfile_diff::format_diff_error(&diff));
+        }
+    }
+
+    let mut resolved = config::load_lockfile_checked(root, root_cfg)?;
     let registries = root_cfg.registry_entries();
     let mut exclusions = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(root_cfg.per_dependency_exclusions());
@@ -543,7 +576,7 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
     )?;
     crate::SPINNER_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
     spinner.finish_and_clear();
-    config::save_resolved_cache(root, &resolved)?;
+    config::save_lockfile(root, &resolved)?;
     let dep_time = dep_start.elapsed();
     let total_jars: usize = per_module_jars.values().next().map(|v| v.len()).unwrap_or(0);
     println!(
@@ -2374,7 +2407,7 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
         return Ok(vec![]);
     }
 
-    let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
+    let mut resolved = config::load_lockfile_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
     exclusions.extend(cfg.resolved_exclusions());
@@ -2395,7 +2428,7 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
     let jars = crate::workspace::resolver::resolve_and_download_with_constraints(
         &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &constraints, &dep_scopes,
     )?;
-    config::save_resolved_cache(project, &resolved)?;
+    config::save_lockfile(project, &resolved)?;
 
     // Filter out JARs whose transitive scope doesn't match requested scopes
     let mut filtered = filter_jars_by_scope(&resolved, &jars, &cache, scopes);
@@ -2441,7 +2474,7 @@ fn build_dep_scope_map(cfg: &YmConfig, _scopes: &[&str]) -> std::collections::Ha
 /// Filter JAR list by checking each JAR's scope in the resolved cache.
 /// Only include JARs whose scope is in the allowed scopes list.
 fn filter_jars_by_scope(
-    resolved: &crate::config::schema::ResolvedCache,
+    resolved: &crate::config::schema::Lockfile,
     jars: &[std::path::PathBuf],
     cache: &std::path::Path,
     scopes: &[&str],
@@ -2529,7 +2562,7 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
         return Ok(jars);
     }
 
-    let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
+    let mut resolved = config::load_lockfile_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
     exclusions.extend(cfg.resolved_exclusions());
@@ -2550,7 +2583,7 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     let jars = crate::workspace::resolver::resolve_and_download_with_constraints(
         &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &constraints, &dep_scopes,
     )?;
-    config::save_resolved_cache(project, &resolved)?;
+    config::save_lockfile(project, &resolved)?;
 
     // Check for dependency version conflicts
     let conflicts = crate::workspace::resolver::check_conflicts(&resolved);
@@ -2586,7 +2619,7 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
 /// Like resolve_deps but skip JAR downloads. Returns expected cache paths.
 /// Used by `ym idea --json` so importing is never blocked by network I/O.
 /// Batch resolve for workspace: pre-loaded root config avoids repeated I/O.
-/// Skips save_resolved_cache (read-only, for idea --json).
+/// Skips save_lockfile (read-only, for idea --json).
 pub fn resolve_deps_no_download_with_root(
     project: &Path,
     cfg: &YmConfig,
@@ -2614,7 +2647,7 @@ pub fn resolve_deps_no_download_with_root(
         return Ok(resolve_lib_dirs(project, cfg));
     }
 
-    let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
+    let mut resolved = config::load_lockfile_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
     exclusions.extend(cfg.resolved_exclusions());
@@ -2675,7 +2708,7 @@ pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<Pa
         return Ok(jars);
     }
 
-    let mut resolved = config::load_resolved_cache_checked(project, cfg)?;
+    let mut resolved = config::load_lockfile_checked(project, cfg)?;
     let mut exclusions = cfg.exclusions.as_ref().cloned().unwrap_or_default();
     exclusions.extend(cfg.per_dependency_exclusions());
     exclusions.extend(cfg.resolved_exclusions());
@@ -2684,7 +2717,7 @@ pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<Pa
     let jars = crate::workspace::resolver::resolve_no_download(
         &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &dep_scopes,
     )?;
-    config::save_resolved_cache(project, &resolved)?;
+    config::save_lockfile(project, &resolved)?;
 
     let mut all_jars = jars;
     all_jars.extend(resolve_lib_dirs(project, cfg));

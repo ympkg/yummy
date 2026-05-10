@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
-use crate::config::schema::{ResolvedCache, ResolvedDependency};
+use crate::config::schema::{Lockfile, ResolvedDependency};
 
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
@@ -279,7 +279,7 @@ impl MavenCoord {
 /// Splits base version by '.', qualifier by '-'.
 /// Release (no qualifier) > any qualifier (Maven convention).
 /// e.g., 4.0.3 > 4.0.3-5 > 4.0.3-4
-fn version_compare(a: &str, b: &str) -> i32 {
+pub(crate) fn version_compare(a: &str, b: &str) -> i32 {
     // Split into base and qualifier: "4.0.3-5" → ("4.0.3", Some("5"))
     let (base_a, qual_a) = if let Some(pos) = a.find('-') {
         (&a[..pos], Some(&a[pos + 1..]))
@@ -396,7 +396,7 @@ fn build_io_pool(num_threads: usize) -> rayon::ThreadPool {
 pub fn resolve_and_download(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
 ) -> Result<Vec<PathBuf>> {
     resolve_and_download_full(dependencies, cache_dir, lock, &[], &[])
 }
@@ -405,7 +405,7 @@ pub fn resolve_and_download(
 pub fn resolve_and_download_full(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
 ) -> Result<Vec<PathBuf>> {
@@ -416,7 +416,7 @@ pub fn resolve_and_download_full(
 pub fn resolve_and_download_with_resolutions(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
@@ -431,7 +431,7 @@ pub fn resolve_and_download_with_resolutions(
 pub fn resolve_and_download_with_scopes(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
@@ -444,7 +444,7 @@ pub fn resolve_and_download_with_scopes(
 pub fn resolve_and_download_with_constraints(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
@@ -459,7 +459,7 @@ pub fn resolve_and_download_with_constraints(
 pub fn resolve_no_download(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
@@ -475,7 +475,7 @@ pub fn resolve_no_download(
 fn resolve_inner(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
@@ -516,13 +516,14 @@ fn resolve_inner(
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    // Resolve transitive graph with nearest-wins strategy (Maven convention).
-    // Track the depth at which each groupId:artifactId was first resolved.
+    // Resolve transitive graph with latest-wins strategy (Gradle convention, see ADR-016).
+    // Each `groupId:artifactId` resolves to the highest version encountered across all paths.
     let mut coords_to_download: Vec<(String, MavenCoord)> = Vec::new();
     let mut dep_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // Maps groupId:artifactId -> (depth, chosen version)
-    let mut resolved_versions: HashMap<String, (usize, String)> = HashMap::new();
-    // Track BFS depth per queued item
+    // Maps groupId:artifactId -> highest version seen so far. Used to skip
+    // BFS exploration of versions that can never win.
+    let mut resolved_versions: HashMap<String, String> = HashMap::new();
+    // Track BFS depth per queued item (used for diagnostics, not for arbitration)
     let mut depth_map: HashMap<String, usize> = HashMap::new();
 
     // In-memory POM cache to avoid re-parsing the same POM
@@ -541,7 +542,7 @@ fn resolve_inner(
         mc.scope = Some(direct_scope.clone());
         scope_map.insert(mc.versioned_key(), direct_scope);
         depth_map.insert(mc.versioned_key(), 0);
-        resolved_versions.insert(ga_key, (0, mc.version.clone()));
+        resolved_versions.insert(ga_key, mc.version.clone());
         queue.push_back(mc);
     }
 
@@ -561,17 +562,26 @@ fn resolve_inner(
                 continue;
             }
 
-            // Nearest-wins: if we already resolved this GA at a shallower depth
-            // with a different version, skip this deeper version
-            if let Some(&(resolved_depth, ref resolved_ver)) = resolved_versions.get(&ga_key) {
-                if resolved_ver != &coord.version && resolved_depth < current_depth {
+            // Latest-wins (Gradle): if a strictly higher version of this GA was
+            // already explored, skip the lower version — it can never win.
+            // Equal versions (same GAV) are caught by `visited.contains` above.
+            if let Some(resolved_ver) = resolved_versions.get(&ga_key) {
+                if version_compare(&coord.version, resolved_ver) < 0 {
                     continue;
                 }
             }
 
             visited.insert(key.clone());
             ordered_keys.push(key.clone());
-            resolved_versions.entry(ga_key).or_insert((current_depth, coord.version.clone()));
+            // Update high-water mark — newer/higher version takes the spot.
+            resolved_versions
+                .entry(ga_key)
+                .and_modify(|v| {
+                    if version_compare(&coord.version, v) > 0 {
+                        *v = coord.version.clone();
+                    }
+                })
+                .or_insert_with(|| coord.version.clone());
 
             // Queue JAR download if not cached and not known pom-only
             let jar_path = coord.jar_path(cache_dir);
@@ -901,10 +911,12 @@ fn resolve_inner(
         }
     }
 
-    // Phase 3: build lock entries and collect JAR paths
-    // Deduplicate by groupId:artifactId — keep the highest version for each GA.
-    let mut ga_winners: HashMap<String, (MavenCoord, String)> = HashMap::new(); // GA → (coord, key)
-    let mut ga_order: Vec<String> = Vec::new(); // insertion order of GAs
+    // Phase 3: build lock entries and collect JAR paths.
+    // Latest-wins: pick the highest version per groupId:artifactId, then write only
+    // those winner entries to the lock with transitive references normalized to winners
+    // (so every reference inside the lock resolves to a present entry).
+    let mut ga_winners: HashMap<String, (MavenCoord, String)> = HashMap::new(); // GA → (coord, winner_key)
+    let mut ga_order: Vec<String> = Vec::new();
     for key in &ordered_keys {
         let Some(coord) = MavenCoord::from_versioned_key(key) else {
             continue;
@@ -918,16 +930,33 @@ fn resolve_inner(
             ga_order.push(ga.clone());
             ga_winners.insert(ga, (coord, key.clone()));
         }
+    }
 
-        // Always insert lock entries for all resolved versions
-        let dep_keys = dep_map.remove(key).unwrap_or_default();
-        let effective_scope = scope_map.get(key).cloned();
-        lock.dependencies.entry(key.clone()).or_insert(ResolvedDependency {
+    // Insert lock entries only for winner versions; rewrite transitive GAV references
+    // so they point at winners (avoids dangling references in the lock).
+    for ga in &ga_order {
+        let Some((_, winner_key)) = ga_winners.get(ga) else { continue };
+        let raw_deps = dep_map.remove(winner_key).unwrap_or_default();
+        let normalized_deps: Vec<String> = raw_deps
+            .into_iter()
+            .map(|gav| {
+                let parts: Vec<&str> = gav.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    let dep_ga = format!("{}:{}", parts[0], parts[1]);
+                    if let Some((_, winner_gav)) = ga_winners.get(&dep_ga) {
+                        return winner_gav.clone();
+                    }
+                }
+                gav
+            })
+            .collect();
+        let effective_scope = scope_map.get(winner_key).cloned();
+        lock.dependencies.entry(winner_key.clone()).or_insert(ResolvedDependency {
             sha256: None,
-            dependencies: if dep_keys.is_empty() {
+            dependencies: if normalized_deps.is_empty() {
                 None
             } else {
-                Some(dep_keys)
+                Some(normalized_deps)
             },
             scope: effective_scope,
         });
@@ -992,7 +1021,7 @@ fn resolve_snapshot_version(
 fn try_resolve_from_lock(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
-    lock: &ResolvedCache,
+    lock: &Lockfile,
     exclusion_set: &HashSet<String>,
     resolutions: &BTreeMap<String, String>,
     registries: &[RegistryEntry],
@@ -2184,7 +2213,7 @@ fn load_credentials_for_url(url: &str) -> Option<(String, String)> {
 
 /// Check for dependency version conflicts in the resolved dependency set.
 /// Returns a list of (groupId:artifactId, [versions]) for artifacts with multiple versions.
-pub fn check_conflicts(lock: &ResolvedCache) -> Vec<(String, Vec<String>)> {
+pub fn check_conflicts(lock: &Lockfile) -> Vec<(String, Vec<String>)> {
     let mut versions_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for key in lock.dependencies.keys() {
@@ -2212,7 +2241,7 @@ pub fn check_conflicts(lock: &ResolvedCache) -> Vec<(String, Vec<String>)> {
 pub fn resolve_workspace_deps(
     all_module_deps: &[(String, BTreeMap<String, String>)],
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
 ) -> Result<HashMap<String, Vec<PathBuf>>> {
@@ -2223,7 +2252,7 @@ pub fn resolve_workspace_deps(
 pub fn resolve_workspace_deps_with_resolutions(
     all_module_deps: &[(String, BTreeMap<String, String>)],
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
@@ -2254,7 +2283,7 @@ pub fn resolve_workspace_deps_with_resolutions(
 fn distribute_jars_per_module(
     all_module_deps: &[(String, BTreeMap<String, String>)],
     cache_dir: &Path,
-    lock: &ResolvedCache,
+    lock: &Lockfile,
 ) -> HashMap<String, Vec<PathBuf>> {
     // Build GA → versioned key lookup from lock file
     let mut ga_to_versioned: HashMap<String, String> = HashMap::new();
@@ -2335,7 +2364,7 @@ fn distribute_jars_per_module(
 pub fn resolve_workspace_deps_no_download(
     all_module_deps: &[(String, BTreeMap<String, String>)],
     cache_dir: &Path,
-    lock: &mut ResolvedCache,
+    lock: &mut Lockfile,
     registries: &[RegistryEntry],
     exclusions: &[String],
     resolutions: &BTreeMap<String, String>,
@@ -2897,7 +2926,7 @@ mod tests {
 
     #[test]
     fn test_check_conflicts_no_conflicts() {
-        let mut lock = ResolvedCache::default();
+        let mut lock = Lockfile::default();
         lock.dependencies.insert("com.example:lib:1.0".to_string(), ResolvedDependency::default());
         let conflicts = check_conflicts(&lock);
         assert!(conflicts.is_empty());
@@ -2905,7 +2934,7 @@ mod tests {
 
     #[test]
     fn test_check_conflicts_detects_multiple_versions() {
-        let mut lock = ResolvedCache::default();
+        let mut lock = Lockfile::default();
         lock.dependencies.insert("com.example:lib:1.0".to_string(), ResolvedDependency::default());
         lock.dependencies.insert("com.example:lib:2.0".to_string(), ResolvedDependency::default());
         let conflicts = check_conflicts(&lock);
@@ -2920,7 +2949,7 @@ mod tests {
     #[test]
     fn test_try_resolve_from_lock_empty() {
         let deps = BTreeMap::new();
-        let lock = ResolvedCache::default();
+        let lock = Lockfile::default();
         let result = try_resolve_from_lock(&deps, Path::new("/tmp/cache"), &lock, &HashSet::new(), &BTreeMap::new(), &[], false);
         // Empty lock returns None
         assert!(result.is_none());
@@ -2955,11 +2984,43 @@ mod tests {
         let module_deps: Vec<(String, BTreeMap<String, String>)> = vec![
             ("mod-a".into(), BTreeMap::new()),
         ];
-        let mut lock = ResolvedCache::default();
+        let mut lock = Lockfile::default();
         let result = resolve_workspace_deps(
             &module_deps, Path::new("/tmp/cache"), &mut lock, &[], &[],
         ).unwrap();
         assert_eq!(result.get("mod-a").unwrap().len(), 0);
+    }
+
+    // --- version_compare tests (latest-wins arbitration support, ADR-016) ---
+
+    #[test]
+    fn test_version_compare_basic_ordering() {
+        assert!(version_compare("1.0", "2.0") < 0);
+        assert!(version_compare("2.0", "1.0") > 0);
+        assert_eq!(version_compare("1.0", "1.0"), 0);
+    }
+
+    #[test]
+    fn test_version_compare_semver_not_lexical() {
+        // SemVer: 1.10.0 must be greater than 1.9.0 (lexical would say opposite)
+        assert!(version_compare("1.10.0", "1.9.0") > 0);
+        assert!(version_compare("2.10", "2.2") > 0);
+        assert!(version_compare("4.0.10", "4.0.3") > 0);
+    }
+
+    #[test]
+    fn test_version_compare_qualifier_release_wins() {
+        // Maven convention: release (no qualifier) > any qualifier
+        assert!(version_compare("4.0.3", "4.0.3-5") > 0);
+        assert!(version_compare("1.0", "1.0-SNAPSHOT") > 0);
+    }
+
+    #[test]
+    fn test_version_compare_uneven_segment_count() {
+        // 1.0 should equal 1.0.0 (missing segments treated as 0)
+        assert_eq!(version_compare("1.0", "1.0.0"), 0);
+        assert!(version_compare("1.0.1", "1.0") > 0);
+        assert!(version_compare("2", "1.99.99") > 0);
     }
 
     // --- MavenCoord clone test ---

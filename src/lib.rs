@@ -191,6 +191,9 @@ enum YmCommands {
         /// Output upgradable deps as JSON (no modification)
         #[arg(long)]
         json: bool,
+        /// Show what would change without modifying ym.json or ym-lock.json (cargo-style dry-run, ADR-016)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Convert from Maven/Gradle to package.toml
     Convert {
@@ -386,6 +389,9 @@ enum YmcCommands {
         /// Treat warnings as errors (-Werror)
         #[arg(long)]
         strict: bool,
+        /// Fail if ym-lock.json is missing or out of sync with ym.json (CI mode, ADR-016)
+        #[arg(long)]
+        frozen_lockfile: bool,
     },
     /// Compile, run, and watch for changes (development mode)
     Dev {
@@ -555,8 +561,8 @@ fn ym_main() -> Result<()> {
             commands::add::execute(&dep, scope.as_deref(), classifier.as_deref())
         }
         YmCommands::Remove { dep } => commands::remove::execute(&dep),
-        YmCommands::Upgrade { interactive, yes, json } => {
-            commands::upgrade::execute(interactive, yes, json)
+        YmCommands::Upgrade { interactive, yes, json, dry_run } => {
+            commands::upgrade::execute(interactive, yes, json, dry_run)
         }
         YmCommands::Convert { verify } => commands::migrate::execute(verify),
         YmCommands::Publish { targets, registry, dry_run, local } => {
@@ -777,7 +783,7 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
     }
 
     match cli.command {
-        YmcCommands::Build { targets, parallel, profile, verbose, clean, output, keep_going, strict } => {
+        YmcCommands::Build { targets, parallel, profile, verbose, clean, output, keep_going, strict, frozen_lockfile } => {
             if let Some(n) = parallel {
                 commands::build::set_parallelism(n);
             }
@@ -792,6 +798,9 @@ fn dispatch_ymc(cli: YmcCli) -> Result<()> {
             }
             if strict {
                 commands::build::set_strict(true);
+            }
+            if frozen_lockfile {
+                commands::build::set_frozen_lockfile(true);
             }
             if profile {
                 commands::build::execute_with_profile(targets)

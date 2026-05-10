@@ -3,7 +3,7 @@ use console::style;
 use std::collections::HashSet;
 
 use crate::config;
-use crate::config::schema::{ResolvedCache, ResolvedDependency};
+use crate::config::schema::{Lockfile, ResolvedDependency};
 
 pub fn execute(max_depth: usize, json: bool, flat: bool, dot: bool, reverse: Option<&str>) -> Result<()> {
     if json {
@@ -25,7 +25,7 @@ fn execute_flat() -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
-    let resolved = config::load_resolved_cache(&project)?;
+    let resolved = config::load_lockfile(&project)?;
     let deps = cfg.maven_dependencies();
 
     // Collect all unique dependencies (direct + transitive)
@@ -69,7 +69,7 @@ fn execute_flat() -> Result<()> {
 }
 
 fn collect_transitive(
-    resolved: &ResolvedCache,
+    resolved: &Lockfile,
     key: &str,
     all: &mut std::collections::BTreeMap<String, String>,
     seen: &mut HashSet<String>,
@@ -97,7 +97,7 @@ fn execute_json() -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
 
-    let resolved = config::load_resolved_cache(&project)?;
+    let resolved = config::load_lockfile(&project)?;
     let deps = cfg.maven_dependencies();
 
     let mut tree = Vec::new();
@@ -116,7 +116,7 @@ fn execute_json() -> Result<()> {
 }
 
 fn build_json_tree(
-    resolved: &ResolvedCache,
+    resolved: &Lockfile,
     key: &str,
     seen: &mut HashSet<String>,
 ) -> Vec<serde_json::Value> {
@@ -166,7 +166,7 @@ fn execute_text(max_depth: usize) -> Result<()> {
         style(cfg.version.as_deref().unwrap_or("")).dim()
     );
 
-    let resolved = config::load_resolved_cache(&project)?;
+    let resolved = config::load_lockfile(&project)?;
     let deps = cfg.maven_dependencies();
     let dep_count = deps.len();
 
@@ -193,7 +193,7 @@ fn execute_text(max_depth: usize) -> Result<()> {
 fn execute_dot() -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
-    let resolved = config::load_resolved_cache(&project)?;
+    let resolved = config::load_lockfile(&project)?;
     let deps = cfg.maven_dependencies();
 
     println!("digraph dependencies {{");
@@ -226,7 +226,7 @@ fn execute_dot() -> Result<()> {
 fn execute_reverse(target: &str) -> Result<()> {
     let (config_path, cfg) = config::load_or_find_config()?;
     let project = config::project_dir(&config_path);
-    let resolved = config::load_resolved_cache(&project)?;
+    let resolved = config::load_lockfile(&project)?;
     let deps = cfg.maven_dependencies();
 
     println!();
@@ -273,7 +273,7 @@ fn execute_reverse(target: &str) -> Result<()> {
 }
 
 fn print_transitive(
-    resolved: &ResolvedCache,
+    resolved: &Lockfile,
     entry: &ResolvedDependency,
     prefix: &str,
     seen: &mut HashSet<String>,

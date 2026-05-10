@@ -443,9 +443,9 @@ fn check_maven_cache() {
 
 fn check_jar_integrity(fix: bool) -> bool {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let resolved = match crate::config::load_resolved_cache(&cwd) {
+    let resolved = match crate::config::load_lockfile(&cwd) {
         Ok(r) => r,
-        Err(_) => return true, // No resolved.json, nothing to check
+        Err(_) => return true, // No ym-lock.json, nothing to check
     };
 
     if resolved.dependencies.is_empty() {
@@ -492,11 +492,11 @@ fn check_jar_integrity(fix: bool) -> bool {
             resolved.dependencies.len()
         );
     } else if fix {
-        // Delete corrupt/missing JARs and clear resolved cache so next build re-downloads
-        let resolved_path = cwd.join(".ym").join("resolved.json");
-        let _ = std::fs::remove_file(&resolved_path);
+        // Delete corrupt/missing JARs and clear lockfile so next build re-downloads
+        let lock_path = crate::config::lockfile_path(&cwd);
+        let _ = std::fs::remove_file(&lock_path);
         println!(
-            "  {} Cleared resolved cache ({} missing, {} corrupt). Next build will re-download.",
+            "  {} Cleared ym-lock.json ({} missing, {} corrupt). Next build will re-download.",
             style("✓").green(),
             missing,
             corrupt

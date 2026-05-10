@@ -752,7 +752,7 @@ impl YmConfig {
     }
 
     /// Compute a fingerprint of dependency-relevant config fields.
-    /// Used to detect when resolved.json should be invalidated.
+    /// Used to detect when ym-lock.json should be invalidated.
     pub fn dependency_fingerprint(&self) -> String {
         use std::fmt::Write;
         let mut data = String::new();
@@ -878,27 +878,39 @@ pub struct NativeConfig {
     pub docker_image: Option<String>,
 }
 
-/// Internal resolved dependency cache (.ym/resolved.json)
+/// Lockfile (ym-lock.json, project root, committed to git).
+/// Replaces the legacy `.ym/resolved.json` cache. See ADR-016.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ResolvedCache {
-    pub version: u32,
-    /// SHA-256 hash of dependency-relevant config fields for cache invalidation
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_hash: Option<String>,
+pub struct Lockfile {
+    /// Schema version (initial 1; bumped on incompatible schema change)
+    pub lockfile_version: u32,
+    /// ymc semantic version that wrote this lockfile (debug only, not used in frozen comparison)
+    pub ymc_version: String,
+    /// ISO 8601 UTC timestamp of last write (debug only)
+    pub generated_at: String,
+    /// Conflict resolution strategy ("latest-wins" default; future flag position)
+    pub version_winner_strategy: String,
+    /// SHA-256 of dependency-relevant config fields (deps/resolutions/exclusions/registries).
+    /// Used for fast change detection in --frozen-lockfile and lock invalidation.
+    pub config_hash: String,
+    /// Full transitive dependency tree, keyed by `groupId:artifactId:version`
     pub dependencies: BTreeMap<String, ResolvedDependency>,
 }
 
-impl Default for ResolvedCache {
+impl Default for Lockfile {
     fn default() -> Self {
         Self {
-            version: 1,
-            config_hash: None,
+            lockfile_version: 1,
+            ymc_version: env!("CARGO_PKG_VERSION").to_string(),
+            generated_at: String::new(),
+            version_winner_strategy: "latest-wins".to_string(),
+            config_hash: String::new(),
             dependencies: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedDependency {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,

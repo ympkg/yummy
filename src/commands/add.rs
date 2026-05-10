@@ -200,14 +200,14 @@ pub fn execute(dep: &str, scope: Option<&str>, classifier: Option<&str>) -> Resu
     // Try to download immediately
     let project = config::project_dir(&config_path);
     let cache = config::maven_cache_dir();
-    let mut resolved = config::load_resolved_cache(&project)?;
+    let mut resolved = config::load_lockfile(&project)?;
 
     let mut single_dep = std::collections::BTreeMap::new();
     single_dep.insert(coord.clone(), version);
 
     match resolver::resolve_and_download(&single_dep, &cache, &mut resolved) {
         Ok(jars) => {
-            config::save_resolved_cache(&project, &resolved)?;
+            config::save_lockfile(&project, &resolved)?;
             println!(
                 "  {} Downloaded {} artifact(s)",
                 style("✓").green(),

@@ -28,7 +28,7 @@ fn clean_all(
     let size = config::dir_size(maven_cache) + config::dir_size(pom_cache);
     // Filter upfront so "does it exist" is answered exactly once.
     let resolved = project
-        .map(config::resolved_cache_path)
+        .map(config::lockfile_path)
         .filter(|p| p.exists());
 
     if size == 0 && resolved.is_none() {
@@ -216,11 +216,11 @@ fn clean_pattern(
         println!("  {} Removed {}", style("✓").green(), p.display());
     }
 
-    // Invalidate project-local resolved.json so the next build re-resolves
+    // Invalidate project-local ym-lock.json so the next build re-resolves
     // the cleared deps. Safe to remove even if the pattern matched only
-    // entries outside the current project — resolved.json will rebuild.
+    // entries outside the current project — ym-lock.json will rebuild.
     if let Some(p) = project {
-        let path = config::resolved_cache_path(p);
+        let path = config::lockfile_path(p);
         if path.exists() {
             std::fs::remove_file(&path)?;
             println!("  {} Invalidated {}", style("✓").green(), path.display());

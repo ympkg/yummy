@@ -5,7 +5,7 @@ use crate::config;
 use crate::config::schema::DependencyValue;
 use crate::workspace::resolver;
 
-pub fn execute(interactive: bool, yes: bool, json: bool) -> Result<()> {
+pub fn execute(interactive: bool, yes: bool, json: bool, dry_run: bool) -> Result<()> {
     let (config_path, mut cfg) = config::load_or_find_config()?;
 
     // Check for pinned versions (resolutions)
@@ -147,14 +147,27 @@ pub fn execute(interactive: bool, yes: bool, json: bool) -> Result<()> {
     }
 
     if updated > 0 {
-        config::save_config(&config_path, &cfg)?;
-        println!();
-        println!(
-            "  {} Upgraded {} dependenc{}",
-            style("✓").green(),
-            updated,
-            if updated == 1 { "y" } else { "ies" }
-        );
+        if dry_run {
+            println!();
+            println!(
+                "  {} {} dependenc{} would be upgraded ({}). \
+                 Re-run without --dry-run to apply.",
+                style("→").yellow(),
+                updated,
+                if updated == 1 { "y" } else { "ies" },
+                style("--dry-run").dim(),
+            );
+        } else {
+            config::save_config(&config_path, &cfg)?;
+            println!();
+            println!(
+                "  {} Upgraded {} dependenc{}. \
+                 ym-lock.json will be regenerated on next build (commit it together with ym.json, see ADR-016).",
+                style("✓").green(),
+                updated,
+                if updated == 1 { "y" } else { "ies" }
+            );
+        }
     }
 
     Ok(())

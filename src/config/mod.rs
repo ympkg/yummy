@@ -1,16 +1,16 @@
 pub mod schema;
 
 use anyhow::{Context, Result};
-use schema::{ResolvedCache, YmConfig};
+use schema::{Lockfile, YmConfig};
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = "ym.json";
+pub const LOCKFILE_NAME: &str = "ym-lock.json";
 pub const CACHE_DIR: &str = ".ym";
 pub const OUTPUT_DIR: &str = "out";
 pub const CLASSES_DIR: &str = "classes";
 pub const TEST_CLASSES_DIR: &str = "test-classes";
 pub const SOURCE_DIR: &str = "src";
-pub const RESOLVED_FILE: &str = "resolved.json";
 pub const MAVEN_CACHE_DIR: &str = "maven";
 pub const BUILD_CACHE_DIR: &str = "build-cache";
 pub const POM_CACHE_DIR: &str = "pom-cache";
@@ -63,48 +63,62 @@ pub fn save_config(path: &Path, config: &YmConfig) -> Result<()> {
     Ok(())
 }
 
-/// Load the resolved dependency cache from .ym/resolved.json
-pub fn load_resolved_cache(project: &Path) -> Result<ResolvedCache> {
-    let path = resolved_cache_path(project);
+/// Load ym-lock.json from project root (workspace root, not .ym/).
+/// Returns Default if file doesn't exist (caller is expected to populate + save).
+/// Legacy `.ym/resolved.json` is intentionally ignored — see ADR-016.
+pub fn load_lockfile(project: &Path) -> Result<Lockfile> {
+    let path = lockfile_path(project);
     if !path.exists() {
-        return Ok(ResolvedCache::default());
+        return Ok(Lockfile::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    let cache: ResolvedCache = serde_json::from_str(&content)?;
-    Ok(cache)
+    let lock: Lockfile = serde_json::from_str(&content)?;
+    Ok(lock)
 }
 
-/// Load resolved cache, invalidating if config has changed.
-/// Returns empty cache if dependency-relevant fields (dependencies, resolutions,
-/// exclusions, registries) have changed since last resolve.
-pub fn load_resolved_cache_checked(project: &Path, cfg: &YmConfig) -> Result<ResolvedCache> {
-    let mut cache = load_resolved_cache(project)?;
+/// Load lockfile, invalidating dependencies if config has changed.
+/// Returns empty deps + new hash when ym.json's dependency-relevant fields changed.
+pub fn load_lockfile_checked(project: &Path, cfg: &YmConfig) -> Result<Lockfile> {
+    let mut lock = load_lockfile(project)?;
     let current_hash = cfg.dependency_fingerprint();
-    if cache.config_hash.as_deref() != Some(&current_hash) {
-        // Config changed — invalidate
-        cache.dependencies.clear();
-        cache.config_hash = Some(current_hash);
+    if lock.config_hash != current_hash {
+        lock.dependencies.clear();
+        lock.config_hash = current_hash;
     }
-    Ok(cache)
+    Ok(lock)
 }
 
-/// Save the resolved dependency cache to .ym/resolved.json
-/// Skips writing if the content is unchanged (preserves mtime for fingerprinting).
-pub fn save_resolved_cache(project: &Path, cache: &ResolvedCache) -> Result<()> {
-    // One call to `cache_dir` (via `resolved_cache_path`) — the enclosing
-    // directory is derived from the file path for symmetry with `load`.
-    let path = resolved_cache_path(project);
+/// Save lockfile to project root (workspace root) as ym-lock.json.
+/// Stamps `ymc_version` and `generated_at` on every write.
+/// Atomic via tmp+rename. Skips writing if content unchanged (preserves mtime).
+pub fn save_lockfile(project: &Path, lock: &Lockfile) -> Result<()> {
+    let mut lock = lock.clone();
+    lock.ymc_version = env!("CARGO_PKG_VERSION").to_string();
+    lock.generated_at = chrono::Utc::now().to_rfc3339();
+    if lock.version_winner_strategy.is_empty() {
+        lock.version_winner_strategy = "latest-wins".to_string();
+    }
+    if lock.lockfile_version == 0 {
+        lock.lockfile_version = 1;
+    }
+
+    let path = lockfile_path(project);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let content = serde_json::to_string_pretty(cache)? + "\n";
-    // Only write if content has changed, to preserve mtime for build fingerprinting
+    let content = serde_json::to_string_pretty(&lock)? + "\n";
+    // Skip if existing lock body matches modulo timestamp (avoid pointless mtime churn)
     if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing == content {
-            return Ok(());
+        if let Ok(existing_lock) = serde_json::from_str::<Lockfile>(&existing) {
+            if existing_lock.config_hash == lock.config_hash
+                && existing_lock.dependencies == lock.dependencies
+                && existing_lock.lockfile_version == lock.lockfile_version
+                && existing_lock.version_winner_strategy == lock.version_winner_strategy
+            {
+                return Ok(());
+            }
         }
     }
-    // Atomic write: tmp + rename to avoid corruption on interrupt
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, &content)?;
     std::fs::rename(&tmp_path, &path)?;
@@ -191,8 +205,10 @@ pub fn pom_cache_dir() -> PathBuf {
         .join(POM_CACHE_DIR)
 }
 
-pub fn resolved_cache_path(project: &Path) -> PathBuf {
-    cache_dir(project).join(RESOLVED_FILE)
+/// Lockfile lives at the workspace root (sibling of ym.json), not in `.ym/`.
+pub fn lockfile_path(project: &Path) -> PathBuf {
+    let root = find_workspace_root(project).unwrap_or_else(|| project.to_path_buf());
+    root.join(LOCKFILE_NAME)
 }
 
 /// Missing path returns 0 rather than erroring so callers (clean, doctor)

@@ -24,12 +24,28 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
         return Ok(());
     }
 
-    // misc.xml - JDK version + ExternalStorageConfigurationManager (prevents .iml generation)
+    // misc.xml — language level + project output dir only.
+    //
+    // We intentionally do NOT write `project-jdk-name` here. ym's `target` is a JDK version
+    // number (e.g. "21"); IDEA's SDK name is whatever the user picked in `File → Project
+    // Structure → SDKs` (e.g. "graalvm-ce-25", "JBR_21", "openjdk-25"). Writing
+    // project-jdk-name="21" forces IDEA to look for a literally-named SDK "21" and, when
+    // missing, leaves modules with no JDK orderEntry → "Module JDK is not defined".
+    //
+    // Letting IDEA's "Setup SDK" banner (or an existing project-jdk-name preserved by IDEA
+    // itself) own the SDK choice keeps ym out of the user's SDK registry. The ExternalSystem
+    // sync path complements this by attaching ModuleSdkData(null) to each module so they
+    // inherit whatever SDK the user selected.
+    let existing_misc = std::fs::read_to_string(idea_dir.join("misc.xml")).ok();
+    let preserved_project_jdk = existing_misc
+        .as_deref()
+        .and_then(extract_project_jdk_attrs)
+        .unwrap_or_default();
     let misc = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ExternalStorageConfigurationManager" enabled="true" />
-  <component name="ProjectRootManager" version="2" languageLevel="JDK_{java_version}" default="true" project-jdk-name="{java_version}" project-jdk-type="JavaSDK">
+  <component name="ProjectRootManager" version="2" languageLevel="JDK_{java_version}"{preserved_project_jdk}>
     <output url="file://$PROJECT_DIR$/out" />
   </component>
 </project>
@@ -62,14 +78,14 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
                 all_module_deps.push((pkg_name.clone(), deps));
             }
 
-            let mut resolved = config::load_resolved_cache(&project)?;
+            let mut resolved = config::load_lockfile(&project)?;
             let mut exclusions: Vec<String> = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
             exclusions.extend(root_cfg.per_dependency_exclusions());
             exclusions.extend(root_cfg.resolved_exclusions());
             let per_module_jars = crate::workspace::resolver::resolve_workspace_deps_with_resolutions(
                 &all_module_deps, &cache_dir, &mut resolved, &root_registries, &exclusions, &root_resolutions,
             )?;
-            config::save_resolved_cache(&project, &resolved)?;
+            config::save_lockfile(&project, &resolved)?;
 
             let mut all_jars: Vec<PathBuf> = Vec::new();
             for jars in per_module_jars.values() {
@@ -212,12 +228,12 @@ fn build_modules_workspace(
     eprintln!("  Resolving {} artifacts...", unique_dep_count);
 
     // Single-pass resolution: merge all deps → resolve + download → distribute per-module
-    let mut resolved = config::load_resolved_cache(root)?;
+    let mut resolved = config::load_lockfile(root)?;
     let exclusions: Vec<String> = root_cfg.exclusions.as_ref().cloned().unwrap_or_default();
     let per_module_jars = resolver::resolve_workspace_deps_with_resolutions(
         &all_module_deps, &cache_dir, &mut resolved, &root_registries, &exclusions, &root_resolutions,
     )?;
-    config::save_resolved_cache(root, &resolved)?;
+    config::save_lockfile(root, &resolved)?;
 
     eprintln!("  Building project model...");
 
@@ -504,6 +520,31 @@ fn collect_annotation_processor_jars(
 }
 
 
+/// Extract the `project-jdk-name` (and matching `project-jdk-type`) attribute from an
+/// existing misc.xml so re-running `ymc idea` doesn't clobber the user's SDK selection.
+/// Returns the leading-space-prefixed attribute fragment (e.g.
+/// ` default="true" project-jdk-name="graalvm-ce-25" project-jdk-type="JavaSDK"`) or None
+/// if no project-jdk-name is present (meaning IDEA will show "Setup SDK").
+fn extract_project_jdk_attrs(misc_xml: &str) -> Option<String> {
+    let name = extract_xml_attr(misc_xml, "project-jdk-name")?;
+    if name.is_empty() {
+        return None;
+    }
+    let kind = extract_xml_attr(misc_xml, "project-jdk-type").unwrap_or_else(|| "JavaSDK".into());
+    Some(format!(
+        r#" default="true" project-jdk-name="{}" project-jdk-type="{}""#,
+        name, kind
+    ))
+}
+
+fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    let needle = format!("{}=\"", attr);
+    let start = xml.find(&needle)? + needle.len();
+    let rest = &xml[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 /// Detect if running under WSL (Windows Subsystem for Linux).
 fn is_wsl() -> bool {
     if let Ok(osrelease) = std::fs::read_to_string("/proc/version") {
@@ -554,6 +595,38 @@ fn to_idea_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_project_jdk_attrs_returns_none_when_absent() {
+        let xml = r#"<project version="4">
+  <component name="ProjectRootManager" version="2" languageLevel="JDK_25">
+    <output url="file://$PROJECT_DIR$/out" />
+  </component>
+</project>"#;
+        assert!(extract_project_jdk_attrs(xml).is_none());
+    }
+
+    #[test]
+    fn extract_project_jdk_attrs_preserves_user_selection() {
+        let xml = r#"<project version="4">
+  <component name="ProjectRootManager" version="2" languageLevel="JDK_25" default="true" project-jdk-name="graalvm-ce-25" project-jdk-type="JavaSDK">
+    <output url="file://$PROJECT_DIR$/out" />
+  </component>
+</project>"#;
+        let frag = extract_project_jdk_attrs(xml).expect("should extract");
+        assert!(frag.contains(r#"project-jdk-name="graalvm-ce-25""#));
+        assert!(frag.contains(r#"project-jdk-type="JavaSDK""#));
+        assert!(frag.starts_with(' '), "must start with a leading space");
+    }
+
+    #[test]
+    fn extract_project_jdk_attrs_defaults_type_to_javasdk() {
+        let xml = r#"project-jdk-name="JBR_25""#;
+        let frag = extract_project_jdk_attrs(xml).expect("should extract");
+        assert!(frag.contains(r#"project-jdk-type="JavaSDK""#));
+    }
+
     #[test]
     fn test_to_idea_path_mnt_conversion() {
         // Only test the path conversion logic (not WSL detection)
