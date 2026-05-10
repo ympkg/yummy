@@ -22,16 +22,12 @@ pub fn execute(yes: bool, pattern: Option<&str>) -> Result<()> {
 fn clean_all(
     maven_cache: &Path,
     pom_cache: &Path,
-    project: Option<&Path>,
+    _project: Option<&Path>,
     yes: bool,
 ) -> Result<()> {
     let size = config::dir_size(maven_cache) + config::dir_size(pom_cache);
-    // Filter upfront so "does it exist" is answered exactly once.
-    let resolved = project
-        .map(config::lockfile_path)
-        .filter(|p| p.exists());
 
-    if size == 0 && resolved.is_none() {
+    if size == 0 {
         println!("  {} No cache to clean", style("✓").green());
         return Ok(());
     }
@@ -58,10 +54,12 @@ fn clean_all(
         std::fs::remove_dir_all(pom_cache)?;
         println!("  {} Removed {}", style("✓").green(), pom_cache.display());
     }
-    if let Some(path) = resolved {
-        std::fs::remove_file(&path)?;
-        println!("  {} Removed {}", style("✓").green(), path.display());
-    }
+
+    // NOTE: Do NOT touch ym-lock.json. Lockfile is git-tracked source
+    // (like Cargo.lock / package-lock.json / yarn.lock), not cache.
+    // Touching it breaks `--frozen-lockfile`. See ADR-016.
+    // Industry standard: `npm cache clean` / `cargo clean` / `pnpm store prune`
+    // all leave the lockfile alone.
 
     println!(
         "  {} Cache clean complete ({} freed)",
@@ -168,7 +166,7 @@ fn match_pom_cache(cache: &Path, pat: &CachePattern) -> Vec<PathBuf> {
 fn clean_pattern(
     maven_cache: &Path,
     pom_cache: &Path,
-    project: Option<&Path>,
+    _project: Option<&Path>,
     pattern: &str,
     yes: bool,
 ) -> Result<()> {
@@ -216,16 +214,11 @@ fn clean_pattern(
         println!("  {} Removed {}", style("✓").green(), p.display());
     }
 
-    // Invalidate project-local ym-lock.json so the next build re-resolves
-    // the cleared deps. Safe to remove even if the pattern matched only
-    // entries outside the current project — ym-lock.json will rebuild.
-    if let Some(p) = project {
-        let path = config::lockfile_path(p);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            println!("  {} Invalidated {}", style("✓").green(), path.display());
-        }
-    }
+    // NOTE: Do NOT touch ym-lock.json here. Lockfile is git-tracked source
+    // (like Cargo.lock / package-lock.json / yarn.lock), not cache. Touching
+    // it breaks `--frozen-lockfile` builds. See ADR-016.
+    // Industry standard: `npm cache clean` / `cargo clean` / `pnpm store prune`
+    // all leave the lockfile alone.
 
     println!(
         "  {} Cache clean complete ({} freed)",
@@ -340,6 +333,60 @@ mod tests {
         );
         assert_eq!(matches.len(), 1);
         assert!(matches[0].ends_with("1.0"));
+    }
+
+    // --- Regression tests: cache clean must NOT touch ym-lock.json (ADR-016) ---
+    // Lockfile is git-tracked source (like Cargo.lock / package-lock.json),
+    // not cache. Touching it breaks `--frozen-lockfile`.
+
+    #[test]
+    fn clean_all_preserves_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("ym.json"), r#"{"name":"test"}"#).unwrap();
+        let lock_path = project.join("ym-lock.json");
+        std::fs::write(&lock_path, r#"{"lockfile_version":1,"dependencies":{}}"#).unwrap();
+
+        let maven_cache = tmp.path().join("maven");
+        std::fs::create_dir_all(&maven_cache).unwrap();
+        std::fs::write(maven_cache.join("dummy"), "x").unwrap();
+        let pom_cache = tmp.path().join("pom-cache");
+        std::fs::create_dir_all(&pom_cache).unwrap();
+
+        clean_all(&maven_cache, &pom_cache, Some(project), true).unwrap();
+
+        assert!(
+            lock_path.exists(),
+            "clean_all must NOT delete ym-lock.json (lockfile is git-tracked source, not cache)"
+        );
+    }
+
+    #[test]
+    fn clean_pattern_preserves_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        std::fs::write(project.join("ym.json"), r#"{"name":"test"}"#).unwrap();
+        let lock_path = project.join("ym-lock.json");
+        std::fs::write(&lock_path, r#"{"lockfile_version":1,"dependencies":{}}"#).unwrap();
+
+        let maven_cache = tmp.path().join("maven");
+        std::fs::create_dir_all(maven_cache.join("com.example").join("foo").join("1.0")).unwrap();
+        let pom_cache = tmp.path().join("pom-cache");
+        std::fs::create_dir_all(&pom_cache).unwrap();
+
+        clean_pattern(
+            &maven_cache,
+            &pom_cache,
+            Some(project),
+            "com.example:foo:1.0",
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            lock_path.exists(),
+            "clean_pattern must NOT delete ym-lock.json (lockfile is git-tracked source, not cache)"
+        );
     }
 
     #[test]
