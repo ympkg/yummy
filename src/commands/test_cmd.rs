@@ -295,6 +295,7 @@ fn run_tests(
     // Step 1: compile main source (compile + provided scope)
     let main_compile_cfg = crate::compiler::CompileConfig {
         source_dirs: vec![src_dir],
+        resource_dirs: vec![project.join("src").join("main").join("resources")],
         output_dir: out_dir.clone(),
         classpath: compile_jars,
         java_version: cfg.target.clone(),
@@ -318,6 +319,7 @@ fn run_tests(
 
         let test_compile_cfg = crate::compiler::CompileConfig {
             source_dirs: vec![test_dir.clone()],
+            resource_dirs: vec![project.join("src").join("test").join("resources")],
             output_dir: test_out_dir.clone(),
             classpath: test_classpath,
             java_version: cfg.target.clone(),
@@ -863,6 +865,7 @@ fn test_workspace(
 
         let compile_cfg = crate::compiler::CompileConfig {
             source_dirs: vec![test_dir.clone()],
+            resource_dirs: vec![target_pkg.path.join("src").join("test").join("resources")],
             output_dir: test_out_dir.clone(),
             classpath: test_cp,
             java_version: target_pkg.config.target.clone(),

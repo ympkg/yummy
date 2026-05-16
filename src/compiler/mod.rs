@@ -30,6 +30,11 @@ pub struct CompileResult {
 
 pub struct CompileConfig {
     pub source_dirs: Vec<PathBuf>,
+    /// Directories whose non-`.java` files are copied verbatim into `output_dir`
+    /// and packaged into the artifact (e.g. `src/main/resources`). Folded into
+    /// the build cache key so a resource-only change invalidates a stale cache
+    /// instead of restoring an out-of-date `output_dir`.
+    pub resource_dirs: Vec<PathBuf>,
     pub output_dir: PathBuf,
     pub classpath: Vec<PathBuf>,
     pub java_version: Option<String>,

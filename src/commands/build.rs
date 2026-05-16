@@ -787,6 +787,9 @@ fn build_workspace(root: &Path, root_cfg: &YmConfig, targets: &[String], package
                 // Build a CompileConfig for cache key computation (AP JARs covered by maven SHA-256s)
                 let compile_cfg = compiler::CompileConfig {
                     source_dirs: Vec::new(),
+                    // Resources are folded into the module cache key separately,
+                    // via source_hashes_map (see the "res:" entries above).
+                    resource_dirs: Vec::new(),
                     output_dir: std::path::PathBuf::new(),
                     classpath: Vec::new(),
                     java_version: module_cfg.target.clone(),
@@ -2757,8 +2760,15 @@ pub fn compile_project(
         extra_args.push("-Werror".to_string());
     }
 
+    let resources_dir = project.join("src").join("main").join("resources");
+
     let compile_cfg = compiler::CompileConfig {
         source_dirs: vec![src.clone()],
+        // Both dirs are copied into output_dir and packaged into the jar:
+        // non-.java files under src/main/java, and everything under
+        // src/main/resources. Folding them into the build cache key makes a
+        // resource-only change invalidate the cache (see compute_build_cache_key).
+        resource_dirs: vec![src.clone(), resources_dir.clone()],
         output_dir: out.clone(),
         classpath: classpath.to_vec(),
         java_version: cfg.target.clone(),
@@ -2772,7 +2782,6 @@ pub fn compile_project(
     let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
     resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
 
-    let resources_dir = project.join("src").join("main").join("resources");
     if resources_dir.exists() {
         resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
@@ -2810,8 +2819,13 @@ pub fn compile_project_with_pool(
         extra_args.push("-Werror".to_string());
     }
 
+    let resources_dir = project.join("src").join("main").join("resources");
+
     let compile_cfg = compiler::CompileConfig {
         source_dirs: vec![src.clone()],
+        // See compile_project: resources packaged into the jar must invalidate
+        // the build cache key when their contents change.
+        resource_dirs: vec![src.clone(), resources_dir.clone()],
         output_dir: out.clone(),
         classpath: classpath.to_vec(),
         java_version: cfg.target.clone(),
@@ -2825,7 +2839,6 @@ pub fn compile_project_with_pool(
     let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
     resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
 
-    let resources_dir = project.join("src").join("main").join("resources");
     if resources_dir.exists() {
         resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
     }
@@ -3015,6 +3028,8 @@ pub fn compile_project_full(
 
     let compile_cfg = compiler::CompileConfig {
         source_dirs: vec![src],
+        // compile_project_full calls javac directly — no build cache involved.
+        resource_dirs: vec![],
         output_dir: out,
         classpath: classpath.to_vec(),
         java_version: cfg.target.clone(),

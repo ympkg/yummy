@@ -10,6 +10,7 @@ const BUILD_MANIFEST_FILE: &str = "build-manifest.json";
 // Hash domain separator tags for cache key computation
 mod tag {
     pub const SRC: &[u8] = b"src:";
+    pub const RES: &[u8] = b"res:";
     pub const DEP: &[u8] = b"dep:";
     pub const MVN: &[u8] = b"mvn:";
     pub const CP: &[u8] = b"cp:";
@@ -596,6 +597,7 @@ pub fn incremental_compile(
 
     let incremental_config = super::CompileConfig {
         source_dirs: Vec::new(), // We'll pass files directly
+        resource_dirs: config.resource_dirs.clone(),
         output_dir: config.output_dir.clone(),
         classpath,
         java_version: config.java_version.clone(),
@@ -875,6 +877,35 @@ fn feed_compiler_config(hasher: &mut Sha256, config: &super::CompileConfig) {
     }
 }
 
+/// Walk resource directories and return sorted `(normalized_path, content_hash)`
+/// pairs for every non-`.java` file. Non-existent dirs are skipped; `.java`
+/// files are skipped because they are compiled rather than packaged verbatim
+/// (and are already covered by the source-file hashes).
+///
+/// Folded into the build cache key so a resource-only change yields a different
+/// key — see `compute_build_cache_key`.
+fn collect_resource_hashes(resource_dirs: &[PathBuf]) -> Result<Vec<(String, String)>> {
+    let mut hashes: Vec<(String, String)> = Vec::new();
+    for dir in resource_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(dir) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("java") {
+                continue;
+            }
+            hashes.push((crate::normalize_cache_path(path), hash_file(path)?));
+        }
+    }
+    hashes.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(hashes)
+}
+
 /// Compute a content-addressable key from all compilation inputs.
 /// Used internally by incremental_compile for single-module cache.
 fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBuf]) -> Result<String> {
@@ -889,6 +920,20 @@ fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBu
     }
     source_hashes.sort_by(|a, b| a.0.cmp(&b.0));
     for (path, hash) in &source_hashes {
+        hasher.update(path.as_bytes());
+        hasher.update(hash.as_bytes());
+    }
+
+    // Resource content hashes. Resources (src/main/resources/**, plus non-.java
+    // files under the source dir) are copied verbatim into output_dir and end
+    // up inside the packaged jar. They are not compiled, but a resource-only
+    // change MUST still invalidate this cache — otherwise try_restore_build_cache
+    // restores a stale output_dir whose resources no longer match the source,
+    // and packaging ships an outdated GraphQL schema / config file.
+    // No resources → no bytes hashed → key unchanged (resource-less modules
+    // keep their existing cache valid).
+    for (path, hash) in &collect_resource_hashes(&config.resource_dirs)? {
+        hasher.update(tag::RES);
         hasher.update(path.as_bytes());
         hasher.update(hash.as_bytes());
     }
@@ -1734,6 +1779,7 @@ mod tests {
 
         let config = super::super::CompileConfig {
             source_dirs: vec![],
+            resource_dirs: vec![],
             output_dir: output_dir.clone(),
             classpath: vec![],
             java_version: Some("17".to_string()),
@@ -1773,6 +1819,7 @@ mod tests {
 
         let config = super::super::CompileConfig {
             source_dirs: vec![],
+            resource_dirs: vec![],
             output_dir: output_dir.clone(),
             classpath: vec![],
             java_version: Some("21".to_string()),  // distinct version → distinct cache key
@@ -1801,6 +1848,113 @@ mod tests {
         assert!(cache_dir.join("Foo.class").exists(), "fresh content must be in cache");
 
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// Resource-staleness regression: a change to a packaged resource file
+    /// (src/main/resources/**) with NO .java change must produce a different
+    /// build cache key.
+    ///
+    /// Before this was fixed, compute_build_cache_key hashed only .java
+    /// sources. A resource-only edit kept the key identical, so
+    /// try_restore_build_cache restored a stale output_dir (old .class + old
+    /// resources) — the outdated resource then got packaged into the jar. The
+    /// whole compile→CI chain stayed green while shipping an artifact whose
+    /// GraphQL schema / application.yml did not match the committed source.
+    #[test]
+    fn test_build_cache_key_tracks_resource_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // src/main/java/Foo.java — the .java source, kept constant throughout.
+        let java_dir = tmp.path().join("src").join("main").join("java");
+        std::fs::create_dir_all(&java_dir).unwrap();
+        let java_file = java_dir.join("Foo.java");
+        std::fs::write(&java_file, "class Foo {}").unwrap();
+
+        // src/main/resources/schema.graphqls — the resource we will mutate.
+        let res_dir = tmp.path().join("src").join("main").join("resources");
+        std::fs::create_dir_all(&res_dir).unwrap();
+        let res_file = res_dir.join("schema.graphqls");
+        std::fs::write(&res_file, "type Query { a: String }").unwrap();
+
+        let make_config = || super::super::CompileConfig {
+            source_dirs: vec![java_dir.clone()],
+            resource_dirs: vec![java_dir.clone(), res_dir.clone()],
+            output_dir: tmp.path().join("out"),
+            classpath: vec![],
+            java_version: Some("17".to_string()),
+            encoding: None,
+            annotation_processors: vec![],
+            lint: vec![],
+            extra_args: vec![],
+        };
+        let source_files = vec![java_file.clone()];
+
+        let key_before = compute_build_cache_key(&make_config(), &source_files).unwrap();
+        // Determinism: identical inputs → identical key.
+        assert_eq!(
+            key_before,
+            compute_build_cache_key(&make_config(), &source_files).unwrap(),
+            "cache key must be deterministic for identical inputs"
+        );
+
+        // Mutate ONLY the resource file — the .java file is untouched.
+        std::fs::write(&res_file, "type Query { a: String, b: Int }").unwrap();
+        let key_after_edit = compute_build_cache_key(&make_config(), &source_files).unwrap();
+        assert_ne!(
+            key_before, key_after_edit,
+            "editing a resource file must change the build cache key"
+        );
+
+        // Adding a brand-new resource file must also change the key.
+        std::fs::write(res_dir.join("application.yml"), b"server:\n  port: 8080\n").unwrap();
+        let key_after_add = compute_build_cache_key(&make_config(), &source_files).unwrap();
+        assert_ne!(
+            key_after_edit, key_after_add,
+            "adding a resource file must change the build cache key"
+        );
+    }
+
+    /// A module with no resource files must compute the same key whether
+    /// resource_dirs is empty or points at non-existent directories — so
+    /// resource-less modules keep their existing build cache valid (and a
+    /// .java source change still drives the key, as before).
+    #[test]
+    fn test_build_cache_key_no_resources_is_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let java_dir = tmp.path().join("src").join("main").join("java");
+        std::fs::create_dir_all(&java_dir).unwrap();
+        let java_file = java_dir.join("Bar.java");
+        std::fs::write(&java_file, "class Bar {}").unwrap();
+        let source_files = vec![java_file.clone()];
+
+        let base = |resource_dirs: Vec<std::path::PathBuf>| super::super::CompileConfig {
+            source_dirs: vec![java_dir.clone()],
+            resource_dirs,
+            output_dir: tmp.path().join("out"),
+            classpath: vec![],
+            java_version: Some("17".to_string()),
+            encoding: None,
+            annotation_processors: vec![],
+            lint: vec![],
+            extra_args: vec![],
+        };
+
+        let key_empty = compute_build_cache_key(&base(vec![]), &source_files).unwrap();
+        let key_missing_dir = compute_build_cache_key(
+            &base(vec![tmp.path().join("does-not-exist")]), &source_files,
+        ).unwrap();
+        assert_eq!(
+            key_empty, key_missing_dir,
+            "empty / non-existent resource dirs must not perturb the cache key"
+        );
+
+        // A .java content change still changes the key.
+        std::fs::write(&java_file, "class Bar { int x; }").unwrap();
+        let key_java_changed = compute_build_cache_key(&base(vec![]), &source_files).unwrap();
+        assert_ne!(
+            key_empty, key_java_changed,
+            "a .java source change must still change the build cache key"
+        );
     }
 
     /// ADR-013 root-cause regression: simulate the standard-task-core 750B
