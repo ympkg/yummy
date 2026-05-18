@@ -607,9 +607,22 @@ pub fn incremental_compile(
         extra_args: config.extra_args.clone(),
     };
 
-    let result = compile_files(&incremental_config, &files_to_compile, pool)?;
-
+    // A full compile regenerates a .class for every current source file. Any
+    // .class already under output_dir that is NOT regenerated is an orphan —
+    // left behind by a since-renamed or -deleted source. The prune()-based
+    // cleanup below cannot catch these when fingerprints were cleared (module
+    // renamed → fresh fingerprint dir, or `out/` carried stale classes): prune
+    // has nothing to diff against. Left in place, orphans get snapshotted into
+    // the content-addressed build cache and — because the cache key is purely
+    // source-derived — poison every future restore of the same source. Purge
+    // stale .class up front so a full compile always yields an output dir that
+    // reflects exactly the current source set. Resources are left untouched.
     let is_full_compile = files_to_compile.len() == all_files.len();
+    if is_full_compile && has_classes {
+        purge_class_files(&config.output_dir);
+    }
+
+    let result = compile_files(&incremental_config, &files_to_compile, pool)?;
 
     if result.success {
         // Update fingerprints for compiled files
@@ -632,11 +645,13 @@ pub fn incremental_compile(
             }
         }
         let removed = fingerprints.prune(&all_files);
-        // Delete orphan .class files for deleted sources
+        // Delete orphan .class files for deleted sources — including nested and
+        // anonymous classes (Foo$Inner.class, Foo$1.class), which one .java file
+        // also produces; removing only the primary .class leaks the rest.
         for removed_src in &removed {
             let src_path = Path::new(removed_src);
             if let Some(class_file) = find_class_for_source(src_path, &config.source_dirs, &config.output_dir) {
-                let _ = std::fs::remove_file(&class_file);
+                remove_class_family(&class_file);
             }
         }
         fingerprints.save(&fp_dir)?;
@@ -693,6 +708,52 @@ fn find_class_for_source(source: &Path, source_dirs: &[PathBuf], output_dir: &Pa
         }
     }
     None
+}
+
+/// Remove every `.class` file under `dir`, recursively, leaving resources and
+/// directory structure intact. Called before a full compile so the output dir
+/// reflects exactly the current source set — see the call site in
+/// `incremental_compile` for why fingerprint-diff orphan cleanup is insufficient.
+fn purge_class_files(dir: &Path) {
+    if !dir.exists() {
+        return;
+    }
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("class") {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Remove a primary `.class` together with its nested / anonymous siblings
+/// (`Name.class` + `Name$*.class` in the same directory). A single `.java`
+/// file compiles to many class files; deleting only the primary leaves
+/// `Name$1.class`, `Name$Inner.class`, ... behind as orphans.
+fn remove_class_family(primary_class: &Path) {
+    let _ = std::fs::remove_file(primary_class);
+    let parent = match primary_class.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let stem = match primary_class.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let nested_prefix = format!("{}$", stem);
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("class") {
+                continue;
+            }
+            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                if name.starts_with(&nested_prefix) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
 }
 
 /// Validate a .class file by checking size + 0xCAFEBABE magic header.
@@ -911,6 +972,9 @@ fn collect_resource_hashes(resource_dirs: &[PathBuf]) -> Result<Vec<(String, Str
 fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBuf]) -> Result<String> {
     let mut hasher = Sha256::new();
 
+    // Cache-format version — see compute_module_cache_key for the v2 rationale.
+    hasher.update(b"v2:");
+
     // Source content hashes (sorted for determinism)
     let mut source_hashes: Vec<(String, String)> = Vec::new();
     for f in source_files {
@@ -993,7 +1057,13 @@ fn try_restore_build_cache(
         return Ok(None);
     }
 
-    // Cache hit — restore .class files
+    // Cache hit — restore .class files. Clear output_dir first so the restore
+    // replaces rather than merges: a leftover .class / resource from a prior
+    // build of since-renamed source must not survive into the restored output
+    // (mirrors try_restore_module_cache, which already clears before restoring).
+    if config.output_dir.exists() {
+        let _ = std::fs::remove_dir_all(&config.output_dir);
+    }
     std::fs::create_dir_all(&config.output_dir)?;
     copy_dir_recursive(&cache_dir, &config.output_dir)?;
 
@@ -1337,7 +1407,12 @@ pub struct ModuleCacheInput<'a> {
 pub fn compute_module_cache_key(input: &ModuleCacheInput) -> String {
     let mut hasher = Sha256::new();
 
-    hasher.update(b"v1:");
+    // Cache-format version. Bumped v1 → v2 to abandon every entry written by
+    // pre-fix ym — those can contain orphan .class files from a since-renamed
+    // package. The cache key is purely source-derived, so a corrected rebuild
+    // of the same source hashes to the same key; without a version bump it
+    // would keep restoring the poisoned pre-fix entry.
+    hasher.update(b"v2:");
 
     // All input slices are pre-sorted by caller (see ModuleCacheInput doc)
     for (path, hash) in input.source_hashes {
@@ -1590,6 +1665,45 @@ mod tests {
         data.extend_from_slice(&[0x00, 0x00]);
 
         data
+    }
+
+    #[test]
+    fn test_purge_class_files_removes_class_keeps_resources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path();
+        let pkg = out.join("com/example");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("Foo.class"), build_test_class(&[0xB1])).unwrap();
+        std::fs::write(pkg.join("Foo$1.class"), build_test_class(&[0xB1])).unwrap();
+        // Resources are copied into output_dir before compilation — must survive.
+        std::fs::write(pkg.join("schema.graphqls"), "type Query").unwrap();
+        std::fs::write(out.join("application.properties"), "k=v").unwrap();
+
+        purge_class_files(out);
+
+        assert!(!pkg.join("Foo.class").exists(), "primary .class must be purged");
+        assert!(!pkg.join("Foo$1.class").exists(), "nested .class must be purged");
+        assert!(pkg.join("schema.graphqls").exists(), "resource must survive purge");
+        assert!(out.join("application.properties").exists(), "resource must survive purge");
+    }
+
+    #[test]
+    fn test_remove_class_family_removes_nested_and_anonymous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let primary = dir.join("Service.class");
+        std::fs::write(&primary, build_test_class(&[0xB1])).unwrap();
+        std::fs::write(dir.join("Service$Inner.class"), build_test_class(&[0xB1])).unwrap();
+        std::fs::write(dir.join("Service$1.class"), build_test_class(&[0xB1])).unwrap();
+        // A different top-level class sharing a name prefix must NOT be removed.
+        std::fs::write(dir.join("ServiceHelper.class"), build_test_class(&[0xB1])).unwrap();
+
+        remove_class_family(&primary);
+
+        assert!(!primary.exists(), "primary .class removed");
+        assert!(!dir.join("Service$Inner.class").exists(), "nested .class removed");
+        assert!(!dir.join("Service$1.class").exists(), "anonymous .class removed");
+        assert!(dir.join("ServiceHelper.class").exists(), "unrelated sibling kept");
     }
 
     #[test]
