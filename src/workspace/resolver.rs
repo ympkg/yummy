@@ -489,7 +489,7 @@ fn resolve_inner(
     // caller would otherwise download on miss). `resolve_no_download`
     // callers (e.g. `ym idea --json`) skip validation for zero-network use.
     if resolutions.is_empty() {
-        if let Some(jars) = try_resolve_from_lock(dependencies, cache_dir, lock, &exclusion_set, resolutions, registries, download) {
+        if let Some(jars) = try_resolve_from_lock(dependencies, cache_dir, lock, &exclusion_set, resolutions, registries, download)? {
             return Ok(jars);
         }
     } else {
@@ -500,7 +500,7 @@ fn resolve_inner(
                 resolved_deps.insert(k.clone(), v.clone());
             }
         }
-        if let Some(jars) = try_resolve_from_lock(&resolved_deps, cache_dir, lock, &exclusion_set, resolutions, registries, download) {
+        if let Some(jars) = try_resolve_from_lock(&resolved_deps, cache_dir, lock, &exclusion_set, resolutions, registries, download)? {
             return Ok(jars);
         }
     }
@@ -1012,12 +1012,13 @@ fn resolve_snapshot_version(
 
 /// Try to resolve all dependencies from lock file without (usually) hitting
 /// the network. When `validate_sha1` is true, non-whitelist registries are
-/// probed with `.jar.sha1` to catch republished artifacts; the fast path
-/// falls back to re-resolve on a real mismatch and degrades to cache-only
-/// on network errors. The source registry for each dep is computed from
-/// `registries` via the same scope-routing rules used during the original
-/// download — no per-dep registry information is stored in the lock.
-/// Returns None if any dep is missing from lock or cache.
+/// probed with `.jar.sha1` to catch republished artifacts (ADR-017): on a
+/// real mismatch the stale derivatives are purged and the caller re-resolves
+/// cache-cold, except under `--frozen-lockfile` where it fails loud instead.
+/// Network errors degrade to cache-only. The source registry for each dep is
+/// computed from `registries` via the same scope-routing rules used during
+/// the original download — no per-dep registry information is stored in lock.
+/// Returns `Ok(None)` if any dep is missing from lock or cache.
 fn try_resolve_from_lock(
     dependencies: &BTreeMap<String, String>,
     cache_dir: &Path,
@@ -1026,15 +1027,15 @@ fn try_resolve_from_lock(
     resolutions: &BTreeMap<String, String>,
     registries: &[RegistryEntry],
     validate_sha1: bool,
-) -> Option<Vec<PathBuf>> {
+) -> Result<Option<Vec<PathBuf>>> {
     if lock.dependencies.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // If any dependency is a SNAPSHOT, skip fast path (need to check for updates)
     for version in dependencies.values() {
         if version.ends_with("-SNAPSHOT") {
-            return None;
+            return Ok(None);
         }
     }
 
@@ -1045,7 +1046,10 @@ fn try_resolve_from_lock(
     let mut queue = VecDeque::new();
 
     for (coord, version) in dependencies {
-        let mc = MavenCoord::parse(coord, version).ok()?;
+        let mc = match MavenCoord::parse(coord, version) {
+            Ok(mc) => mc,
+            Err(_) => return Ok(None),
+        };
         queue.push_back(mc);
     }
 
@@ -1065,11 +1069,14 @@ fn try_resolve_from_lock(
         let jar_path = coord.jar_path(cache_dir);
         let pom_only = is_pom_only_cached(&jar_path);
         if !jar_path.exists() && !pom_only {
-            return None; // Cache miss
+            return Ok(None); // Cache miss
         }
 
         // Check lock file entry exists
-        let locked = lock.dependencies.get(&key)?;
+        let locked = match lock.dependencies.get(&key) {
+            Some(locked) => locked,
+            None => return Ok(None),
+        };
 
         if !pom_only {
             // Track highest version per GA
@@ -1097,14 +1104,14 @@ fn try_resolve_from_lock(
     }
 
     // Remote sha1 validation: catch republished artifacts on mutable
-    // registries. The source registry for each dep is recomputed from
-    // `registries` via scope routing — the same logic that picked it at
-    // download time. Whitelist (Maven Central) entries skip validation.
+    // registries (private registries routinely violate Maven's immutable-
+    // release convention). The source registry for each dep is recomputed
+    // from `registries` via scope routing — the same logic that picked it
+    // at download time. Whitelist (Maven Central) entries skip validation.
     //
     // `ga_winners` only contains non-pom-only coords (see the `if !pom_only`
-    // guard upstream in this function), so pom-only artifacts are not
-    // validated here. Their POM staleness is a known minor gap — pom-only
-    // artifacts are rare and rarely republished.
+    // guard upstream), so pom-only artifacts are not validated here — a
+    // known minor gap; pom-only artifacts are rare and rarely republished.
     if validate_sha1 {
         let validation_targets: Vec<ValidationTarget> = ga_winners
             .values()
@@ -1121,17 +1128,41 @@ fn try_resolve_from_lock(
             })
             .collect();
 
-        if !validate_sha1_remote(&validation_targets, cache_dir) {
-            // Real mismatch — surface a one-line hint so users understand
-            // why the slow path is kicking in, then let the caller fall
-            // through to re-resolve/re-download.
+        // A non-empty result means one or more cached artifacts no longer
+        // match the registry — the release version was republished (ADR-017).
+        let republished = validate_sha1_remote(&validation_targets, cache_dir);
+        if !republished.is_empty() {
+            if crate::commands::build::is_frozen_lockfile() {
+                // ADR-017 fix ③: frozen mode must not silently re-resolve a
+                // stale lock. Fail loud and point at the fix.
+                let mut msg = String::from(
+                    "ym-lock.json is out of date — upstream release(s) were republished:",
+                );
+                for coord in &republished {
+                    msg.push_str(&format!("\n  ✗ {}", coord.versioned_key()));
+                }
+                msg.push_str(
+                    "\n\n  A release version was overwritten on a mutable registry, so the\n  \
+                     locked dependency graph no longer matches reality.\n  \
+                     Run `ym install` to re-resolve, then commit the updated ym-lock.json.",
+                );
+                bail!("{}", msg);
+            }
+            // ADR-017 fix ②: purge every republished artifact's cached
+            // derivatives (raw `.pom` / `.jar` / parsed pom-cache json) so the
+            // slow path re-resolves them cache-cold instead of reading the
+            // stale `.pom` straight back. The transitive closure is rebuilt
+            // by the slow path's full BFS.
+            for coord in &republished {
+                purge_artifact_cache(coord, cache_dir);
+            }
             if !crate::is_progress_quiet() {
                 eprintln!(
                     "{} dependency cache out of date (sha1 mismatch), re-resolving",
                     console::style(format!("{:>12}", "info")).cyan().bold()
                 );
             }
-            return None;
+            return Ok(None);
         }
     }
 
@@ -1146,7 +1177,7 @@ fn try_resolve_from_lock(
     }
 
     append_native_jars(&mut all_jars);
-    Some(all_jars)
+    Ok(Some(all_jars))
 }
 
 /// In-memory cache for parsed POM transitive dependencies.
@@ -1189,6 +1220,31 @@ impl PomCache {
     }
 }
 
+/// On-disk POM cache entry (`~/.ym/pom-cache/{g}/{a}/{v}.json`).
+/// `pom_sha256` binds the parsed dependency list to the exact raw `.pom` it
+/// was derived from. A republished release (same GAV, new `.pom`) makes the
+/// hashes diverge, so the stale entry is rejected instead of silently
+/// feeding an outdated dependency graph into the build (ADR-017).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PomCacheEntry {
+    pom_sha256: String,
+    resolved: Vec<(String, String, String, Vec<String>)>,
+}
+
+/// Remove every cached derivative of one artifact-version — raw `.pom`,
+/// `.jar`, and the parsed pom-cache entry. Called when a republished release
+/// is detected (ADR-017 fix ②) so the slow path re-resolves it cache-cold
+/// rather than reading the stale `.pom` straight back.
+fn purge_artifact_cache(coord: &MavenCoord, cache_dir: &Path) {
+    let _ = std::fs::remove_file(coord.jar_path(cache_dir));
+    let _ = std::fs::remove_file(coord.pom_path(cache_dir));
+    let pom_cache_file = crate::config::pom_cache_dir()
+        .join(&coord.group_id)
+        .join(&coord.artifact_id)
+        .join(format!("{}.json", coord.version));
+    let _ = std::fs::remove_file(pom_cache_file);
+}
+
 fn resolve_transitive_cached(
     client: &reqwest::blocking::Client,
     coord: &MavenCoord,
@@ -1212,11 +1268,25 @@ fn resolve_transitive_cached(
         .join(&coord.artifact_id)
         .join(format!("{}.json", coord.version));
 
+    let pom_path = coord.pom_path(cache_dir);
+
+    // On-disk POM cache is content-addressed (ADR-017): the entry records the
+    // sha256 of the raw `.pom` it was parsed from and is trusted only while
+    // the local `.pom` still hashes to that value. A republished release
+    // (same GAV, new `.pom`) therefore cannot be served stale, and old-format
+    // entries (bare arrays) fail to parse as `PomCacheEntry` and regenerate.
     if pom_cache_file.exists() {
         if let Ok(content) = std::fs::read_to_string(&pom_cache_file) {
-            // Try new format with exclusions first, then fallback to old format
-            if let Ok(cached_deps) = serde_json::from_str::<Vec<(String, String, String, Vec<String>)>>(&content) {
-                let deps: Vec<MavenCoord> = cached_deps
+            let fresh = serde_json::from_str::<PomCacheEntry>(&content)
+                .ok()
+                .filter(|entry| {
+                    compute_sha256_file(&pom_path)
+                        .map(|local| local == entry.pom_sha256)
+                        .unwrap_or(false)
+                });
+            if let Some(entry) = fresh {
+                let deps: Vec<MavenCoord> = entry
+                    .resolved
                     .iter()
                     .map(|(g, a, v, excl)| MavenCoord {
                         group_id: g.clone(),
@@ -1232,14 +1302,10 @@ fn resolve_transitive_cached(
                 }
                 return Ok(deps);
             }
-            // Fallback: old format without exclusions — delete stale cache so it gets regenerated
-            if serde_json::from_str::<Vec<(String, String, String)>>(&content).is_ok() {
-                let _ = std::fs::remove_file(&pom_cache_file);
-            }
+            // Stale (sha mismatch / `.pom` missing) or old format — drop it.
+            let _ = std::fs::remove_file(&pom_cache_file);
         }
     }
-
-    let pom_path = coord.pom_path(cache_dir);
 
     // For SNAPSHOT, always re-download POM (may have changed)
     if !pom_path.exists() || coord.is_snapshot() {
@@ -1266,15 +1332,21 @@ fn resolve_transitive_cached(
 
     let deps = parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, registries)?;
 
-    // Write to disk cache (with exclusions)
+    // Write content-addressed disk cache (ADR-017): bind the parsed result to
+    // the sha256 of the `.pom` it came from so a later republish invalidates it.
     if let Some(parent) = pom_cache_file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let serializable: Vec<(String, String, String, Vec<String>)> = deps
-        .iter()
-        .map(|d| (d.group_id.clone(), d.artifact_id.clone(), d.version.clone(), d.exclusions.clone()))
-        .collect();
-    let _ = std::fs::write(&pom_cache_file, serde_json::to_string(&serializable).unwrap_or_default());
+    if let Ok(pom_sha256) = compute_sha256_file(&pom_path) {
+        let entry = PomCacheEntry {
+            pom_sha256,
+            resolved: deps
+                .iter()
+                .map(|d| (d.group_id.clone(), d.artifact_id.clone(), d.version.clone(), d.exclusions.clone()))
+                .collect(),
+        };
+        let _ = std::fs::write(&pom_cache_file, serde_json::to_string(&entry).unwrap_or_default());
+    }
 
     // Store in memory cache
     if let Some(cache) = pom_cache {
@@ -1807,6 +1879,25 @@ fn compute_sha1_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Compute the SHA-256 hex digest of a file in streaming fashion.
+/// Used to content-address the on-disk POM cache (ADR-017).
+fn compute_sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// Fetch a `.sha1` sidecar file from a Maven registry.
 /// Returns `Ok(Some(hash))` on success, `Ok(None)` for 404 (no sidecar),
 /// `Err(_)` for network / protocol failures.
@@ -1926,16 +2017,15 @@ fn check_target(
 /// Validate locally cached JARs and POMs against registry-provided
 /// `.sha1` files.
 ///
-/// Returns `true` when the fast path can safely proceed (all hashes match
-/// or we hit network errors — offline graceful degradation). Returns
-/// `false` only when a real mismatch is detected, so the slow path must
-/// re-resolve.
-fn validate_sha1_remote(targets: &[ValidationTarget], cache_dir: &Path) -> bool {
+/// Returns the coordinates whose cached content no longer matches the
+/// registry — i.e. release versions that were republished (ADR-017). An
+/// empty result means the fast path can safely proceed: either everything
+/// matched, or the registry was unreachable (offline graceful degradation).
+fn validate_sha1_remote(targets: &[ValidationTarget], cache_dir: &Path) -> Vec<MavenCoord> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     if targets.is_empty() {
-        return true;
+        return Vec::new();
     }
 
     let client = sha1_validation_client();
@@ -1959,41 +2049,37 @@ fn validate_sha1_remote(targets: &[ValidationTarget], cache_dir: &Path) -> bool 
             .and_then(|(_, c)| c.as_ref())
     };
 
-    // Parallel fold with an `AtomicBool` short-circuit. Once any task
-    // observes a mismatch, subsequent tasks bail out immediately instead of
-    // paying the HTTP round-trip. We use a per-thread `(mismatches,
-    // network_errors)` accumulator and `reduce` the tree, avoiding the
-    // intermediate `Vec<Sha1CheckResult>` allocation entirely.
-    let abort = AtomicBool::new(false);
-    let (mismatches, network_errors) = pool.install(|| {
+    // Every target is checked (no early abort): the caller must purge each
+    // republished artifact (ADR-017 fix ②), and missing one would leave a
+    // torn cache. Each thread accumulates `(mismatched_coords, net_errors)`.
+    let (mismatched, network_errors) = pool.install(|| {
         targets
             .par_iter()
             .fold(
-                || (0usize, 0usize),
-                |(m, n), t| {
-                    if abort.load(Ordering::Relaxed) {
-                        return (m, n);
-                    }
+                || (Vec::<MavenCoord>::new(), 0usize),
+                |(mut m, n), t| {
                     let creds = lookup_creds(&t.registry_url);
-                    let r = check_target(t, cache_dir, client, creds);
-                    if matches!(r, Sha1CheckResult::Mismatch) {
-                        abort.store(true, Ordering::Relaxed);
-                    }
-                    match r {
+                    match check_target(t, cache_dir, client, creds) {
                         Sha1CheckResult::Match => (m, n),
-                        Sha1CheckResult::Mismatch => (m + 1, n),
+                        Sha1CheckResult::Mismatch => {
+                            m.push(t.coord.clone());
+                            (m, n)
+                        }
                         Sha1CheckResult::NetworkError => (m, n + 1),
                     }
                 },
             )
             .reduce(
-                || (0usize, 0usize),
-                |(m1, n1), (m2, n2)| (m1 + m2, n1 + n2),
+                || (Vec::new(), 0usize),
+                |(mut m1, n1), (m2, n2)| {
+                    m1.extend(m2);
+                    (m1, n1 + n2)
+                },
             )
     });
 
-    if mismatches > 0 {
-        return false;
+    if !mismatched.is_empty() {
+        return mismatched;
     }
 
     if network_errors > 0 && !crate::is_progress_quiet() {
@@ -2013,7 +2099,7 @@ fn validate_sha1_remote(targets: &[ValidationTarget], cache_dir: &Path) -> bool 
         }
     }
 
-    true
+    Vec::new()
 }
 
 /// Download a file and return its SHA-256 hash.
@@ -2951,8 +3037,62 @@ mod tests {
         let deps = BTreeMap::new();
         let lock = Lockfile::default();
         let result = try_resolve_from_lock(&deps, Path::new("/tmp/cache"), &lock, &HashSet::new(), &BTreeMap::new(), &[], false);
-        // Empty lock returns None
-        assert!(result.is_none());
+        // Empty lock returns Ok(None)
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_compute_sha256_file() {
+        let dir = std::env::temp_dir().join(format!("ym_sha256_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        assert_eq!(
+            compute_sha256_file(&f).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_pom_cache_entry_roundtrip() {
+        // ADR-017: content-addressed pom-cache format round-trips.
+        let entry = PomCacheEntry {
+            pom_sha256: "abc123".to_string(),
+            resolved: vec![("g".into(), "a".into(), "1.0".into(), vec!["x:y".into()])],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: PomCacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pom_sha256, "abc123");
+        assert_eq!(back.resolved.len(), 1);
+        // Old bare-array format must NOT parse as PomCacheEntry — forces a
+        // one-time regeneration instead of being trusted blind.
+        let old = r#"[["g","a","1.0",[]]]"#;
+        assert!(serde_json::from_str::<PomCacheEntry>(old).is_err());
+    }
+
+    #[test]
+    fn test_validate_sha1_remote_empty() {
+        // No targets → nothing to validate → empty result (fast path proceeds).
+        assert!(validate_sha1_remote(&[], Path::new("/tmp/cache")).is_empty());
+    }
+
+    #[test]
+    fn test_purge_artifact_cache() {
+        // ADR-017 fix ②: a republished artifact's jar + pom are removed so the
+        // slow path re-resolves it cache-cold.
+        let dir = std::env::temp_dir().join(format!("ym_purge_test_{}", std::process::id()));
+        let coord = MavenCoord::parse("com.example:purge-lib", "9.9.9").unwrap();
+        let jar = coord.jar_path(&dir);
+        let pom = coord.pom_path(&dir);
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        std::fs::write(&jar, b"jar").unwrap();
+        std::fs::write(&pom, b"pom").unwrap();
+        assert!(jar.exists() && pom.exists());
+        purge_artifact_cache(&coord, &dir);
+        assert!(!jar.exists(), "jar should be purged");
+        assert!(!pom.exists(), "pom should be purged");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- POM Cache tests ---
