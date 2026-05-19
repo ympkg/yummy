@@ -2780,11 +2780,16 @@ pub fn compile_project(
 
     let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
     let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
-    resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
-
-    if resources_dir.exists() {
-        resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
-    }
+    // Sync (copy + prune orphans) resources into output_dir so a resource since
+    // deleted/renamed in src cannot linger and be packaged into the jar.
+    let fp_dir = incremental::fingerprint_dir_for(&cache, &out);
+    resources::sync_resources(
+        &compile_cfg.resource_dirs,
+        &out,
+        &fp_dir,
+        custom_res_ext.map(|v| v.as_slice()),
+        res_exclude.map(|v| v.as_slice()),
+    )?;
 
     incremental::incremental_compile(&compile_cfg, &cache, None)
 }
@@ -2837,11 +2842,16 @@ pub fn compile_project_with_pool(
 
     let custom_res_ext = cfg.compiler.as_ref().and_then(|c| c.resource_extensions.as_ref());
     let res_exclude = cfg.compiler.as_ref().and_then(|c| c.resource_exclude.as_ref());
-    resources::copy_resources_with_extensions(&src, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
-
-    if resources_dir.exists() {
-        resources::copy_resources_with_extensions(&resources_dir, &out, custom_res_ext.map(|v| v.as_slice()), res_exclude.map(|v| v.as_slice()))?;
-    }
+    // Sync (copy + prune orphans) resources into output_dir so a resource since
+    // deleted/renamed in src cannot linger and be packaged into the jar.
+    let fp_dir = incremental::fingerprint_dir_for(&cache, &out);
+    resources::sync_resources(
+        &compile_cfg.resource_dirs,
+        &out,
+        &fp_dir,
+        custom_res_ext.map(|v| v.as_slice()),
+        res_exclude.map(|v| v.as_slice()),
+    )?;
 
     incremental::incremental_compile(&compile_cfg, &cache, pool)
 }

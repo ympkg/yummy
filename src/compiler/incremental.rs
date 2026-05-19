@@ -789,7 +789,7 @@ fn is_cache_dir_valid(dir: &Path) -> bool {
 
 /// Derive a per-module fingerprint directory from the output dir path.
 /// This ensures workspace modules have independent fingerprint files.
-fn fingerprint_dir_for(cache_dir: &Path, output_dir: &Path) -> PathBuf {
+pub fn fingerprint_dir_for(cache_dir: &Path, output_dir: &Path) -> PathBuf {
     let hash = hash_bytes(crate::normalize_cache_path(output_dir).as_bytes());
     cache_dir.join("fingerprints").join(&hash[..16])
 }
@@ -972,8 +972,8 @@ fn collect_resource_hashes(resource_dirs: &[PathBuf]) -> Result<Vec<(String, Str
 fn compute_build_cache_key(config: &super::CompileConfig, source_files: &[PathBuf]) -> Result<String> {
     let mut hasher = Sha256::new();
 
-    // Cache-format version — see compute_module_cache_key for the v2 rationale.
-    hasher.update(b"v2:");
+    // Cache-format version — see compute_module_cache_key for the rationale.
+    hasher.update(b"v3:");
 
     // Source content hashes (sorted for determinism)
     let mut source_hashes: Vec<(String, String)> = Vec::new();
@@ -1407,12 +1407,14 @@ pub struct ModuleCacheInput<'a> {
 pub fn compute_module_cache_key(input: &ModuleCacheInput) -> String {
     let mut hasher = Sha256::new();
 
-    // Cache-format version. Bumped v1 → v2 to abandon every entry written by
-    // pre-fix ym — those can contain orphan .class files from a since-renamed
-    // package. The cache key is purely source-derived, so a corrected rebuild
-    // of the same source hashes to the same key; without a version bump it
-    // would keep restoring the poisoned pre-fix entry.
-    hasher.update(b"v2:");
+    // Cache-format version. Bumped v1 → v2 to abandon entries with orphan
+    // .class files from a since-renamed package; v2 → v3 to abandon entries
+    // that snapshotted orphan *resource* files (resource copying was additive
+    // until resources::sync_resources started pruning). The cache key is
+    // source-derived, so a corrected rebuild of the same source hashes to the
+    // same key; without a version bump it would keep restoring the poisoned
+    // pre-fix entry.
+    hasher.update(b"v3:");
 
     // All input slices are pre-sorted by caller (see ModuleCacheInput doc)
     for (path, hash) in input.source_hashes {
