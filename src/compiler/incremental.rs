@@ -507,6 +507,24 @@ pub fn incremental_compile(
         }
     }
 
+    // A source deleted or renamed since the last build leaves its compiled
+    // .class (plus nested / anonymous siblings) orphaned in output_dir. The
+    // manifest fast-path above already bailed when the source set changed, so
+    // reaching here means we must reconcile output_dir with the current source
+    // set. Prune orphans UP FRONT — before the up-to-date early return below —
+    // so every downstream path yields an output dir matching exactly the
+    // current sources. Previously this ran only after a successful compile, so
+    // a pure deletion (changed.is_empty(), nothing to recompile) returned
+    // UpToDate with the orphan still on disk; packaging then shipped it (the
+    // standard-task-core / entity-relation rename incidents).
+    prune_orphan_classes(
+        &mut fingerprints,
+        &all_files,
+        &config.source_dirs,
+        &config.output_dir,
+        &fp_dir,
+    )?;
+
     // ADR-013: detect "have we compiled before" by looking for .class files
     // specifically, NOT by `dir is non-empty`. The build pipeline copies
     // resources (graphqls, properties, ...) into output_dir BEFORE invoking
@@ -644,16 +662,9 @@ pub fn incremental_compile(
                 }
             }
         }
-        let removed = fingerprints.prune(&all_files);
-        // Delete orphan .class files for deleted sources — including nested and
-        // anonymous classes (Foo$Inner.class, Foo$1.class), which one .java file
-        // also produces; removing only the primary .class leaks the rest.
-        for removed_src in &removed {
-            let src_path = Path::new(removed_src);
-            if let Some(class_file) = find_class_for_source(src_path, &config.source_dirs, &config.output_dir) {
-                remove_class_family(&class_file);
-            }
-        }
+        // Orphan .class pruning for deleted/renamed sources already ran up front
+        // (prune_orphan_classes, before the has_classes check) so it also covers
+        // the up-to-date early-return path. Nothing left to prune here.
         fingerprints.save(&fp_dir)?;
 
         // Save to build cache after successful full compilation
@@ -708,6 +719,41 @@ fn find_class_for_source(source: &Path, source_dirs: &[PathBuf], output_dir: &Pa
         }
     }
     None
+}
+
+/// Prune `.class` families left behind by sources deleted or renamed since the
+/// last build: every fingerprint entry whose source is no longer in `all_files`
+/// is dropped, and its compiled `.class` (with nested / anonymous siblings) is
+/// removed from `output_dir`. Persists the trimmed fingerprints when anything
+/// was removed; a no-op (no orphans) touches no files.
+///
+/// Must run on EVERY incremental_compile path, not only after a recompile: a
+/// pure deletion leaves `changed` empty and takes the up-to-date early return,
+/// where post-compile cleanup never ran. Reaching that path also guarantees the
+/// fingerprints are intact (every current source has a matching entry), so this
+/// diff-based prune always has the deleted entry to act on — the "no prior
+/// fingerprint to diff against" gap only afflicts the full-compile path, which
+/// `purge_class_files` covers separately by clearing all `.class` outright.
+fn prune_orphan_classes(
+    fingerprints: &mut Fingerprints,
+    all_files: &[PathBuf],
+    source_dirs: &[PathBuf],
+    output_dir: &Path,
+    fp_dir: &Path,
+) -> Result<()> {
+    let removed = fingerprints.prune(all_files);
+    if removed.is_empty() {
+        return Ok(());
+    }
+    for removed_src in &removed {
+        if let Some(class_file) =
+            find_class_for_source(Path::new(removed_src), source_dirs, output_dir)
+        {
+            remove_class_family(&class_file);
+        }
+    }
+    fingerprints.save(fp_dir)?;
+    Ok(())
 }
 
 /// Remove every `.class` file under `dir`, recursively, leaving resources and
@@ -1706,6 +1752,72 @@ mod tests {
         assert!(!dir.join("Service$Inner.class").exists(), "nested .class removed");
         assert!(!dir.join("Service$1.class").exists(), "anonymous .class removed");
         assert!(dir.join("ServiceHelper.class").exists(), "unrelated sibling kept");
+    }
+
+    /// Regression for the orphan-`.class` leak on the up-to-date path.
+    ///
+    /// When a source is deleted/renamed and NO surviving source changed,
+    /// `incremental_compile` takes the up-to-date early return (changed empty,
+    /// nothing missing) — javac is never invoked. Orphan-`.class` cleanup used
+    /// to run only AFTER a real compile, so the deleted source's `.class` (plus
+    /// its nested / anonymous siblings) stayed in `output_dir` and got packaged
+    /// into the jar (the standard-task-core / entity-relation rename incidents).
+    /// Pruning now runs up front on every path, so the orphan is gone even
+    /// though this path compiles nothing.
+    #[test]
+    fn test_incremental_compile_prunes_orphan_class_when_source_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let src_dir = tmp.path().join("src");
+        let output_dir = tmp.path().join("out");
+        let pkg = output_dir.join("com/example");
+        std::fs::create_dir_all(src_dir.join("com/example")).unwrap();
+        std::fs::create_dir_all(&pkg).unwrap();
+
+        // Surviving source A + its compiled class.
+        let a_java = src_dir.join("com/example/A.java");
+        std::fs::write(&a_java, "package com.example; class A {}").unwrap();
+        std::fs::write(pkg.join("A.class"), build_test_class(&[0xB1])).unwrap();
+
+        // B was deleted from src after the last build, but its class family
+        // (primary + nested) still sits in output_dir as an orphan.
+        let b_java = src_dir.join("com/example/B.java");
+        std::fs::write(pkg.join("B.class"), build_test_class(&[0xB1])).unwrap();
+        std::fs::write(pkg.join("B$Inner.class"), build_test_class(&[0xB1])).unwrap();
+
+        let config = super::super::CompileConfig {
+            source_dirs: vec![src_dir.clone()],
+            resource_dirs: vec![],
+            output_dir: output_dir.clone(),
+            classpath: vec![],
+            java_version: Some("21".to_string()),
+            encoding: None,
+            annotation_processors: vec![],
+            lint: vec![],
+            extra_args: vec![],
+        };
+
+        // Seed fingerprints + manifest as the prior build (A + B) left them:
+        // A matches the on-disk source (so `changed` stays empty), B is stale.
+        let fp_dir = fingerprint_dir_for(&cache, &output_dir);
+        let mut fp = Fingerprints::default();
+        let a_hash = hash_file(&a_java).unwrap();
+        let a_mtime = std::fs::metadata(&a_java).unwrap().modified().unwrap()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        fp.update_source(&a_java, &a_hash, a_mtime);
+        fp.update_source(&b_java, "stale-b-hash", 1);
+        fp.save(&fp_dir).unwrap();
+        BuildManifest::write(&fp_dir, &output_dir, &[a_java.clone(), b_java.clone()]).unwrap();
+
+        let result = incremental_compile(&config, &cache, None).unwrap();
+
+        // No surviving source changed → up-to-date, javac never invoked.
+        assert!(result.success);
+        assert_eq!(result.outcome, super::super::CompileOutcome::UpToDate);
+        // Live class kept; orphan family (incl. nested) pruned.
+        assert!(pkg.join("A.class").exists(), "live class must survive");
+        assert!(!pkg.join("B.class").exists(), "orphan primary .class must be pruned");
+        assert!(!pkg.join("B$Inner.class").exists(), "orphan nested .class must be pruned");
     }
 
     #[test]
