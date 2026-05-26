@@ -107,7 +107,7 @@ pub struct RegistryEntry {
 }
 
 /// A parsed Maven coordinate
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MavenCoord {
     pub group_id: String,
     pub artifact_id: String,
@@ -4427,5 +4427,170 @@ mod tests {
             "concurrent NamedTempFile::new_in paths collided — race fix broken: {:?}",
             paths
         );
+    }
+
+    // L1 integration (ADR-024) — 8 concurrent download_file calls on same URL+path must converge on a single valid POM without leaving `.part.*` orphans.
+    #[test]
+    fn download_file_concurrent_same_path_no_corruption() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pom_body: &[u8] = br#"<?xml version="1.0"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>race</artifactId>
+  <version>1.0</version>
+</project>"#;
+
+        let mut server = mockito::Server::new();
+        let mock = server.mock("GET", "/com/example/race/1.0/race-1.0.pom")
+            .with_status(200)
+            .with_header("content-type", "application/xml")
+            .with_body(pom_body)
+            .expect_at_least(1)
+            .create();
+
+        let dir = std::env::temp_dir().join(format!("ym_dl_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("race-1.0.pom");
+        let url = format!("{}/com/example/race/1.0/race-1.0.pom", server.url());
+
+        let client = Arc::new(reqwest::blocking::Client::new());
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let client = client.clone();
+            let url = url.clone();
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                download_file(&client, &url, &path, None, None)
+            }));
+        }
+        let mut errors = vec![];
+        for h in handles {
+            if let Err(e) = h.join().unwrap() {
+                errors.push(e.to_string());
+            }
+        }
+
+        let final_body = std::fs::read(&path).ok();
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p != &path)
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        mock.assert();
+
+        assert!(errors.is_empty(), "no concurrent download must error, got: {:?}", errors);
+        assert_eq!(final_body.as_deref(), Some(pom_body), "final POM must equal the source — race must not corrupt content");
+        assert!(leftovers.is_empty(), "no `.part.*` orphans after races, found: {:?}", leftovers);
+    }
+
+    // L4 integration (ADR-024) — when a server advertises Content-Length but truncates the body, download_file must NOT persist the partial .pom. Uses a raw TcpListener because mockito's hyper backend refuses to ship a mismatched response (asserts server-side). hyper *client* will error first, but the contract under test is "no partial .pom lands in cache" — that contract is what defends us against future protocol-violating proxies.
+    #[test]
+    fn download_file_does_not_persist_pom_when_server_truncates() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_thread = thread::spawn(move || {
+            // Serve up to 3 attempts so download_file's retry loop can drain.
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/xml\r\n\r\n<short/>";
+                let _ = stream.write_all(response);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("ym_dl_truncate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trunc.pom");
+        let url = format!("http://127.0.0.1:{}/trunc.pom", port);
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = download_file(&client, &url, &path, None, None);
+
+        let pom_exists = path.exists();
+        let part_orphans: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p != &path)
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = server_thread.join();
+
+        assert!(result.is_err(), "download must fail when server advertises Content-Length 100 but ships 8 bytes");
+        assert!(!pom_exists, "no .pom must land in cache when length mismatches — got persisted file");
+        assert!(part_orphans.is_empty(), "no tempfile orphans must leak, found: {:?}", part_orphans);
+    }
+
+    // L3 integration (ADR-024) — resolve_transitive_cached must detect a pre-existing corrupt POM in cache, unlink it, refetch via the registry, and return valid deps.
+    #[test]
+    fn resolve_transitive_cached_recovers_from_corrupt_cache() {
+        let pom_body: &[u8] = br#"<?xml version="1.0"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>self-heal</artifactId>
+  <version>1.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>downstream</artifactId>
+      <version>2.0</version>
+    </dependency>
+  </dependencies>
+</project>"#;
+
+        let mut server = mockito::Server::new();
+        let mock = server.mock("GET", "/com/example/self-heal/1.0/self-heal-1.0.pom")
+            .with_status(200)
+            .with_body(pom_body)
+            .expect_at_least(1)
+            .create();
+
+        let cache_dir = std::env::temp_dir().join(format!("ym_l3_self_heal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Plant a corrupt POM exactly where resolve_transitive_cached will look.
+        let coord = MavenCoord::parse("com.example:self-heal", "1.0").unwrap();
+        let pom_path = coord.pom_path(&cache_dir);
+        std::fs::create_dir_all(pom_path.parent().unwrap()).unwrap();
+        std::fs::write(&pom_path, b"<truncated").unwrap();
+        let corrupt_size = std::fs::metadata(&pom_path).unwrap().len();
+        assert_eq!(corrupt_size, "<truncated".len() as u64, "test fixture must be a corrupt POM");
+
+        let registries = vec![RegistryEntry {
+            url: server.url(),
+            scope: None,
+            username: None,
+            password: None,
+        }];
+        let client = reqwest::blocking::Client::new();
+
+        let deps = resolve_transitive_cached(&client, &coord, &cache_dir, &registries, None)
+            .expect("must self-heal corrupt cache and resolve deps");
+
+        let final_body = std::fs::read(&pom_path).unwrap();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        mock.assert();
+        assert_eq!(final_body, pom_body, "corrupt POM in cache must be replaced by registry body");
+        assert_eq!(deps.len(), 1, "must return the single transitive dep, got: {:?}", deps);
+        assert_eq!(deps[0].artifact_id, "downstream");
+        assert_eq!(deps[0].version, "2.0");
     }
 }
