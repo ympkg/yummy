@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
+use tempfile::NamedTempFile;
 
 use crate::config::schema::{Lockfile, ResolvedDependency};
 
@@ -1412,6 +1413,11 @@ fn resolve_transitive_cached(
         }
     }
 
+    // L3 (ADR-024): completeness > existence — a stale corrupt POM from a previous race / pre-ADR-023 install must not satisfy the .exists() check below.
+    if !coord.is_snapshot() {
+        invalidate_corrupt_pom(&pom_path);
+    }
+
     // For SNAPSHOT, always re-download POM (may have changed)
     if !pom_path.exists() || coord.is_snapshot() {
         let pom_result = if coord.is_snapshot() {
@@ -1568,6 +1574,7 @@ fn resolve_parent_properties(
                     scope: None,
                 };
                 let parent_pom_path = parent_coord.pom_path(cache_dir);
+                invalidate_corrupt_pom(&parent_pom_path); // L3 (ADR-024)
                 if !parent_pom_path.exists() {
                     let _ = download_from_repos(client, &parent_coord, &parent_pom_path, registries, None, |c, r| c.pom_url(r));
                 }
@@ -1793,6 +1800,7 @@ fn collect_parent_dependencies(
                 scope: None,
             };
             let parent_pom_path = parent_coord.pom_path(cache_dir);
+            invalidate_corrupt_pom(&parent_pom_path); // L3 (ADR-024)
             if !parent_pom_path.exists() {
                 let _ = download_from_repos(
                     client,
@@ -2446,6 +2454,19 @@ fn verify_pom_body(body: &[u8]) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// L3 (ADR-024): unlink any cached POM that fails integrity check so the caller's subsequent `.exists()` check triggers a refetch ("完整性 > 存在性").
+fn invalidate_corrupt_pom(pom_path: &Path) {
+    if !pom_path.exists() {
+        return;
+    }
+    let valid = std::fs::read(pom_path)
+        .map(|b| verify_pom_body(&b).is_ok())
+        .unwrap_or(false);
+    if !valid {
+        let _ = std::fs::remove_file(pom_path);
+    }
+}
+
 fn download_file(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -2484,13 +2505,25 @@ fn download_file(
                     if let Some(cb) = &progress {
                         cb(content_len, 0); // register total size
                     }
-                    // Stream to file to handle large JARs (100MB+)
-                    let tmp_path = path.with_extension("part");
-                    let stream_result = (|| -> Result<(String, u64)> {
+                    // L1 (ADR-024): NamedTempFile gives a per-call unique path + RAII unlink — two BFS workers fetching the same GAV can no longer truncate each other's in-flight bytes via a shared `.part`.
+                    let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+                    let mut tmp_file = match NamedTempFile::new_in(parent_dir) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            last_outcome = Some(AttemptOutcome {
+                                http_status: Some(status),
+                                body_bytes: None,
+                                category: format!("tempfile create failed: {}", e),
+                            });
+                            continue;
+                        }
+                    };
+
+                    let stream_result: Result<(String, u64)> = (|| {
                         use sha2::{Digest, Sha256};
-                        use std::io::Read;
+                        use std::io::{Read, Write};
                         let mut reader = response;
-                        let mut file = std::fs::File::create(&tmp_path)?;
+                        let file = tmp_file.as_file_mut();
                         let mut hasher = Sha256::new();
                         let mut buf = [0u8; 65536];
                         let mut bytes_written: u64 = 0;
@@ -2498,31 +2531,39 @@ fn download_file(
                             let n = reader.read(&mut buf)?;
                             if n == 0 { break; }
                             hasher.update(&buf[..n]);
-                            std::io::Write::write_all(&mut file, &buf[..n])?;
+                            file.write_all(&buf[..n])?;
                             bytes_written += n as u64;
                             if let Some(cb) = &progress {
                                 cb(0, n as u64);
                             }
                         }
-                        drop(file);
+                        // L4 (ADR-024): CDN-truncated HTTP 200 — cross-check stream length so we retry instead of caching a parseable-but-incomplete POM.
+                        if content_len > 0 && bytes_written != content_len {
+                            anyhow::bail!(
+                                "Content-Length advertised {} bytes but read {} bytes (truncated mid-stream)",
+                                content_len, bytes_written
+                            );
+                        }
+                        // L6 (ADR-024): fsync before persist so a host crash never leaves a zero-page .pom that downstream reads as "no root node".
+                        file.sync_all()?;
                         Ok((format!("{:x}", hasher.finalize()), bytes_written))
                     })();
                     match stream_result {
                         Ok((hash, bytes_written)) => {
-                            // ADR-023: parse-before-write for raw POM. HTTP 200 +
-                            // streamed body is not enough — CDN edges occasionally
-                            // return truncated XML with HTTP 200. Validate the body
-                            // parses as <project> before rename; otherwise count
-                            // this attempt as a failure and retry.
+                            // ADR-023: parse-before-persist for raw POM. HTTP
+                            // 200 + streamed body is not enough — also see L4
+                            // above for length-based truncation detection.
                             if is_pom {
-                                match std::fs::read(&tmp_path) {
+                                match std::fs::read(tmp_file.path()) {
                                     Ok(body) => match verify_pom_body(&body) {
                                         Ok(()) => {
-                                            std::fs::rename(&tmp_path, path)?;
+                                            tmp_file.persist(path).map_err(|e| {
+                                                anyhow::anyhow!("persist tempfile to {}: {}", path.display(), e.error)
+                                            })?;
                                             return Ok(hash);
                                         }
                                         Err(reason) => {
-                                            let _ = std::fs::remove_file(&tmp_path);
+                                            // tmp_file drop unlinks the bad tempfile
                                             last_outcome = Some(AttemptOutcome {
                                                 http_status: Some(status),
                                                 body_bytes: Some(bytes_written),
@@ -2532,7 +2573,6 @@ fn download_file(
                                         }
                                     },
                                     Err(e) => {
-                                        let _ = std::fs::remove_file(&tmp_path);
                                         last_outcome = Some(AttemptOutcome {
                                             http_status: Some(status),
                                             body_bytes: Some(bytes_written),
@@ -2543,11 +2583,13 @@ fn download_file(
                                 }
                             }
                             // Non-POM (e.g. jar): trust the stream.
-                            std::fs::rename(&tmp_path, path)?;
+                            tmp_file.persist(path).map_err(|e| {
+                                anyhow::anyhow!("persist tempfile to {}: {}", path.display(), e.error)
+                            })?;
                             return Ok(hash);
                         }
                         Err(e) => {
-                            let _ = std::fs::remove_file(&tmp_path);
+                            // tmp_file drop unlinks the partial tempfile
                             last_outcome = Some(AttemptOutcome {
                                 http_status: Some(status),
                                 body_bytes: None,
@@ -4294,6 +4336,96 @@ mod tests {
             alt.contains("the document does not have a root node"),
             "leaf cause missing: {}",
             alt
+        );
+    }
+
+    // L3 (ADR-024) — stale corrupt cache files must not satisfy a downstream `.exists()` hit ("完整性 > 存在性").
+    #[test]
+    fn invalidate_corrupt_pom_unlinks_empty_file() {
+        let dir = std::env::temp_dir().join(format!("ym_inv_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pom = dir.join("a.pom");
+        std::fs::write(&pom, b"").unwrap();
+        invalidate_corrupt_pom(&pom);
+        let removed = !pom.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(removed, "empty POM must be unlinked");
+    }
+
+    #[test]
+    fn invalidate_corrupt_pom_unlinks_truncated_xml() {
+        let dir = std::env::temp_dir().join(format!("ym_inv_trunc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pom = dir.join("a.pom");
+        std::fs::write(&pom, b"<?xml version=\"1.0\"?>\n<project>incomplete").unwrap();
+        invalidate_corrupt_pom(&pom);
+        let removed = !pom.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(removed, "truncated POM must be unlinked");
+    }
+
+    #[test]
+    fn invalidate_corrupt_pom_keeps_valid_pom() {
+        let dir = std::env::temp_dir().join(format!("ym_inv_valid_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pom = dir.join("a.pom");
+        let body = br#"<?xml version="1.0"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>x</groupId>
+  <artifactId>y</artifactId>
+  <version>1.0</version>
+</project>"#;
+        std::fs::write(&pom, body).unwrap();
+        invalidate_corrupt_pom(&pom);
+        let kept = pom.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(kept, "valid POM must not be unlinked");
+    }
+
+    #[test]
+    fn invalidate_corrupt_pom_handles_missing_file_gracefully() {
+        let dir = std::env::temp_dir().join(format!("ym_inv_miss_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pom = dir.join("nonexistent.pom");
+        invalidate_corrupt_pom(&pom); // must not panic
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // L1 (ADR-024) — legacy fixed `.part` tempfile let two BFS workers truncate each other's in-flight bytes; NamedTempFile::new_in must hand out a unique path per call.
+    #[test]
+    fn namedtempfile_new_in_returns_unique_paths_under_concurrency() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = std::env::temp_dir().join(format!("ym_tmpf_unique_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let paths: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let dir = dir.clone();
+            let paths = paths.clone();
+            handles.push(thread::spawn(move || {
+                // Hold the tempfile alive across the join barrier so its
+                // path stays allocated (mirrors what download_file does
+                // between create and persist).
+                let t = NamedTempFile::new_in(&dir).expect("NamedTempFile::new_in");
+                paths.lock().unwrap().push(t.path().to_path_buf());
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(t);
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+
+        let paths = paths.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let unique: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(
+            unique.len(), paths.len(),
+            "concurrent NamedTempFile::new_in paths collided — race fix broken: {:?}",
+            paths
         );
     }
 }
