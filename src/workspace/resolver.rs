@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use console::style;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -523,6 +523,12 @@ fn resolve_inner(
     // Maps groupId:artifactId -> highest version seen so far. Used to skip
     // BFS exploration of versions that can never win.
     let mut resolved_versions: HashMap<String, String> = HashMap::new();
+    // ADR-022: GAs that came from `ym.json` direct dependencies. Their version
+    // is what the user explicitly declared (possibly via scope alias, `${var}`
+    // interpolation, or `{ workspace = true }` inheritance) and must NEVER be
+    // changed by an imported BOM `constraint`. `resolutions` still wins (it's
+    // the user actively forcing an override, like Gradle `enforcedPlatform`).
+    let mut explicit_deps: HashSet<String> = HashSet::new();
     // Track BFS depth per queued item (used for diagnostics, not for arbitration)
     let mut depth_map: HashMap<String, usize> = HashMap::new();
 
@@ -548,7 +554,10 @@ fn resolve_inner(
         mc.scope = Some(direct_scope.clone());
         scope_map.insert(mc.versioned_key(), direct_scope);
         depth_map.insert(mc.versioned_key(), 0);
-        resolved_versions.insert(ga_key, mc.version.clone());
+        resolved_versions.insert(ga_key.clone(), mc.version.clone());
+        // ADR-022: mark this GA as explicit so BOM constraint application
+        // below leaves its version alone.
+        explicit_deps.insert(ga_key);
         queue.push_back(mc);
     }
 
@@ -671,15 +680,24 @@ fn resolve_inner(
             for mut dep in transitive {
                 let ga_key = format!("{}:{}", dep.group_id, dep.artifact_id);
 
-                // Apply resolutions: forced override (like enforcedPlatform)
+                // Apply resolutions: forced override (like enforcedPlatform).
+                // Resolutions win even over explicit deps — they are the user
+                // actively forcing an override.
                 if let Some(forced_version) = resolutions.get(&ga_key) {
                     dep.version = forced_version.clone();
                 }
-                // Apply constraints: "at least this version" (like platform())
-                // Only upgrade, never downgrade. Higher transitive version wins.
-                else if let Some(constraint_version) = constraints.get(&ga_key) {
-                    if version_compare(&dep.version, constraint_version) < 0 {
-                        dep.version = constraint_version.clone();
+                // ADR-022: Apply BOM constraints ONLY to non-explicit GAs.
+                // A GA the user declared directly in `ym.json` keeps its
+                // explicit version — BOM constraint is a hint for transitive
+                // resolution, not authority over the user's pin.
+                else if !explicit_deps.contains(&ga_key) {
+                    if let Some(constraint_version) = constraints.get(&ga_key) {
+                        // "at least this version" (like Gradle platform()).
+                        // Only upgrade, never downgrade. Higher transitive
+                        // version wins over BOM-managed version.
+                        if version_compare(&dep.version, constraint_version) < 0 {
+                            dep.version = constraint_version.clone();
+                        }
                     }
                 }
                 let dep_vk = dep.versioned_key();
@@ -718,25 +736,53 @@ fn resolve_inner(
         }
     }
 
-    // ADR-021: BFS finished — if any POM fetch/parse failed inside any worker,
-    // report all of them in a single error and abort before download phase.
-    // Aggregating beats one-at-a-time-on-retry because a CI runner with flaky
-    // network typically loses several adjacent deps; users want the full list.
+    // ADR-021 + ADR-022: BFS finished — partition POM fetch/parse failures
+    // into "fatal" and "stale-noise" buckets, then fail-loud only on the fatal
+    // bucket. A failure whose `coord.version` is strictly lower than the GA's
+    // current winner in `resolved_versions` cannot enter the final classpath
+    // (latest-wins arbitration already chose a higher version), so its POM
+    // failure is noise that would mask real errors and block the build for
+    // no reason. Print those as warnings instead.
     {
         let failures = pom_failures.lock().unwrap();
         if !failures.is_empty() {
-            let mut msg = String::from("\n  ✗ Dependency resolution failed — POM fetch/parse errors:\n\n");
-            for (coord, reason) in failures.iter() {
-                msg.push_str(&format!(
-                    "    - {}:{}:{}\n        reason: {}\n",
-                    coord.group_id, coord.artifact_id, coord.version, reason
-                ));
+            let mut fatal: Vec<&(MavenCoord, String)> = Vec::new();
+            let mut stale: Vec<&(MavenCoord, String)> = Vec::new();
+            for entry in failures.iter() {
+                let (coord, _reason) = entry;
+                let ga_key = format!("{}:{}", coord.group_id, coord.artifact_id);
+                match resolved_versions.get(&ga_key) {
+                    Some(winner) if version_compare(winner, &coord.version) > 0 => {
+                        stale.push(entry);
+                    }
+                    _ => fatal.push(entry),
+                }
             }
-            msg.push_str("\n  Possible causes:\n");
-            msg.push_str("    - registry temporarily unreachable (retry; check network and credentials)\n");
-            msg.push_str("    - artifact does not exist at that version (typo in ym.json?)\n");
-            msg.push_str("    - cache corruption (run `ym cache clean -y` to retry from scratch)\n");
-            return Err(anyhow::anyhow!(msg));
+            for (coord, reason) in &stale {
+                let ga_key = format!("{}:{}", coord.group_id, coord.artifact_id);
+                let winner = resolved_versions.get(&ga_key).map(|s| s.as_str()).unwrap_or("?");
+                eprintln!(
+                    "{} stale POM fetch failed (superseded by {}): {}:{}:{} — {}",
+                    style(format!("{:>12}", "warning")).yellow().bold(),
+                    winner,
+                    coord.group_id, coord.artifact_id, coord.version,
+                    reason
+                );
+            }
+            if !fatal.is_empty() {
+                let mut msg = String::from("\n  ✗ Dependency resolution failed — POM fetch/parse errors:\n\n");
+                for (coord, reason) in &fatal {
+                    msg.push_str(&format!(
+                        "    - {}:{}:{}\n        reason: {}\n",
+                        coord.group_id, coord.artifact_id, coord.version, reason
+                    ));
+                }
+                msg.push_str("\n  Possible causes:\n");
+                msg.push_str("    - registry temporarily unreachable (retry; check network and credentials)\n");
+                msg.push_str("    - artifact does not exist at that version (typo in ym.json?)\n");
+                msg.push_str("    - cache corruption (run `ym cache clean -y` to retry from scratch)\n");
+                return Err(anyhow::anyhow!(msg));
+            }
         }
     }
 
@@ -1392,14 +1438,25 @@ fn resolve_transitive_cached(
         }
     }
 
-    let pom_content = std::fs::read_to_string(&pom_path)?;
+    let pom_content = std::fs::read_to_string(&pom_path)
+        .with_context(|| format!("read raw POM at {}", pom_path.display()))?;
+
+    // ADR-023: every parse error from helpers below carries an inner context
+    // (e.g. "parse POM body in …"); we tack on the GAV + path at this outer
+    // layer so the BFS driver sees a self-contained error in `pom_failures`.
+    let outer_ctx = || format!(
+        "resolve transitive for {}:{}:{} (POM at {})",
+        coord.group_id, coord.artifact_id, coord.version, pom_path.display()
+    );
 
     // Collect parent POM properties (unlimited depth with cycle detection)
     let mut all_properties = HashMap::new();
     let mut visited_poms = HashSet::new();
-    resolve_parent_properties(client, &pom_content, cache_dir, registries, &mut all_properties, 0, &mut visited_poms)?;
+    resolve_parent_properties(client, &pom_content, cache_dir, registries, &mut all_properties, 0, &mut visited_poms)
+        .with_context(outer_ctx)?;
 
-    let mut deps = parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, registries)?;
+    let mut deps = parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, registries)
+        .with_context(outer_ctx)?;
 
     // ADR-021: Merge parent POM `<dependencies>` blocks into the child's
     // transitive set (Maven inheritance). Without this, projects whose deps
@@ -1421,7 +1478,7 @@ fn resolve_transitive_cached(
         &all_properties,
         0,
         &mut visited_parent_deps,
-    )?;
+    ).with_context(outer_ctx)?;
     let mut existing_ga: HashSet<String> = deps
         .iter()
         .map(|d| format!("{}:{}", d.group_id, d.artifact_id))
@@ -1473,7 +1530,12 @@ fn resolve_parent_properties(
         return Ok(());
     }
 
-    let doc = roxmltree::Document::parse(pom_content)?;
+    // ADR-023: parse errors must carry context — roxmltree's `NoRootNode`
+    // displays as "the document does not have a root node" with no path or
+    // GAV. The outer wrapping at the entry point (e.g. `resolve_transitive_cached`)
+    // adds the GAV; this layer adds which POM body we were trying to parse.
+    let doc = roxmltree::Document::parse(pom_content)
+        .with_context(|| "parse POM body in resolve_parent_properties (current POM)")?;
 
     // Find parent reference
     for node in doc.root_element().children() {
@@ -1513,7 +1575,8 @@ fn resolve_parent_properties(
                     // Recurse into grandparent first (so child overrides parent)
                     resolve_parent_properties(client, &parent_content, cache_dir, registries, properties, depth + 1, visited_poms)?;
                     // Then merge parent properties
-                    let parent_doc = roxmltree::Document::parse(&parent_content)?;
+                    let parent_doc = roxmltree::Document::parse(&parent_content)
+                        .with_context(|| format!("parse parent POM at {}", parent_pom_path.display()))?;
                     let parent_props = collect_pom_properties(&parent_doc);
                     for (k, v) in parent_props {
                         properties.entry(k).or_insert(v);
@@ -1549,7 +1612,8 @@ fn parse_pom_dependencies_with_props(
     cache_dir: &Path,
     registries: &[RegistryEntry],
 ) -> Result<Vec<MavenCoord>> {
-    let doc = roxmltree::Document::parse(pom)?;
+    let doc = roxmltree::Document::parse(pom)
+        .with_context(|| "parse POM body in parse_pom_dependencies_with_props")?;
 
     // Merge local properties with inherited
     let mut properties = extra_properties.clone();
@@ -1692,7 +1756,8 @@ fn collect_parent_dependencies(
     if depth > 20 {
         return Ok(vec![]);
     }
-    let doc = roxmltree::Document::parse(pom_content)?;
+    let doc = roxmltree::Document::parse(pom_content)
+        .with_context(|| "parse POM body in collect_parent_dependencies")?;
     let mut deps: Vec<MavenCoord> = Vec::new();
     let mut seen_ga: HashSet<String> = HashSet::new();
 
@@ -2062,7 +2127,16 @@ fn download_from_repos(
     url_fn: impl Fn(&MavenCoord, &str) -> String,
 ) -> Result<String> {
     let repos = repos_for_group_id(registries, &coord.group_id);
-    let mut last_err = None;
+    if repos.is_empty() {
+        bail!(
+            "download failed for {}:{}:{}: no repositories configured",
+            coord.group_id, coord.artifact_id, coord.version
+        );
+    }
+    // ADR-023: accumulate per-repo failures so the terminal error names the
+    // GAV and the inner download_file message (URL / status / bytes /
+    // category / hint) for every repo attempted, not just the last one.
+    let mut repo_errors: Vec<String> = Vec::new();
     for repo in &repos {
         let url = url_fn(coord, &repo.url);
         let creds = match (&repo.username, &repo.password) {
@@ -2071,10 +2145,20 @@ fn download_from_repos(
         };
         match download_file(client, &url, path, progress, creds) {
             Ok(hash) => return Ok(hash),
-            Err(e) => last_err = Some(e),
+            Err(e) => repo_errors.push(e.to_string()),
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No repositories configured")))
+    let mut msg = format!(
+        "download failed for {}:{}:{} across {} repositor{}",
+        coord.group_id, coord.artifact_id, coord.version,
+        repo_errors.len(),
+        if repo_errors.len() == 1 { "y" } else { "ies" }
+    );
+    for (i, e) in repo_errors.iter().enumerate() {
+        let indented = e.replace('\n', "\n    ");
+        msg.push_str(&format!("\n  repo #{}: {}", i + 1, indented));
+    }
+    Err(anyhow::anyhow!(msg))
 }
 
 /// A dep queued for sha1 validation.
@@ -2328,6 +2412,39 @@ fn validate_sha1_remote(targets: &[ValidationTarget], cache_dir: &Path) -> Vec<M
 /// Retries up to 3 times with exponential backoff (1s → 2s → 4s).
 /// `progress`: optional callback — first call `(content_length, 0)` to register size,
 /// then `(0, chunk_bytes)` for each chunk read.
+/// Outcome of one download attempt, used to build a self-contained failure
+/// message after all retries are exhausted (ADR-023: error must contain
+/// URL / HTTP status / body bytes / category / hint).
+struct AttemptOutcome {
+    http_status: Option<u16>,
+    body_bytes: Option<u64>,
+    category: String,
+}
+
+/// Validate that a downloaded POM body parses as a Maven POM. Returns the
+/// error category string on failure (ADR-023). HTTP 200 + non-empty body is
+/// not sufficient: CDN edge nodes occasionally return truncated bodies with
+/// HTTP 200, and `roxmltree` reports those as `NoRootNode` deep in the BFS
+/// without any context. Catch them at write time instead.
+fn verify_pom_body(body: &[u8]) -> std::result::Result<(), String> {
+    if body.is_empty() {
+        return Err("empty body".to_string());
+    }
+    let text = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(e) => return Err(format!("invalid UTF-8 in POM body: {}", e)),
+    };
+    let doc = match roxmltree::Document::parse(text) {
+        Ok(d) => d,
+        Err(e) => return Err(format!("parse error: {}", e)),
+    };
+    let root_name = doc.root_element().tag_name().name();
+    if root_name != "project" {
+        return Err(format!("unexpected root element <{}> (expected <project>)", root_name));
+    }
+    Ok(())
+}
+
 fn download_file(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -2336,7 +2453,9 @@ fn download_file(
     inline_creds: Option<(&str, &str)>,
 ) -> Result<String> {
     let max_retries = 3;
-    let mut last_err = None;
+    // ADR-023: track per-attempt outcome so the terminal error is self-contained.
+    let mut last_outcome: Option<AttemptOutcome> = None;
+    let is_pom = path.extension().and_then(|s| s.to_str()) == Some("pom");
 
     for attempt in 0..max_retries {
         if attempt > 0 {
@@ -2356,6 +2475,7 @@ fn download_file(
         match request.send() {
             Ok(response) => {
                 if response.status().is_success() {
+                    let status = response.status().as_u16();
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -2365,46 +2485,118 @@ fn download_file(
                     }
                     // Stream to file to handle large JARs (100MB+)
                     let tmp_path = path.with_extension("part");
-                    match (|| -> Result<String> {
+                    let stream_result = (|| -> Result<(String, u64)> {
                         use sha2::{Digest, Sha256};
                         use std::io::Read;
                         let mut reader = response;
                         let mut file = std::fs::File::create(&tmp_path)?;
                         let mut hasher = Sha256::new();
                         let mut buf = [0u8; 65536];
+                        let mut bytes_written: u64 = 0;
                         loop {
                             let n = reader.read(&mut buf)?;
                             if n == 0 { break; }
                             hasher.update(&buf[..n]);
                             std::io::Write::write_all(&mut file, &buf[..n])?;
+                            bytes_written += n as u64;
                             if let Some(cb) = &progress {
                                 cb(0, n as u64);
                             }
                         }
                         drop(file);
-                        std::fs::rename(&tmp_path, path)?;
-                        Ok(format!("{:x}", hasher.finalize()))
-                    })() {
-                        Ok(hash) => return Ok(hash),
+                        Ok((format!("{:x}", hasher.finalize()), bytes_written))
+                    })();
+                    match stream_result {
+                        Ok((hash, bytes_written)) => {
+                            // ADR-023: parse-before-write for raw POM. HTTP 200 +
+                            // streamed body is not enough — CDN edges occasionally
+                            // return truncated XML with HTTP 200. Validate the body
+                            // parses as <project> before rename; otherwise count
+                            // this attempt as a failure and retry.
+                            if is_pom {
+                                match std::fs::read(&tmp_path) {
+                                    Ok(body) => match verify_pom_body(&body) {
+                                        Ok(()) => {
+                                            std::fs::rename(&tmp_path, path)?;
+                                            return Ok(hash);
+                                        }
+                                        Err(reason) => {
+                                            let _ = std::fs::remove_file(&tmp_path);
+                                            last_outcome = Some(AttemptOutcome {
+                                                http_status: Some(status),
+                                                body_bytes: Some(bytes_written),
+                                                category: format!("truncated body ({})", reason),
+                                            });
+                                            continue; // retry
+                                        }
+                                    },
+                                    Err(e) => {
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        last_outcome = Some(AttemptOutcome {
+                                            http_status: Some(status),
+                                            body_bytes: Some(bytes_written),
+                                            category: format!("read tmp failed: {}", e),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Non-POM (e.g. jar): trust the stream.
+                            std::fs::rename(&tmp_path, path)?;
+                            return Ok(hash);
+                        }
                         Err(e) => {
                             let _ = std::fs::remove_file(&tmp_path);
-                            last_err = Some(anyhow::anyhow!("Download stream failed for {}: {}", url, e));
+                            last_outcome = Some(AttemptOutcome {
+                                http_status: Some(status),
+                                body_bytes: None,
+                                category: format!("download stream failed: {}", e),
+                            });
                         }
                     }
                 } else if response.status().as_u16() == 404 {
                     // 404 means artifact doesn't exist in this repo, no retry
                     bail!("HTTP 404 for {}", url);
                 } else {
-                    last_err = Some(anyhow::anyhow!("HTTP {} for {}", response.status(), url));
+                    last_outcome = Some(AttemptOutcome {
+                        http_status: Some(response.status().as_u16()),
+                        body_bytes: None,
+                        category: format!("HTTP {}", response.status()),
+                    });
                 }
             }
             Err(e) => {
-                last_err = Some(anyhow::anyhow!("Request failed for {}: {}", url, e));
+                last_outcome = Some(AttemptOutcome {
+                    http_status: None,
+                    body_bytes: None,
+                    category: format!("request failed: {}", e),
+                });
             }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Download failed for {}", url)))
+    // ADR-023: build a self-contained error message containing URL, last
+    // attempt HTTP status, body bytes, retry count, category, and a hint.
+    let outcome = last_outcome.unwrap_or(AttemptOutcome {
+        http_status: None,
+        body_bytes: None,
+        category: "unknown failure".to_string(),
+    });
+    let status_str = outcome.http_status.map(|s| format!("HTTP {}", s)).unwrap_or_else(|| "no response".to_string());
+    let bytes_str = outcome.body_bytes.map(|b| format!("{} bytes", b)).unwrap_or_else(|| "n/a".to_string());
+    let hint = if outcome.category.starts_with("truncated body") {
+        "\n    hint: registry may be returning incomplete responses (CDN edge node? proxy?)"
+    } else if outcome.http_status.map(|s| s >= 500).unwrap_or(false) {
+        "\n    hint: registry returned 5xx — temporary outage, retry later"
+    } else if outcome.category.starts_with("request failed") {
+        "\n    hint: network/DNS issue or registry unreachable; check credentials and connectivity"
+    } else {
+        ""
+    };
+    Err(anyhow::anyhow!(
+        "download failed after {} retries\n    URL: {}\n    last attempt: {}, {}\n    failure category: {}{}",
+        max_retries, url, status_str, bytes_str, outcome.category, hint
+    ))
 }
 
 /// Counter for GPG verification failures (to avoid spamming warnings).
@@ -3913,5 +4105,161 @@ mod tests {
             &client, pom, Path::new("/tmp"), &[], &props, 0, &mut visited,
         ).unwrap();
         assert!(deps.is_empty(), "no parent → no inherited deps");
+    }
+
+    // --- ADR-023: raw POM body verification ---
+
+    #[test]
+    fn test_verify_pom_body_rejects_empty() {
+        // Empty body = unmistakable truncation. Must fail before write.
+        let err = verify_pom_body(b"").unwrap_err();
+        assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_verify_pom_body_rejects_non_xml() {
+        // Body that is not XML at all (CDN returned an HTML error page, etc.).
+        assert!(verify_pom_body(b"not xml at all").is_err());
+    }
+
+    #[test]
+    fn test_verify_pom_body_rejects_wrong_root_element() {
+        // XML parses but root is not <project> — likely an error page or
+        // unrelated XML proxied through.
+        let body = br#"<?xml version="1.0"?><html><body>oops</body></html>"#;
+        let err = verify_pom_body(body).unwrap_err();
+        assert!(err.contains("unexpected root"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_verify_pom_body_accepts_valid_project_root() {
+        let body = br#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>lib</artifactId>
+    <version>1.0</version>
+</project>"#;
+        verify_pom_body(body).expect("valid POM body must pass");
+    }
+
+    // --- ADR-022: explicit dep is shielded from BOM constraint ---
+
+    #[test]
+    fn test_resolve_inner_explicit_dep_unchanged_by_constraint() {
+        // ADR-022 main invariant: a GA declared directly in ym.json keeps
+        // its declared version, even when an imported BOM constraint would
+        // upgrade it. This is the user-pin-wins contract.
+        let cache_dir = std::env::temp_dir()
+            .join(format!("ym_adr022_explicit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let explicit_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>explicit-dep</artifactId>
+    <version>1.0</version>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "explicit-dep", "1.0", explicit_pom);
+
+        let mut deps = BTreeMap::new();
+        deps.insert("com.example:explicit-dep".to_string(), "1.0".to_string());
+
+        // BOM tries to upgrade explicit dep to 5.0 — must be IGNORED.
+        let mut constraints = BTreeMap::new();
+        constraints.insert("com.example:explicit-dep".to_string(), "5.0".to_string());
+
+        let mut lock = Lockfile::default();
+        let result = resolve_inner(
+            &deps,
+            &cache_dir,
+            &mut lock,
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &constraints,
+            &HashMap::new(),
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        result.expect("resolve_inner should succeed");
+
+        let keys: Vec<String> = lock.dependencies.keys().cloned().collect();
+        assert!(
+            keys.contains(&"com.example:explicit-dep:1.0".to_string()),
+            "explicit pin must keep version 1.0; got {:?}", keys
+        );
+        assert!(
+            !keys.contains(&"com.example:explicit-dep:5.0".to_string()),
+            "BOM constraint 5.0 must NOT override explicit 1.0; got {:?}", keys
+        );
+    }
+
+    #[test]
+    fn test_resolve_inner_transitive_dep_upgraded_by_constraint() {
+        // ADR-022 regression test: BOM constraint still works on non-explicit
+        // (transitive) GAs. Locks down that the explicit-guard didn't break
+        // the existing platform()-style upgrade behavior for transitive deps.
+        let cache_dir = std::env::temp_dir()
+            .join(format!("ym_adr022_trans_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Direct dep: host:1.0 brings nested:2.0 transitively.
+        let host_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>host</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>nested</artifactId>
+            <version>2.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "host", "1.0", host_pom);
+
+        // BOM upgrades nested → 5.0. Since nested is NOT explicit, the upgrade
+        // must take effect.
+        let nested_5_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.lib</groupId>
+    <artifactId>nested</artifactId>
+    <version>5.0</version>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.lib", "nested", "5.0", nested_5_pom);
+
+        let mut deps = BTreeMap::new();
+        deps.insert("com.example:host".to_string(), "1.0".to_string());
+
+        let mut constraints = BTreeMap::new();
+        constraints.insert("com.lib:nested".to_string(), "5.0".to_string());
+
+        let mut lock = Lockfile::default();
+        let result = resolve_inner(
+            &deps,
+            &cache_dir,
+            &mut lock,
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &constraints,
+            &HashMap::new(),
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        result.expect("resolve_inner should succeed");
+
+        let keys: Vec<String> = lock.dependencies.keys().cloned().collect();
+        assert!(
+            keys.contains(&"com.lib:nested:5.0".to_string()),
+            "BOM constraint must upgrade non-explicit transitive; got {:?}", keys
+        );
+        assert!(
+            !keys.contains(&"com.lib:nested:2.0".to_string()),
+            "transitive version 2.0 must not win after BOM upgrade; got {:?}", keys
+        );
     }
 }
