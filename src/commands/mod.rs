@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod idea;
 pub mod info;
 pub mod init;
+pub mod install;
 pub mod login;
 pub mod migrate;
 pub mod prepare;

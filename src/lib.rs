@@ -180,6 +180,8 @@ enum YmCommands {
         /// Dependency coordinate (groupId:artifactId or artifactId)
         dep: String,
     },
+    /// Install dependencies: resolve workspace deps and sync ym-lock.json (no compilation)
+    Install,
     /// Upgrade dependencies to latest versions
     Upgrade {
         /// Interactively select which dependencies to upgrade
@@ -561,6 +563,7 @@ fn ym_main() -> Result<()> {
             commands::add::execute(&dep, scope.as_deref(), classifier.as_deref())
         }
         YmCommands::Remove { dep } => commands::remove::execute(&dep),
+        YmCommands::Install => commands::install::execute(),
         YmCommands::Upgrade { interactive, yes, json, dry_run } => {
             commands::upgrade::execute(interactive, yes, json, dry_run)
         }

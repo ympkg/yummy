@@ -78,8 +78,20 @@ pub fn load_lockfile(project: &Path) -> Result<Lockfile> {
 
 /// Load lockfile, invalidating dependencies if config has changed.
 /// Returns empty deps + new hash when ym.json's dependency-relevant fields changed.
+///
+/// When `project` is a workspace child, the lockfile is owned by the workspace
+/// root and indexed by the root cfg's fingerprint (which sums every module's
+/// deps). A child cfg only knows its own slice, so its fingerprint is always
+/// different — comparing them would falsely invalidate the lockfile on every
+/// per-module resolve. We therefore skip the freshness check for workspace
+/// children and trust the on-disk lockfile; the workspace root build path is
+/// the sole writer of `config_hash`. See ADR-016 and the partnered guard in
+/// [`save_lockfile`].
 pub fn load_lockfile_checked(project: &Path, cfg: &YmConfig) -> Result<Lockfile> {
     let mut lock = load_lockfile(project)?;
+    if is_workspace_child(project) {
+        return Ok(lock);
+    }
     let current_hash = cfg.dependency_fingerprint();
     if lock.config_hash != current_hash {
         lock.dependencies.clear();
@@ -88,10 +100,30 @@ pub fn load_lockfile_checked(project: &Path, cfg: &YmConfig) -> Result<Lockfile>
     Ok(lock)
 }
 
+/// True when `project` lives under a workspace root that is a different
+/// directory. Single projects and the workspace root itself return false.
+fn is_workspace_child(project: &Path) -> bool {
+    match find_workspace_root(project) {
+        Some(ws_root) => ws_root != project,
+        None => false,
+    }
+}
+
 /// Save lockfile to project root (workspace root) as ym-lock.json.
 /// Stamps `ymc_version` and `generated_at` on every write.
 /// Atomic via tmp+rename. Skips writing if content unchanged (preserves mtime).
+///
+/// **Workspace-child guard**: if `project` is a workspace child, this is a
+/// no-op. The lockfile is workspace-root-scoped — its `config_hash` is the
+/// root cfg's fingerprint and its `dependencies` is the union of every
+/// module's resolution. A per-child resolve only knows its own slice and
+/// would otherwise corrupt both fields (last-writer-wins). Callers that need
+/// to refresh the lockfile must run from the workspace root (e.g. `ym install`
+/// or `ymc build` with no module target). See ADR-016.
 pub fn save_lockfile(project: &Path, lock: &Lockfile) -> Result<()> {
+    if is_workspace_child(project) {
+        return Ok(());
+    }
     let mut lock = lock.clone();
     lock.ymc_version = env!("CARGO_PKG_VERSION").to_string();
     lock.generated_at = chrono::Utc::now().to_rfc3339();
@@ -232,5 +264,102 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schema::ResolvedDependency;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    fn write_workspace(root: &Path) {
+        fs::write(
+            root.join(CONFIG_FILE),
+            r#"{"name":"root","groupId":"com.example","workspaces":["child"],"dependencies":{"@google/guava":"33.4.0"},"scopeMapping":{"@google/guava":"com.google.guava:guava"}}"#,
+        ).unwrap();
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            child.join(CONFIG_FILE),
+            r#"{"name":"child","groupId":"com.example","dependencies":{"@google/guava":{"workspace":true}}}"#,
+        ).unwrap();
+    }
+
+    fn make_lock(hash: &str, deps: &[&str]) -> Lockfile {
+        let mut lock = Lockfile::default();
+        lock.config_hash = hash.to_string();
+        lock.lockfile_version = 1;
+        lock.version_winner_strategy = "latest-wins".to_string();
+        let mut map = BTreeMap::new();
+        for gav in deps {
+            map.insert(gav.to_string(), ResolvedDependency::default());
+        }
+        lock.dependencies = map;
+        lock
+    }
+
+    #[test]
+    fn save_lockfile_is_noop_for_workspace_child() {
+        // A per-module resolve from a workspace child must not overwrite the
+        // workspace lockfile — otherwise child cfg's fingerprint (only its own
+        // deps) would replace the root cfg's fingerprint (the full set).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_workspace(root);
+
+        // Seed a "good" lockfile written from the workspace root.
+        let good = make_lock("root_hash_aaaa", &["com.google.guava:guava:33.4.0"]);
+        save_lockfile(root, &good).unwrap();
+        let before = fs::read_to_string(lockfile_path(root)).unwrap();
+
+        // A child write tries to clobber with a wrong hash + truncated deps.
+        let child = root.join("child");
+        let bad = make_lock("child_hash_xxxx", &[]);
+        save_lockfile(&child, &bad).unwrap();
+
+        let after = fs::read_to_string(lockfile_path(&child)).unwrap();
+        assert_eq!(
+            before, after,
+            "workspace-child save_lockfile must be a no-op; lockfile changed"
+        );
+    }
+
+    #[test]
+    fn load_lockfile_checked_keeps_deps_for_workspace_child() {
+        // Comparing the lockfile's root-fingerprint against a child cfg's own
+        // fingerprint would always mismatch and falsely clear deps. The guard
+        // makes load_lockfile_checked behave like load_lockfile for children.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_workspace(root);
+
+        let good = make_lock("root_hash_aaaa", &["com.google.guava:guava:33.4.0"]);
+        save_lockfile(root, &good).unwrap();
+
+        let child_path = root.join("child");
+        let child_cfg = load_config(&child_path.join(CONFIG_FILE)).unwrap();
+        let loaded = load_lockfile_checked(&child_path, &child_cfg).unwrap();
+        assert_eq!(loaded.config_hash, "root_hash_aaaa");
+        assert_eq!(loaded.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn save_lockfile_still_writes_for_workspace_root() {
+        // Sanity check the happy path: writes from the workspace root itself
+        // (not a child) must still go through.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_workspace(root);
+
+        let lock = make_lock("root_hash_bbbb", &["com.google.guava:guava:33.4.0"]);
+        save_lockfile(root, &lock).unwrap();
+
+        let written: Lockfile = serde_json::from_str(
+            &fs::read_to_string(lockfile_path(root)).unwrap(),
+        ).unwrap();
+        assert_eq!(written.config_hash, "root_hash_bbbb");
+        assert_eq!(written.dependencies.len(), 1);
     }
 }

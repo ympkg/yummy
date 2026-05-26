@@ -39,7 +39,15 @@ pub fn compute_diff(cfg: &YmConfig, lock: &Lockfile) -> LockfileDiff {
                 continue;
             }
             if let Some(version) = value.version() {
-                ym_direct.insert(coord.clone(), version.to_string());
+                // ym.json keys may be aliases like `@angus/angus-mail` while the lockfile
+                // is indexed by `groupId:artifactId`. Resolve through scopeMapping /
+                // global registry so the two sides compare on the same namespace —
+                // otherwise every aliased direct dep falsely surfaces as "missing
+                // from ym-lock.json" in --frozen-lockfile failures.
+                let resolved = cfg.resolve_key(coord);
+                if resolved.contains(':') {
+                    ym_direct.insert(resolved, version.to_string());
+                }
             }
         }
     }
@@ -199,6 +207,52 @@ mod tests {
         let diff = compute_diff(&cfg, &lock);
         // Workspace + URL deps are not in the lock and not subject to frozen check
         assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn test_diff_resolves_alias_via_scope_mapping() {
+        // Regression: previously, ym.json keys like `@angus/angus-mail` were inserted
+        // into ym_direct as-is and then compared against lockfile GA keys like
+        // `org.eclipse.angus:angus-mail`. Every aliased direct dep was reported as
+        // "missing from ym-lock.json", swamping --frozen-lockfile failures with
+        // false positives. After the fix, resolve_key normalises both sides.
+        let mut cfg = YmConfig::default();
+        let mut mapping = BTreeMap::new();
+        mapping.insert(
+            "@angus/angus-mail".to_string(),
+            "org.eclipse.angus:angus-mail".to_string(),
+        );
+        cfg.scope_mapping = Some(mapping);
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "@angus/angus-mail".to_string(),
+            DependencyValue::Simple("2.0.4".to_string()),
+        );
+        cfg.dependencies = Some(deps);
+        let lock = make_lock(&["org.eclipse.angus:angus-mail:2.0.4"]);
+        let diff = compute_diff(&cfg, &lock);
+        assert!(
+            diff.is_empty(),
+            "aliased direct dep should resolve to GA and match lockfile, got {:?}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_diff_skips_unresolvable_alias() {
+        // An alias with no scopeMapping / global registry entry can't be compared.
+        // Better to skip than to wrongly flag every alias as "added".
+        let mut cfg = YmConfig::default();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "@nosuch/dep".to_string(),
+            DependencyValue::Simple("1.0.0".to_string()),
+        );
+        cfg.dependencies = Some(deps);
+        let lock = Lockfile::default();
+        let diff = compute_diff(&cfg, &lock);
+        assert!(diff.added.is_empty());
+        assert!(diff.version_changed.is_empty());
     }
 
     #[test]

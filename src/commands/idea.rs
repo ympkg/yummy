@@ -53,7 +53,11 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
     );
     std::fs::write(idea_dir.join("misc.xml"), misc)?;
 
-    // Download sources if requested (still useful for offline caching)
+    // Download sources if requested (still useful for offline caching).
+    //
+    // NOTE: This branch uses `load_lockfile` (not `load_lockfile_checked`), so it
+    // does NOT update `config_hash` when ym.json's dependency fingerprint
+    // changes. To sync the lockfile after editing ym.json, use `ym install`.
     if download_sources {
         let jars = if cfg.workspaces.is_some() {
             let ws = WorkspaceGraph::build(&project)?;
@@ -85,7 +89,11 @@ pub fn execute(target: Option<String>, download_sources: bool, json: bool) -> Re
             let per_module_jars = crate::workspace::resolver::resolve_workspace_deps_with_resolutions(
                 &all_module_deps, &cache_dir, &mut resolved, &root_registries, &exclusions, &root_resolutions,
             )?;
-            config::save_lockfile(&project, &resolved)?;
+            // No save_lockfile — `ymc idea --download-sources` is an executive
+            // command (read-only against ym-lock.json, ADR-020). Source URLs
+            // are discovered on next install/build naturally; persisting them
+            // here would either fight the workspace-child guard or pollute the
+            // workspace lockfile from a non-declarative entry point.
 
             let mut all_jars: Vec<PathBuf> = Vec::new();
             for jars in per_module_jars.values() {
@@ -194,6 +202,11 @@ fn execute_json(
     Ok(())
 }
 
+/// Builds per-module dependency models for `ymc idea --json` (IDEA plugin
+/// External System sync). This is a **read-only** lockfile path: it uses
+/// `load_lockfile` (not `load_lockfile_checked`), so it never updates
+/// `config_hash` when ym.json's dependency fingerprint changes. To sync the
+/// lockfile after editing ym.json by hand, use `ym install`.
 fn build_modules_workspace(
     root: &Path,
     packages: &[String],
@@ -233,7 +246,9 @@ fn build_modules_workspace(
     let per_module_jars = resolver::resolve_workspace_deps_with_resolutions(
         &all_module_deps, &cache_dir, &mut resolved, &root_registries, &exclusions, &root_resolutions,
     )?;
-    config::save_lockfile(root, &resolved)?;
+    // No save_lockfile — `ymc idea --json` is an executive read-only path
+    // (ADR-020). The lockfile is the source-of-truth for IDEA imports, not
+    // an output of this command.
 
     eprintln!("  Building project model...");
 

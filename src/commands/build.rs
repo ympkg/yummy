@@ -150,7 +150,9 @@ pub fn execute_with_profile(_targets: Vec<String>) -> Result<()> {
     );
 
     let dep_start = Instant::now();
-    let _all_jars = resolve_deps(&project, &cfg)?;
+    // execute_with_profile is the build main entry — self-heals ym-lock.json
+    // for single-project mode. The follow-up scoped resolve is read-only.
+    let _all_jars = resolve_and_persist_deps(&project, &cfg)?;
     let compile_jars = resolve_deps_with_scopes(&project, &cfg, &["compile", "provided"])?;
     let dep_time = dep_start.elapsed();
     println!(
@@ -236,9 +238,11 @@ fn build_impl(targets: Vec<String>, package: bool, keep_going: bool) -> Result<(
 
     // Single project mode
     let start = Instant::now();
-    // Resolve all deps to populate cache
-    let _all_jars = resolve_deps(&project, &cfg)?;
-    // Compilation classpath: compile + provided (exclude runtime and test)
+    // Resolve all deps to populate cache + self-heal ym-lock.json. Single-project
+    // build is a declarative writer of the lockfile (ADR-020).
+    let _all_jars = resolve_and_persist_deps(&project, &cfg)?;
+    // Compilation classpath: compile + provided (exclude runtime and test).
+    // Read-only — the lockfile was already saved above.
     let compile_jars = resolve_deps_with_scopes(&project, &cfg, &["compile", "provided"])?;
     let resolve_time = start.elapsed();
 
@@ -2351,7 +2355,12 @@ fn load_packaging_fingerprints(project: &Path) -> std::collections::HashMap<Stri
 //   compute_module_cache_key() + try_restore_module_cache() + save_module_cache()
 // from compiler::incremental.
 
-/// Resolve dependencies filtered by scope. Used for scope-specific classpath construction.
+/// Resolve dependencies filtered by scope, used for scope-specific classpath
+/// construction. **Read-only** — does NOT write `ym-lock.json`. There is no
+/// `_with_scopes` persisting variant because every declarative caller
+/// (install / add / build main entry) saves the full unscoped resolution; a
+/// scope-filtered save would write a partial set and is never desired. See
+/// ADR-020.
 pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str]) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
@@ -2431,7 +2440,6 @@ pub fn resolve_deps_with_scopes(project: &Path, cfg: &YmConfig, scopes: &[&str])
     let jars = crate::workspace::resolver::resolve_and_download_with_constraints(
         &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &constraints, &dep_scopes,
     )?;
-    config::save_lockfile(project, &resolved)?;
 
     // Filter out JARs whose transitive scope doesn't match requested scopes
     let mut filtered = filter_jars_by_scope(&resolved, &jars, &cache, scopes);
@@ -2514,7 +2522,26 @@ fn jar_path_to_versioned_key(jar: &std::path::Path, cache: &std::path::Path) -> 
     }
 }
 
+/// Resolve all dependencies and return classpath JARs. **Read-only** — does
+/// NOT write `ym-lock.json`. Callers that want to refresh the lockfile must
+/// use [`resolve_and_persist_deps`] instead. See ADR-020 for the contract:
+/// lockfile writes are reserved for declarative commands (`ym install` / `add`
+/// / `remove` / `upgrade` / `ymc build` main entry), executive commands (dev /
+/// test / native / packaging) only read.
 pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
+    resolve_deps_inner(project, cfg, false)
+}
+
+/// Resolve all dependencies, **persist** the result to `ym-lock.json`, and
+/// return classpath JARs. The persisting variant of [`resolve_deps`]. Only
+/// safe to call from the workspace root path (or single-project root) — the
+/// `is_workspace_child` guard in `save_lockfile` will silently no-op writes
+/// from child paths, see ADR-020.
+pub fn resolve_and_persist_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
+    resolve_deps_inner(project, cfg, true)
+}
+
+fn resolve_deps_inner(project: &Path, cfg: &YmConfig, persist: bool) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
     let mut resolutions = cfg.resolved_resolutions(cfg);
@@ -2586,7 +2613,9 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     let jars = crate::workspace::resolver::resolve_and_download_with_constraints(
         &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &constraints, &dep_scopes,
     )?;
-    config::save_lockfile(project, &resolved)?;
+    if persist {
+        config::save_lockfile(project, &resolved)?;
+    }
 
     // Check for dependency version conflicts
     let conflicts = crate::workspace::resolver::check_conflicts(&resolved);
@@ -2619,10 +2648,10 @@ pub fn resolve_deps(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     Ok(all_jars)
 }
 
-/// Like resolve_deps but skip JAR downloads. Returns expected cache paths.
-/// Used by `ym idea --json` so importing is never blocked by network I/O.
-/// Batch resolve for workspace: pre-loaded root config avoids repeated I/O.
-/// Skips save_lockfile (read-only, for idea --json).
+/// Workspace-optimized variant of [`resolve_deps_no_download`] that takes the
+/// pre-loaded root config + shared cache + registry list, avoiding repeated
+/// I/O across modules. **Read-only** — does NOT write `ym-lock.json`. See
+/// ADR-020.
 pub fn resolve_deps_no_download_with_root(
     project: &Path,
     cfg: &YmConfig,
@@ -2665,6 +2694,10 @@ pub fn resolve_deps_no_download_with_root(
     Ok(all_jars)
 }
 
+/// Like [`resolve_deps`] but skips JAR downloads — returns expected cache
+/// paths even when the JARs haven't been fetched. Used by `ymc idea --json`
+/// so importing into IDEA is never blocked by network I/O. **Read-only** —
+/// does NOT write `ym-lock.json`. See ADR-020.
 pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<PathBuf>> {
     use crate::workspace::resolver::RegistryEntry;
     let mut registries: Vec<RegistryEntry> = Vec::new();
@@ -2720,7 +2753,6 @@ pub fn resolve_deps_no_download(project: &Path, cfg: &YmConfig) -> Result<Vec<Pa
     let jars = crate::workspace::resolver::resolve_no_download(
         &deps, &cache, &mut resolved, &registries, &exclusions, &resolutions, &dep_scopes,
     )?;
-    config::save_lockfile(project, &resolved)?;
 
     let mut all_jars = jars;
     all_jars.extend(resolve_lib_dirs(project, cfg));

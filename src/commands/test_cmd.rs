@@ -844,13 +844,15 @@ fn test_workspace(
         classpath_jars.extend(jars);
     }
 
-    // Also resolve all Maven dependencies (including test-scoped) for the target
+    // Also resolve all Maven dependencies (including test-scoped) for the target.
+    // No save_lockfile — `ymc test` is an executive command, read-only against
+    // ym-lock.json (ADR-020). The workspace-child guard would also reject the
+    // write here since `target_pkg.path` is a child of the workspace root.
     {
         let all_deps = target_pkg.config.maven_dependencies();
         let cache = config::maven_cache_dir();
         let mut resolved = config::load_lockfile(&target_pkg.path)?;
         let extra_jars = crate::workspace::resolver::resolve_and_download(&all_deps, &cache, &mut resolved)?;
-        config::save_lockfile(&target_pkg.path, &resolved)?;
         classpath_jars.extend(extra_jars);
     }
 
