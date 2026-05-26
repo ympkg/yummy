@@ -631,10 +631,11 @@ fn resolve_inner(
                     ) {
                         Ok(t) => t,
                         Err(e) => {
+                            // `{:#}` unfolds the full anyhow chain; `to_string()` would drop the inner causes ADR-021/023 stacked.
                             pom_failures_ref
                                 .lock()
                                 .unwrap()
-                                .push((coord.clone(), e.to_string()));
+                                .push((coord.clone(), format!("{:#}", e)));
                             Vec::new()
                         }
                     };
@@ -4260,6 +4261,39 @@ mod tests {
         assert!(
             !keys.contains(&"com.lib:nested:2.0".to_string()),
             "transitive version 2.0 must not win after BOM upgrade; got {:?}", keys
+        );
+    }
+
+    // Guards resolver.rs:~637 — `to_string()` drops inner causes; `{:#}` walks the full anyhow chain ADR-021/023 stacked.
+    #[test]
+    fn anyhow_alt_display_unfolds_full_chain_but_plain_display_does_not() {
+        use anyhow::{anyhow, Context};
+
+        let err: anyhow::Error = Err::<(), _>(anyhow!("the document does not have a root node"))
+            .context("parse POM body in parse_pom_dependencies_with_props")
+            .context("resolve transitive for software.amazon.awssdk:sdk-core:2.44.4 (POM at /tmp/x.pom)")
+            .unwrap_err();
+
+        let plain = err.to_string();
+        assert!(plain.contains("resolve transitive for"), "outer ctx missing: {}", plain);
+        assert!(
+            !plain.contains("the document does not have a root node"),
+            "plain Display leaked leaf cause unexpectedly — anyhow changed behavior? got: {}",
+            plain
+        );
+        assert!(
+            !plain.contains("parse POM body"),
+            "plain Display leaked inner ctx unexpectedly: {}",
+            plain
+        );
+
+        let alt = format!("{:#}", err);
+        assert!(alt.contains("resolve transitive for"), "outer ctx missing: {}", alt);
+        assert!(alt.contains("parse POM body"), "inner ctx missing: {}", alt);
+        assert!(
+            alt.contains("the document does not have a root node"),
+            "leaf cause missing: {}",
+            alt
         );
     }
 }
