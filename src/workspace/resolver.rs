@@ -528,6 +528,12 @@ fn resolve_inner(
 
     // In-memory POM cache to avoid re-parsing the same POM
     let pom_cache = PomCache::new();
+    // ADR-021: collect every POM fetch/parse failure across all par_iter
+    // workers so we can fail-loud with the full list at end-of-BFS instead
+    // of silently swallowing them into empty dep lists (the root of the
+    // "80 vs 84 jars" non-determinism).
+    let pom_failures: std::sync::Arc<Mutex<Vec<(MavenCoord, String)>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
     // Accumulated POM-level exclusions per versioned_key (propagated from parent)
     let mut accumulated_exclusions: HashMap<String, HashSet<String>> = HashMap::new();
     // Scope tracking: maps versioned_key -> effective scope
@@ -600,13 +606,29 @@ fn resolve_inner(
         }
 
         // Resolve transitive deps for this level using dedicated 32-thread pool
+        let pom_failures_ref = &pom_failures;
         let level_results: Vec<(MavenCoord, Vec<MavenCoord>)> = network_io_pool().install(|| {
             current_level
                 .par_iter()
                 .map(|coord| {
-                    let transitive = resolve_transitive_cached(
+                    // ADR-021: do not swallow errors into Vec::new() — that
+                    // turns a transient registry hiccup into a permanently
+                    // missing transitive subtree. Record the failure, return
+                    // empty deps so other parallel workers can still progress,
+                    // and let the BFS end-of-loop check fail-loud with the
+                    // full list.
+                    let transitive = match resolve_transitive_cached(
                         &client, coord, cache_dir, registries, Some(&pom_cache),
-                    ).unwrap_or_default();
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            pom_failures_ref
+                                .lock()
+                                .unwrap()
+                                .push((coord.clone(), e.to_string()));
+                            Vec::new()
+                        }
+                    };
                     let n = resolved_count.fetch_add(1, Ordering::Relaxed) + 1;
                     let interval = if crate::is_progress_quiet() { 100 } else { 20 };
                     if show_resolve_progress && n % interval == 0 {
@@ -693,6 +715,28 @@ fn resolve_inner(
 
                 queue.push_back(dep);
             }
+        }
+    }
+
+    // ADR-021: BFS finished — if any POM fetch/parse failed inside any worker,
+    // report all of them in a single error and abort before download phase.
+    // Aggregating beats one-at-a-time-on-retry because a CI runner with flaky
+    // network typically loses several adjacent deps; users want the full list.
+    {
+        let failures = pom_failures.lock().unwrap();
+        if !failures.is_empty() {
+            let mut msg = String::from("\n  ✗ Dependency resolution failed — POM fetch/parse errors:\n\n");
+            for (coord, reason) in failures.iter() {
+                msg.push_str(&format!(
+                    "    - {}:{}:{}\n        reason: {}\n",
+                    coord.group_id, coord.artifact_id, coord.version, reason
+                ));
+            }
+            msg.push_str("\n  Possible causes:\n");
+            msg.push_str("    - registry temporarily unreachable (retry; check network and credentials)\n");
+            msg.push_str("    - artifact does not exist at that version (typo in ym.json?)\n");
+            msg.push_str("    - cache corruption (run `ym cache clean -y` to retry from scratch)\n");
+            return Err(anyhow::anyhow!(msg));
         }
     }
 
@@ -1221,15 +1265,28 @@ impl PomCache {
 }
 
 /// On-disk POM cache entry (`~/.ym/pom-cache/{g}/{a}/{v}.json`).
+///
 /// `pom_sha256` binds the parsed dependency list to the exact raw `.pom` it
 /// was derived from. A republished release (same GAV, new `.pom`) makes the
 /// hashes diverge, so the stale entry is rejected instead of silently
 /// feeding an outdated dependency graph into the build (ADR-017).
+///
+/// `schema_version` lets the resolver invalidate old cache entries when the
+/// semantics of `resolved` change without the raw `.pom` changing. v2 (ADR-021)
+/// introduced parent-POM `<dependencies>` inheritance: `resolved` now contains
+/// the child's own deps **plus** the union of every ancestor POM's project-level
+/// `<dependencies>` block (Maven inheritance). v1 entries (missing
+/// `schema_version`) fail to deserialize as v2 and are dropped + regenerated.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PomCacheEntry {
+    schema_version: u8,
     pom_sha256: String,
     resolved: Vec<(String, String, String, Vec<String>)>,
 }
+
+/// Bump when the semantics of `PomCacheEntry.resolved` change.
+/// v2: ADR-021 — resolved includes parent-POM dependency inheritance.
+const POM_CACHE_SCHEMA_VERSION: u8 = 2;
 
 /// Remove every cached derivative of one artifact-version — raw `.pom`,
 /// `.jar`, and the parsed pom-cache entry. Called when a republished release
@@ -1279,6 +1336,7 @@ fn resolve_transitive_cached(
         if let Ok(content) = std::fs::read_to_string(&pom_cache_file) {
             let fresh = serde_json::from_str::<PomCacheEntry>(&content)
                 .ok()
+                .filter(|entry| entry.schema_version == POM_CACHE_SCHEMA_VERSION)
                 .filter(|entry| {
                     compute_sha256_file(&pom_path)
                         .map(|local| local == entry.pom_sha256)
@@ -1318,8 +1376,19 @@ fn resolve_transitive_cached(
         } else {
             download_from_repos(client, coord, &pom_path, registries, None, |c, r| c.pom_url(r))
         };
-        if pom_result.is_err() {
-            return Ok(vec![]); // POM not found is non-fatal
+        if let Err(e) = pom_result {
+            // ADR-021: Silent-swallow on POM fetch error is the root cause of
+            // intermittent "Resolving 80 jars vs 84 jars" non-determinism — a
+            // transient registry hiccup makes a whole BFS subtree disappear
+            // without any user-visible signal, and "lucky" cache states from
+            // unrelated builds can mask the loss until they invalidate.
+            // Fail-loud propagates the error; the BFS driver collects all
+            // failures and reports them together so users see every missing
+            // dep in one shot, not one at a time on retry.
+            return Err(anyhow::anyhow!(
+                "POM fetch failed for {}:{}:{} — {}",
+                coord.group_id, coord.artifact_id, coord.version, e
+            ));
         }
     }
 
@@ -1330,7 +1399,39 @@ fn resolve_transitive_cached(
     let mut visited_poms = HashSet::new();
     resolve_parent_properties(client, &pom_content, cache_dir, registries, &mut all_properties, 0, &mut visited_poms)?;
 
-    let deps = parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, registries)?;
+    let mut deps = parse_pom_dependencies_with_props(&pom_content, &all_properties, client, cache_dir, registries)?;
+
+    // ADR-021: Merge parent POM `<dependencies>` blocks into the child's
+    // transitive set (Maven inheritance). Without this, projects whose deps
+    // live in a parent POM (e.g. AWS SDK `services` parent ships
+    // sdk-core/auth/regions/http-client-spi) silently lose those jars from the
+    // classpath, since `parse_pom_dependencies_with_props` only reads the
+    // current POM's `<dependencies>`. The previous (P1-era) implementation
+    // assumed all parents only carry `<properties>` + `<dependencyManagement>`,
+    // which is wrong for any monorepo that uses parent-level deps.
+    //
+    // Merge rule: child-declared deps win on identical `groupId:artifactId`
+    // (Maven override semantics — the closer ancestor's declaration wins).
+    let mut visited_parent_deps = HashSet::new();
+    let parent_deps = collect_parent_dependencies(
+        client,
+        &pom_content,
+        cache_dir,
+        registries,
+        &all_properties,
+        0,
+        &mut visited_parent_deps,
+    )?;
+    let mut existing_ga: HashSet<String> = deps
+        .iter()
+        .map(|d| format!("{}:{}", d.group_id, d.artifact_id))
+        .collect();
+    for pd in parent_deps {
+        let ga = format!("{}:{}", pd.group_id, pd.artifact_id);
+        if existing_ga.insert(ga) {
+            deps.push(pd);
+        }
+    }
 
     // Write content-addressed disk cache (ADR-017): bind the parsed result to
     // the sha256 of the `.pom` it came from so a later republish invalidates it.
@@ -1339,6 +1440,7 @@ fn resolve_transitive_cached(
     }
     if let Ok(pom_sha256) = compute_sha256_file(&pom_path) {
         let entry = PomCacheEntry {
+            schema_version: POM_CACHE_SCHEMA_VERSION,
             pom_sha256,
             resolved: deps
                 .iter()
@@ -1551,6 +1653,126 @@ fn parse_pom_dependencies_with_props(
                 }
             }
         }
+    }
+
+    Ok(deps)
+}
+
+/// ADR-021: Walk the `<parent>` chain and union every ancestor POM's
+/// project-level `<dependencies>` block (Maven inheritance).
+///
+/// The caller already runs `resolve_parent_properties` first, so
+/// `extra_properties` contains the full transitive property + `managed:G:A`
+/// map for the chain. We can therefore reuse `parse_pom_dependencies_with_props`
+/// on each ancestor and trust it to filter scope=test/provided/system,
+/// optional=true and import-scope deps the same way it does for the child.
+///
+/// **De-duplication**: returned list is keyed by `groupId:artifactId` with
+/// closer ancestors winning. `resolve_transitive_cached` then merges the
+/// child's own deps on top with the same rule, giving final precedence:
+/// child > parent > grandparent > root.
+///
+/// **Depth limit + cycle detection** match `resolve_parent_properties`:
+/// 20 levels max, visited set bails on cycles.
+///
+/// **Why a separate function from `resolve_parent_properties`**: that one is
+/// about merging values *into* a shared mutable map; this one collects deps
+/// *out* to a returned list. Different signatures, different semantics,
+/// reusing the same walker would force a 3-output return type and obscure
+/// the merge rules.
+fn collect_parent_dependencies(
+    client: &reqwest::blocking::Client,
+    pom_content: &str,
+    cache_dir: &Path,
+    registries: &[RegistryEntry],
+    extra_properties: &HashMap<String, String>,
+    depth: u8,
+    visited: &mut HashSet<String>,
+) -> Result<Vec<MavenCoord>> {
+    if depth > 20 {
+        return Ok(vec![]);
+    }
+    let doc = roxmltree::Document::parse(pom_content)?;
+    let mut deps: Vec<MavenCoord> = Vec::new();
+    let mut seen_ga: HashSet<String> = HashSet::new();
+
+    for node in doc.root_element().children() {
+        if node.tag_name().name() != "parent" {
+            continue;
+        }
+        let mut pg = None;
+        let mut pa = None;
+        let mut pv = None;
+        for child in node.children() {
+            match child.tag_name().name() {
+                "groupId" => pg = child.text(),
+                "artifactId" => pa = child.text(),
+                "version" => pv = child.text(),
+                _ => {}
+            }
+        }
+        if let (Some(g), Some(a), Some(v)) = (pg, pa, pv) {
+            let parent_key = format!("{}:{}:{}", g, a, v);
+            if visited.contains(&parent_key) {
+                break;
+            }
+            visited.insert(parent_key);
+
+            let parent_coord = MavenCoord {
+                group_id: g.to_string(),
+                artifact_id: a.to_string(),
+                version: v.to_string(),
+                classifier: None,
+                exclusions: Vec::new(),
+                scope: None,
+            };
+            let parent_pom_path = parent_coord.pom_path(cache_dir);
+            if !parent_pom_path.exists() {
+                let _ = download_from_repos(
+                    client,
+                    &parent_coord,
+                    &parent_pom_path,
+                    registries,
+                    None,
+                    |c, r| c.pom_url(r),
+                );
+            }
+            if parent_pom_path.exists() {
+                if let Ok(parent_content) = std::fs::read_to_string(&parent_pom_path) {
+                    if let Ok(parent_own_deps) = parse_pom_dependencies_with_props(
+                        &parent_content,
+                        extra_properties,
+                        client,
+                        cache_dir,
+                        registries,
+                    ) {
+                        for d in parent_own_deps {
+                            let ga = format!("{}:{}", d.group_id, d.artifact_id);
+                            if seen_ga.insert(ga) {
+                                deps.push(d);
+                            }
+                        }
+                    }
+                    if let Ok(grandparent_deps) = collect_parent_dependencies(
+                        client,
+                        &parent_content,
+                        cache_dir,
+                        registries,
+                        extra_properties,
+                        depth + 1,
+                        visited,
+                    ) {
+                        for gd in grandparent_deps {
+                            let ga = format!("{}:{}", gd.group_id, gd.artifact_id);
+                            if seen_ga.insert(ga) {
+                                deps.push(gd);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        break;
     }
 
     Ok(deps)
@@ -3056,13 +3278,15 @@ mod tests {
 
     #[test]
     fn test_pom_cache_entry_roundtrip() {
-        // ADR-017: content-addressed pom-cache format round-trips.
+        // ADR-017 + ADR-021: content-addressed pom-cache format round-trips.
         let entry = PomCacheEntry {
+            schema_version: POM_CACHE_SCHEMA_VERSION,
             pom_sha256: "abc123".to_string(),
             resolved: vec![("g".into(), "a".into(), "1.0".into(), vec!["x:y".into()])],
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: PomCacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schema_version, POM_CACHE_SCHEMA_VERSION);
         assert_eq!(back.pom_sha256, "abc123");
         assert_eq!(back.resolved.len(), 1);
         // Old bare-array format must NOT parse as PomCacheEntry — forces a
@@ -3272,5 +3496,422 @@ mod tests {
         let deps = parse_pom_dependencies_with_props(pom, &props, &client, Path::new("/tmp"), &[]).unwrap();
         // runtime scope is included (not test/provided/system/import)
         assert_eq!(deps.len(), 3);
+    }
+
+    // --- ADR-021: parent POM <dependencies> inheritance ---
+
+    #[test]
+    fn test_pom_cache_entry_v1_schema_rejected() {
+        // v1 (pre-ADR-021) cache entry has no `schema_version` field. Loading
+        // it as the v2 struct must fail deserialization so the disk cache
+        // self-heals to v2 on next read.
+        let v1_json = r#"{"pom_sha256":"abc","resolved":[]}"#;
+        let result: std::result::Result<PomCacheEntry, _> = serde_json::from_str(v1_json);
+        assert!(result.is_err(), "v1 schema must fail to deserialize as v2");
+    }
+
+    #[test]
+    fn test_pom_cache_entry_v2_schema_roundtrip() {
+        let entry = PomCacheEntry {
+            schema_version: POM_CACHE_SCHEMA_VERSION,
+            pom_sha256: "deadbeef".to_string(),
+            resolved: vec![("g".to_string(), "a".to_string(), "1.0".to_string(), vec![])],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"schema_version\":2"), "v2 must persist schema_version=2");
+        let parsed: PomCacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.pom_sha256, "deadbeef");
+        assert_eq!(parsed.resolved.len(), 1);
+    }
+
+    fn write_pom_to_cache(cache_dir: &Path, g: &str, a: &str, v: &str, body: &str) {
+        let coord = MavenCoord {
+            group_id: g.to_string(),
+            artifact_id: a.to_string(),
+            version: v.to_string(),
+            classifier: None,
+            exclusions: Vec::new(),
+            scope: None,
+        };
+        let pom = coord.pom_path(cache_dir);
+        std::fs::create_dir_all(pom.parent().unwrap()).unwrap();
+        std::fs::write(&pom, body).unwrap();
+    }
+
+    #[test]
+    fn test_collect_parent_dependencies_inherits_parent_block() {
+        // The AWS SDK scenario: a child POM (ec2) declares almost nothing,
+        // but its parent (services) ships sdk-core/auth/regions/http-client-spi
+        // as direct compile-scope deps. Pre-ADR-021 ym silently dropped these.
+        let cache_dir = std::env::temp_dir()
+            .join(format!("ym_p021_inherit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let parent_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>services</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>sdk-core</artifactId>
+            <version>2.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>auth</artifactId>
+            <version>2.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "services", "1.0", parent_pom);
+
+        let child_pom = r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>services</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>ec2</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>protocol-core</artifactId>
+            <version>2.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let mut visited = HashSet::new();
+        let parent_deps = collect_parent_dependencies(
+            &client, child_pom, &cache_dir, &[], &props, 0, &mut visited,
+        ).unwrap();
+
+        let gas: Vec<String> = parent_deps.iter()
+            .map(|d| format!("{}:{}", d.group_id, d.artifact_id))
+            .collect();
+        assert!(gas.contains(&"com.lib:sdk-core".to_string()),
+            "parent's sdk-core must be inherited; got {:?}", gas);
+        assert!(gas.contains(&"com.lib:auth".to_string()),
+            "parent's auth must be inherited; got {:?}", gas);
+        // child's own protocol-core is NOT returned by this fn (the caller
+        // merges child deps on top); only ancestor deps are here.
+        assert!(!gas.contains(&"com.lib:protocol-core".to_string()),
+            "child's own deps should not be in parent-chain returns");
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_collect_parent_dependencies_closer_parent_wins_over_grandparent() {
+        // Same G:A in both parent and grandparent — closer ancestor's version
+        // wins. Maven inheritance: deeper ancestors don't override nearer ones.
+        let cache_dir = std::env::temp_dir()
+            .join(format!("ym_p021_precedence_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let grandparent_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>grandparent</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>auth</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "grandparent", "1.0", grandparent_pom);
+
+        let parent_pom = r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>grandparent</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>parent</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>auth</artifactId>
+            <version>2.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>utils</artifactId>
+            <version>2.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "parent", "1.0", parent_pom);
+
+        let child_pom = r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>child</artifactId>
+</project>"#;
+
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let mut visited = HashSet::new();
+        let parent_deps = collect_parent_dependencies(
+            &client, child_pom, &cache_dir, &[], &props, 0, &mut visited,
+        ).unwrap();
+
+        let auth = parent_deps.iter().find(|d| d.artifact_id == "auth")
+            .expect("auth must appear");
+        assert_eq!(auth.version, "2.0",
+            "closer parent (2.0) must win over grandparent (1.0)");
+        assert!(parent_deps.iter().any(|d| d.artifact_id == "utils"),
+            "grandparent-only dep not declared by closer parent should still merge");
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_collect_parent_dependencies_filters_test_provided_optional() {
+        // The reused parse_pom_dependencies_with_props already drops these,
+        // but pin it down so a future refactor that bypasses the reuse
+        // doesn't regress filtering on parent deps.
+        let cache_dir = std::env::temp_dir()
+            .join(format!("ym_p021_filter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let parent_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>compile-dep</artifactId>
+            <version>1.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>test-dep</artifactId>
+            <version>1.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>provided-dep</artifactId>
+            <version>1.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>optional-dep</artifactId>
+            <version>1.0</version>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "parent", "1.0", parent_pom);
+
+        let child_pom = r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>child</artifactId>
+</project>"#;
+
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let mut visited = HashSet::new();
+        let parent_deps = collect_parent_dependencies(
+            &client, child_pom, &cache_dir, &[], &props, 0, &mut visited,
+        ).unwrap();
+
+        let ids: Vec<String> = parent_deps.iter().map(|d| d.artifact_id.clone()).collect();
+        assert!(ids.contains(&"compile-dep".to_string()), "compile dep must inherit");
+        assert!(!ids.contains(&"test-dep".to_string()), "test-scope must be filtered");
+        assert!(!ids.contains(&"provided-dep".to_string()), "provided-scope must be filtered");
+        assert!(!ids.contains(&"optional-dep".to_string()), "optional=true must be filtered");
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_resolve_transitive_cached_merges_child_and_parent_deps() {
+        // End-to-end equivalent of the AWS SDK ec2/services scenario:
+        // child (ec2) declares protocol-core; parent (services) declares
+        // auth + sdk-core. The merged direct-deps list returned by
+        // resolve_transitive_cached must contain BOTH the child's own and
+        // the parent's inherited deps. Pre-ADR-021 ym returned only the
+        // child's, silently dropping the 4 jars (auth/sdk-core/regions/
+        // http-client-spi) needed at compile time.
+        let cache_dir = std::env::temp_dir()
+            .join(format!("ym_p021_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let child_pom = r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>services</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>ec2</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>protocol-core</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "ec2", "1.0", child_pom);
+
+        let parent_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>services</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>auth</artifactId>
+            <version>1.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>sdk-core</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "services", "1.0", parent_pom);
+
+        let coord = MavenCoord {
+            group_id: "com.example".into(),
+            artifact_id: "ec2".into(),
+            version: "1.0".into(),
+            classifier: None,
+            exclusions: Vec::new(),
+            scope: None,
+        };
+        let client = reqwest::blocking::Client::new();
+        let deps = resolve_transitive_cached(&client, &coord, &cache_dir, &[], None).unwrap();
+
+        let gas: Vec<String> = deps.iter()
+            .map(|d| format!("{}:{}", d.group_id, d.artifact_id))
+            .collect();
+        assert!(gas.contains(&"com.lib:protocol-core".to_string()),
+            "child's own dep must be present; got {:?}", gas);
+        assert!(gas.contains(&"com.lib:auth".to_string()),
+            "parent's auth must be merged into child deps; got {:?}", gas);
+        assert!(gas.contains(&"com.lib:sdk-core".to_string()),
+            "parent's sdk-core must be merged into child deps; got {:?}", gas);
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_resolve_transitive_cached_child_overrides_parent_same_ga() {
+        // When the same groupId:artifactId appears in both child and parent,
+        // the child's declaration wins (Maven override semantics).
+        let cache_dir = std::env::temp_dir()
+            .join(format!("ym_p021_override_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let child_pom = r#"<?xml version="1.0"?>
+<project>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>p</artifactId>
+        <version>1.0</version>
+    </parent>
+    <artifactId>c</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>auth</artifactId>
+            <version>3.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "c", "1.0", child_pom);
+
+        let parent_pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>p</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>auth</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        write_pom_to_cache(&cache_dir, "com.example", "p", "1.0", parent_pom);
+
+        let coord = MavenCoord {
+            group_id: "com.example".into(), artifact_id: "c".into(),
+            version: "1.0".into(), classifier: None,
+            exclusions: Vec::new(), scope: None,
+        };
+        let client = reqwest::blocking::Client::new();
+        let deps = resolve_transitive_cached(&client, &coord, &cache_dir, &[], None).unwrap();
+
+        let auth = deps.iter().find(|d| d.artifact_id == "auth")
+            .expect("auth must appear");
+        assert_eq!(auth.version, "3.0",
+            "child's auth (3.0) must win over parent's auth (1.0); deduplicated on G:A");
+        assert_eq!(deps.iter().filter(|d| d.artifact_id == "auth").count(), 1,
+            "auth must appear exactly once after dedup");
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_collect_parent_dependencies_no_parent_returns_empty() {
+        // A root POM (no <parent> block) must safely return [] — the function
+        // is called unconditionally for every coord in the BFS.
+        let pom = r#"<?xml version="1.0"?>
+<project>
+    <groupId>com.example</groupId>
+    <artifactId>root</artifactId>
+    <version>1.0</version>
+    <dependencies>
+        <dependency>
+            <groupId>com.lib</groupId>
+            <artifactId>x</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>"#;
+        let props = HashMap::new();
+        let client = reqwest::blocking::Client::new();
+        let mut visited = HashSet::new();
+        let deps = collect_parent_dependencies(
+            &client, pom, Path::new("/tmp"), &[], &props, 0, &mut visited,
+        ).unwrap();
+        assert!(deps.is_empty(), "no parent → no inherited deps");
     }
 }
