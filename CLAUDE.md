@@ -6,13 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Yummy (`ym`) is a modern Java build tool written in Rust. It provides a package manager (`ym`) and compiler/runtime (`ymc`) as a single binary that dispatches based on executable name.
 
-## Spec 位置
+## Spec Location
 
-设计文档在 `/mnt/d/code/spectalk/spec-yummy/02-design/` 目录下。
+Design docs live in the separate spec repo under `spectalk/spec-yummy/02-design/`.
 
-## 开发规则
+## Development Rules
 
-对照 spec 实现时，必须先列出所有 spec 条目的 checklist，逐条实现并标记完成，最后逐条验证。不要凭印象写代码。
+- When implementing against a spec, first list a checklist of every spec item, implement and tick them off one by one, then verify each. Do not write code from memory.
+- **Code language: English only.** This is an international open-source project — all comments, string literals, assert messages, and commit messages must be in English. (The design-spec repo `spec-yummy` stays Chinese by its own convention; that split is intentional.)
 
 ## Build Commands
 
