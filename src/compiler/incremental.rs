@@ -2383,22 +2383,28 @@ mod tests {
     }
 
     // ========================================================================
-    // 04-compiler.md「增量编译契约」路径×不变式矩阵的运行时实证。
+    // Runtime proof for the 04-compiler.md "incremental compile contract"
+    // path × invariant matrix.
     //
-    // spec 强制规则(L148-158):矩阵每个 ✓ 必须 grep 到对应测试,且测试必须打到
-    // 「会短路的那条路径本身」(non-helper)。本批覆盖:
-    //   - manifest fast-path 路径:触发短路 + 2 个绕过场景(源集变化 / 记录的
-    //     class 缺失)
-    //   - up-to-date 路径:Stage 4 写 manifest 不变式(补 ADR-019 已有的 Stage
-    //     1 prune orphan 测试)
-    //   - 跨 build 不变式:up-to-date → fast-path 链路 e2e(spec L156 强制
-    //     「跨 build 不变式必须 e2e 集成测试」)
+    // Mandatory rule (spec L148-158): every ✓ must grep to a test, and the test
+    // must hit the short-circuiting path itself (non-helper). Covered here:
+    //   - manifest fast-path: triggers the short-circuit + 2 bypass scenarios
+    //     (source set shrinks / recorded class missing)
+    //   - up-to-date path: Stage 4 manifest-write invariant (complements the
+    //     pre-existing ADR-019 Stage 1 prune-orphan test)
+    //   - cache restore path: HomeGuard redirects $HOME to isolate ~/.ym/build-cache,
+    //     triggers a restore HIT, asserts Stage1 (product == source set) + Stage3
+    //     skip (returns Cached, javac never called) + Stage4 manifest/fingerprint/
+    //     cache (already present)
+    //   - cross-build invariant: up-to-date → fast-path chain e2e (spec L156
+    //     mandates e2e integration tests for cross-build invariants)
     //
-    // 未覆盖(留 follow-up):
-    //   - cache restore 路径:需 `~/.ym/build-cache` 注入,目前 `build_cache_dir`
-    //     直接读 `crate::home_dir()`,unit test 注入需引入 HOME env var 重定向
-    //     + 测试串行化机制
-    //   - 全量编译 / 增量编译 Stage 3 真编译路径:需 JDK 中的 javac 可用
+    // Not covered (follow-up):
+    //   - full / incremental compile Stage 3 real-compile path: needs javac from a
+    //     JDK — an integration test outside the "no javac e2e" constraint, deferred
+    //     until CI installs a JDK. The other 4 columns (Stage1 / Stage4 manifest /
+    //     fingerprint / cache) share the same path and cannot be triggered without
+    //     javac, so they are deferred together.
     // ========================================================================
 
     /// 构造「前次构建成功后留下的状态」:写源、写假合法 .class、写匹配的
@@ -2676,5 +2682,89 @@ mod tests {
         // 这是 spec L154 「测试命名应反映路径+不变式两个维度,便于 grep 倒查」
         // 的具体实现策略。
         let _ = test_incremental_compile_prunes_orphan_class_when_source_deleted;
+    }
+
+    /// path = cache restore / invariants = Stage1 PrePrune (product == source set) +
+    /// Stage3 skip (restore replaces real compile) + Stage4 manifest + Stage4
+    /// fingerprint + Stage4 cache (already present)
+    ///
+    /// The build cache (`~/.ym/build-cache/{key}`) derives from `crate::home_dir()` →
+    /// `$HOME`, so HomeGuard redirects `$HOME` to a tempdir for isolation — closing the
+    /// gap the follow-up note above flagged as "needs $HOME redirect + test serialization".
+    ///
+    /// Trigger: the production fn `save_build_cache` copies output_dir's .class into the
+    /// build cache, then `rm -rf out` (has_classes=false). This run of incremental_compile:
+    /// no manifest + non-empty changed → fast-path bypassed; has_classes=false → enters the
+    /// full-compile branch → `try_restore_build_cache` HIT → clears output then copies back
+    /// from cache → writes manifest → returns Cached. javac is never called (pool=None; had
+    /// it wrongly entered real compilation it would error on the missing javac).
+    #[test]
+    fn test_cache_restore_path_restores_and_completes_stage4() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::test_support::HomeGuard::redirect(home.path());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let src_dir = tmp.path().join("src");
+        let output_dir = tmp.path().join("out");
+        let fp_dir = fingerprint_dir_for(&cache, &output_dir);
+
+        // Source A.java + a fake-but-valid (CAFEBABE) A.class output.
+        let java = src_dir.join("com/example/A.java");
+        std::fs::create_dir_all(java.parent().unwrap()).unwrap();
+        std::fs::write(&java, "package com.example; class A {}").unwrap();
+        let a_class = output_dir.join("com/example/A.class");
+        std::fs::create_dir_all(a_class.parent().unwrap()).unwrap();
+        std::fs::write(&a_class, build_test_class(&[0xB1])).unwrap();
+
+        let config = minimal_config(&src_dir, &output_dir);
+        let all_files = vec![java.clone()];
+
+        // Seed the build cache: save_build_cache copies output_dir → ~/.ym/build-cache/{key}.
+        save_build_cache(&config, &all_files).unwrap();
+        let key = compute_build_cache_key(&config, &all_files).unwrap();
+        let cache_entry = build_cache_dir(&key);
+        assert!(
+            cache_entry.starts_with(home.path()),
+            "HomeGuard must redirect the build cache into the tempdir (got {})",
+            cache_entry.display()
+        );
+        assert!(
+            cache_entry.join("com/example/A.class").exists(),
+            "save_build_cache must seed A.class into the build cache"
+        );
+
+        // rm -rf out → has_classes=false, forcing the cache-restore branch (L552/561).
+        std::fs::remove_dir_all(&output_dir).unwrap();
+
+        let result = incremental_compile(&config, &cache, None).unwrap();
+
+        // Stage 3 skip (restore replaces compile): returns Cached, not UpToDate; javac uncalled.
+        assert_eq!(
+            result.outcome,
+            super::super::CompileOutcome::Cached,
+            "cache hit + output without .class → must take the cache-restore path and return Cached"
+        );
+        // Stage 1 / product == source set: after restore, output's .class matches the current source set.
+        assert!(
+            output_dir.join("com/example/A.class").exists(),
+            "cache-restore must copy A.class back into output_dir (product == source set)"
+        );
+        // Stage 4 manifest: restore writes a manifest for the next fast-path (L565).
+        assert!(
+            fp_dir.join(BUILD_MANIFEST_FILE).exists(),
+            "cache-restore path Stage 4 must persist the manifest"
+        );
+        // Stage 4 fingerprint: restore rebuilds the source fingerprint (L1133).
+        let fp_after = Fingerprints::load(&fp_dir);
+        assert!(
+            fp_after.entries.contains_key(&crate::normalize_cache_path(&java)),
+            "cache-restore path Stage 4 must rebuild the fingerprint"
+        );
+        // Stage 4 cache (already present): the cache entry remains for future restores.
+        assert!(
+            cache_entry.exists(),
+            "cache-restore path cache invariant: the cache entry remains (already present)"
+        );
     }
 }
