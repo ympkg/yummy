@@ -449,3 +449,74 @@ fn download_url_jar(url: &str, dest: &std::path::Path) -> Result<()> {
     std::fs::write(dest, &bytes)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // add.rs had 0 tests. `ym add` accepts pasted Maven `<dependency>` XML or Gradle
+    // notation — a bug in either pure parser writes the wrong coordinate/scope into
+    // ym.json. Anchor coordinate normalization (`g:a:v` → `g:a@v`) and the Maven/Gradle
+    // → ym scope mapping (03-package-management.md "scope behavior" + the Gradle scope
+    // dispatch in lib.rs).
+
+    #[test]
+    fn maven_xml_parses_coord_and_maps_test_scope() {
+        let xml = r#"<dependency>
+  <groupId>org.junit.jupiter</groupId>
+  <artifactId>junit-jupiter</artifactId>
+  <version>5.10.0</version>
+  <scope>test</scope>
+</dependency>"#;
+        assert_eq!(
+            try_parse_maven_xml(xml),
+            Some(("org.junit.jupiter:junit-jupiter@5.10.0".to_string(), Some("test".to_string())))
+        );
+    }
+
+    #[test]
+    fn maven_xml_compile_scope_maps_to_none() {
+        // An explicit Maven <scope>compile</scope> == the default; ym expresses it as "no scope".
+        let xml = "<dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>33.0.0</version><scope>compile</scope></dependency>";
+        assert_eq!(
+            try_parse_maven_xml(xml),
+            Some(("com.google.guava:guava@33.0.0".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn maven_xml_without_version_omits_at_version() {
+        let xml = "<dependency><groupId>com.example</groupId><artifactId>lib</artifactId></dependency>";
+        assert_eq!(try_parse_maven_xml(xml), Some(("com.example:lib".to_string(), None)));
+    }
+
+    #[test]
+    fn maven_xml_missing_artifact_is_none() {
+        let xml = "<dependency><groupId>com.example</groupId></dependency>";
+        assert_eq!(try_parse_maven_xml(xml), None);
+    }
+
+    #[test]
+    fn gradle_notation_maps_scopes_and_normalizes_coord() {
+        assert_eq!(
+            try_parse_gradle_notation(r#"implementation("com.google.guava:guava:33.0.0")"#),
+            Some(("com.google.guava:guava@33.0.0".to_string(), None))
+        );
+        assert_eq!(
+            try_parse_gradle_notation("testImplementation('org.junit.jupiter:junit-jupiter:5.10.0')"),
+            Some(("org.junit.jupiter:junit-jupiter@5.10.0".to_string(), Some("test".to_string())))
+        );
+        assert_eq!(
+            try_parse_gradle_notation(r#"compileOnly("org.projectlombok:lombok:1.18.30")"#),
+            Some(("org.projectlombok:lombok@1.18.30".to_string(), Some("provided".to_string())))
+        );
+    }
+
+    #[test]
+    fn gradle_notation_rejects_non_gradle_input() {
+        // A bare coordinate (no function wrapper) is not Gradle notation → None, handed back to the normal parse path.
+        assert_eq!(try_parse_gradle_notation("com.google.guava:guava@33.0.0"), None);
+        // Unknown scope function → None.
+        assert_eq!(try_parse_gradle_notation(r#"unknownScope("g:a:1.0")"#), None);
+    }
+}

@@ -1200,3 +1200,109 @@ fn upload_gpg_signature(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // publish.rs had 0 tests. This batch anchors two groups of pure logic (no network,
+    // no javac):
+    //   1. generate_pom — the sole source of the published .pom (upstream of ADR-009
+    //      raw .pom integrity). Pins three spec invariants: coordinates + project
+    //      version source, test scope excluded from the POM, compile scope omits
+    //      <scope> (Maven default) while non-compile scopes are written explicitly.
+    //   2. checksums — the uploaded .sha256 / .md5 must match the Maven ecosystem, or
+    //      the registry rejects them / downstream verification fails (a publish pollution).
+    //
+    // An isolated tempdir is used (ym.json without `workspaces` → find_workspace_root
+    // returns None, root_cfg is None), so dependency versions take the "direct version"
+    // branch with no workspace-inheritance interference.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn write_cfg(project: &Path, ym_json: &str) -> config::schema::YmConfig {
+        std::fs::write(project.join(config::CONFIG_FILE), ym_json).unwrap();
+        config::load_config(&project.join(config::CONFIG_FILE)).unwrap()
+    }
+
+    #[test]
+    fn generate_pom_writes_coordinates_and_skips_test_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let cfg = write_cfg(
+            project,
+            r#"{"name":"mylib","groupId":"com.example","version":"1.2.3","dependencies":{"com.google.guava:guava":"33.0.0","org.junit.jupiter:junit-jupiter":{"version":"5.10.0","scope":"test"}}}"#,
+        );
+        let pom_path = project.join("out.pom");
+        generate_pom(project, &cfg, &pom_path, None).unwrap();
+        let pom = std::fs::read_to_string(&pom_path).unwrap();
+
+        assert!(pom.contains("<groupId>com.example</groupId>"), "POM:\n{}", pom);
+        assert!(pom.contains("<artifactId>mylib</artifactId>"));
+        assert!(pom.contains("<version>1.2.3</version>"), "project version must come from cfg.version");
+        assert!(pom.contains("<artifactId>guava</artifactId>"), "compile dep must be in the POM");
+        assert!(pom.contains("<version>33.0.0</version>"));
+        assert!(
+            !pom.contains("junit-jupiter"),
+            "test-scope deps must NOT be written to the POM (per spec), got:\n{}", pom
+        );
+    }
+
+    #[test]
+    fn generate_pom_omits_scope_for_compile_emits_for_provided() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let cfg = write_cfg(
+            project,
+            r#"{"name":"mylib","groupId":"com.example","version":"1.0.0","dependencies":{"com.google.guava:guava":"33.0.0","org.projectlombok:lombok":{"version":"1.18.30","scope":"provided"}}}"#,
+        );
+        let pom_path = project.join("out.pom");
+        generate_pom(project, &cfg, &pom_path, None).unwrap();
+        let pom = std::fs::read_to_string(&pom_path).unwrap();
+
+        // compile scope → no <scope> (Maven defaults to compile). Slice out guava's
+        // <dependency> block precisely and assert it contains no <scope>.
+        let guava_at = pom.find("<artifactId>guava</artifactId>").expect("guava dep missing");
+        let block_end = pom[guava_at..].find("</dependency>").unwrap();
+        let guava_block = &pom[guava_at..guava_at + block_end];
+        assert!(
+            !guava_block.contains("<scope>"),
+            "compile scope must not write <scope>, got guava block:\n{}", guava_block
+        );
+        // provided scope → explicit <scope>provided</scope>.
+        assert!(
+            pom.contains("<scope>provided</scope>"),
+            "provided scope must be written explicitly, got:\n{}", pom
+        );
+    }
+
+    #[test]
+    fn generate_pom_version_override_wins_over_cfg_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let cfg = write_cfg(project, r#"{"name":"mylib","groupId":"com.example","version":"1.0.0"}"#);
+        let pom_path = project.join("out.pom");
+        generate_pom(project, &cfg, &pom_path, Some("9.9.9")).unwrap();
+        let pom = std::fs::read_to_string(&pom_path).unwrap();
+        assert!(
+            pom.contains("<version>9.9.9</version>"),
+            "version_override must override cfg.version, got:\n{}", pom
+        );
+        assert!(!pom.contains("<version>1.0.0</version>"), "overridden cfg.version must not appear");
+    }
+
+    /// The uploaded .sha256 / .md5 checksums must match the Maven ecosystem — pin
+    /// the algorithm with the canonical "abc" test vectors (sha256_of_file routes
+    /// through incremental::hash_bytes).
+    #[test]
+    fn checksums_match_canonical_abc_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("data.bin");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(
+            sha256_of_file(&f).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(md5_of_file(&f).unwrap(), "900150983cd24fb0d6963f7d28e17f72");
+    }
+}
