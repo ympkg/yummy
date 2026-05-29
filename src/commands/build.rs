@@ -3891,4 +3891,190 @@ mod tests {
         assert!(names.iter().any(|n| n == "com/example/Lib.class"), "dep class must be flattened to root");
         assert!(names.iter().any(|n| n == "com/example/App.class"), "app class must be flattened to root");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ADR-020 resolve_deps path matrix: runtime proof that the persist column has
+    // exactly one ✓ — the "negative tests".
+    //
+    // 03-package-management.md ("resolve_deps path matrix test requirements" #1)
+    // mandates: the 4 read-only functions (resolve_deps / resolve_deps_with_scopes
+    // / resolve_deps_no_download / resolve_deps_no_download_with_root) must leave
+    // ym-lock.json byte- and mtime-identical; only resolve_and_persist_deps writes.
+    // Testing "writes correctly" is not enough — we must prove "does NOT write when
+    // it shouldn't".
+    //
+    // Isolation: HomeGuard points $HOME at a tempdir so the maven/pom cache lands in
+    // an isolated dir; a mockito scoped registry (matches_scope → repos_for_group_id
+    // returns it exclusively, never appending real Maven Central) fully mocks the POM
+    // + jar — zero real network. The sentinel lockfile's config_hash is deliberately
+    // different from the cfg fingerprint so a real resolve always yields different
+    // bytes; that's what lets "bytes unchanged" distinguish "read-only didn't write"
+    // from "wrote, but content happened to match". Trap: with empty deps,
+    // resolve_deps_inner returns early without touching the lockfile, so the persist
+    // difference is unobservable — hence a non-empty dep to drive a full resolve.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Minimal POM with no transitive deps — BFS terminates after the single artifact.
+    fn adr020_pom() -> String {
+        r#"<?xml version="1.0"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.ymtestadr020</groupId>
+  <artifactId>foo</artifactId>
+  <version>1.0</version>
+</project>"#
+            .to_string()
+    }
+
+    /// A distinct-content lockfile written before each resolve call. Its config_hash
+    /// never matches the cfg fingerprint, so a real resolve always produces different
+    /// bytes — making "bytes unchanged" a meaningful negative (rules out "wrote, but
+    /// content happened to match").
+    fn write_sentinel_lock(lock_path: &Path) -> Vec<u8> {
+        let mut lock = crate::config::schema::Lockfile::default();
+        lock.lockfile_version = 1;
+        lock.version_winner_strategy = "latest-wins".to_string();
+        lock.config_hash = "SENTINEL_NEVER_OVERWRITTEN".to_string();
+        lock.ymc_version = "0.0.0-sentinel".to_string();
+        lock.generated_at = "2000-01-01T00:00:00Z".to_string();
+        let bytes = (serde_json::to_string_pretty(&lock).unwrap() + "\n").into_bytes();
+        std::fs::write(lock_path, &bytes).unwrap();
+        bytes
+    }
+
+    /// Live fixture for an ADR-020 resolve test: `$HOME` redirected to an isolated
+    /// tempdir, a mockito registry serving the foo POM + jar, a single-project
+    /// ym.json depending on `com.ymtestadr020:foo`, and a sentinel lockfile on disk.
+    /// Every guard is kept alive in the struct for the test's duration; field order
+    /// is the teardown order (restore HOME + unlock → stop server → delete tempdirs).
+    struct Adr020Fixture {
+        _home_guard: crate::test_support::HomeGuard,
+        _server: mockito::ServerGuard,
+        _pom: mockito::Mock,
+        _jar: mockito::Mock,
+        _home: tempfile::TempDir,
+        _project: tempfile::TempDir,
+        project_dir: PathBuf,
+        cfg: YmConfig,
+        lock_path: PathBuf,
+        sentinel: Vec<u8>,
+    }
+
+    fn adr020_fixture() -> Adr020Fixture {
+        let home = tempfile::tempdir().unwrap();
+        let home_guard = crate::test_support::HomeGuard::redirect(home.path());
+        // Fast-fail: prove the $HOME redirect actually reaches the cache dir BEFORE any
+        // network/download side effect can pollute the real ~/.ym.
+        assert!(
+            config::maven_cache_dir().starts_with(home.path()),
+            "HOME redirect must steer maven_cache_dir into the tempdir (got {})",
+            config::maven_cache_dir().display(),
+        );
+
+        let mut server = mockito::Server::new();
+        let pom = server
+            .mock("GET", "/com/ymtestadr020/foo/1.0/foo-1.0.pom")
+            .with_status(200)
+            .with_body(adr020_pom())
+            .create();
+        let jar = server
+            .mock("GET", "/com/ymtestadr020/foo/1.0/foo-1.0.jar")
+            .with_status(200)
+            .with_body(b"PK\x03\x04 fake jar bytes".to_vec())
+            .create();
+
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().to_path_buf();
+        let ym_json = format!(
+            r#"{{"name":"adr020","groupId":"com.example","dependencies":{{"com.ymtestadr020:foo":"1.0"}},"registries":{{"mock":{{"url":"{}","scope":"com.ymtestadr020.*"}}}}}}"#,
+            server.url(),
+        );
+        std::fs::write(project_dir.join(config::CONFIG_FILE), ym_json).unwrap();
+        let cfg = config::load_config(&project_dir.join(config::CONFIG_FILE)).unwrap();
+
+        let lock_path = config::lockfile_path(&project_dir);
+        let sentinel = write_sentinel_lock(&lock_path);
+
+        Adr020Fixture {
+            _home_guard: home_guard,
+            _server: server,
+            _pom: pom,
+            _jar: jar,
+            _home: home,
+            _project: project,
+            project_dir,
+            cfg,
+            lock_path,
+            sentinel,
+        }
+    }
+
+    /// Assert the on-disk lockfile is byte-for-byte the sentinel (the read-only
+    /// function did not persist) and that its mtime did not change either.
+    fn assert_lock_untouched(fx: &Adr020Fixture, mtime_before: std::time::SystemTime) {
+        let after = std::fs::read(&fx.lock_path).unwrap();
+        assert_eq!(after, fx.sentinel, "read-only resolve must not rewrite ym-lock.json");
+        let mtime_after = std::fs::metadata(&fx.lock_path).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after, "read-only resolve must not touch ym-lock.json mtime");
+    }
+
+    #[test]
+    fn resolve_deps_is_readonly_does_not_persist_lockfile() {
+        let fx = adr020_fixture();
+        let mtime = std::fs::metadata(&fx.lock_path).unwrap().modified().unwrap();
+        resolve_deps(&fx.project_dir, &fx.cfg)
+            .expect("resolve_deps must succeed against mock registry");
+        assert_lock_untouched(&fx, mtime);
+    }
+
+    #[test]
+    fn resolve_deps_with_scopes_is_readonly_does_not_persist_lockfile() {
+        let fx = adr020_fixture();
+        let mtime = std::fs::metadata(&fx.lock_path).unwrap().modified().unwrap();
+        resolve_deps_with_scopes(&fx.project_dir, &fx.cfg, &["compile"])
+            .expect("resolve_deps_with_scopes must succeed against mock registry");
+        assert_lock_untouched(&fx, mtime);
+    }
+
+    #[test]
+    fn resolve_deps_no_download_is_readonly_does_not_persist_lockfile() {
+        let fx = adr020_fixture();
+        let mtime = std::fs::metadata(&fx.lock_path).unwrap().modified().unwrap();
+        resolve_deps_no_download(&fx.project_dir, &fx.cfg)
+            .expect("resolve_deps_no_download must succeed against mock registry");
+        assert_lock_untouched(&fx, mtime);
+    }
+
+    #[test]
+    fn resolve_deps_no_download_with_root_is_readonly_does_not_persist_lockfile() {
+        let fx = adr020_fixture();
+        let mtime = std::fs::metadata(&fx.lock_path).unwrap().modified().unwrap();
+        let registries = fx.cfg.registry_entries();
+        let resolutions = std::collections::BTreeMap::new();
+        let cache = config::maven_cache_dir();
+        // A single project acts as its own workspace root.
+        resolve_deps_no_download_with_root(
+            &fx.project_dir, &fx.cfg, &fx.cfg, &cache, &registries, &resolutions,
+        )
+        .expect("resolve_deps_no_download_with_root must succeed against mock registry");
+        assert_lock_untouched(&fx, mtime);
+    }
+
+    /// Positive contrast: the one ✓ in the persist column. resolve_and_persist_deps
+    /// MUST write the resolved closure through — otherwise the negative tests above
+    /// could pass merely because resolution silently no-ops.
+    #[test]
+    fn resolve_and_persist_deps_writes_lockfile() {
+        let fx = adr020_fixture();
+        resolve_and_persist_deps(&fx.project_dir, &fx.cfg)
+            .expect("resolve_and_persist_deps must succeed against mock registry");
+        let after = std::fs::read(&fx.lock_path).unwrap();
+        assert_ne!(after, fx.sentinel, "resolve_and_persist_deps must overwrite the sentinel lockfile");
+        let written = String::from_utf8(after).unwrap();
+        assert!(
+            written.contains("com.ymtestadr020:foo:1.0"),
+            "persisted lockfile must contain the resolved dependency, got:\n{}",
+            written,
+        );
+    }
 }

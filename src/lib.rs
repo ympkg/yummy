@@ -836,6 +836,52 @@ fn ymc_main() -> Result<()> {
     dispatch_ymc(cli)
 }
 
+/// Test-only support for redirecting the per-user home directory.
+///
+/// `config::maven_cache_dir()` / `pom_cache_dir()` and `incremental::build_cache_dir()`
+/// all derive from `dirs::home_dir()` (i.e. `$HOME` on Unix). Tests that exercise the
+/// resolver or the build-cache restore path must point those at a tempdir, but `$HOME`
+/// is process-global and `set_var` is `unsafe` under edition 2024 — concurrent mutation
+/// across the shared test binary would race. `ENV_LOCK` serializes every such test; the
+/// `HomeGuard` RAII redirects `$HOME` for the lock's lifetime and restores it on drop.
+/// This is the "$HOME redirect + test serialization" mechanism the incremental.rs follow-up note asks for.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Holds [`ENV_LOCK`] and redirects `$HOME` to `home` until dropped.
+    pub struct HomeGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+    }
+
+    impl HomeGuard {
+        /// Acquire the env lock and point `$HOME` at `home`. Recovers from a poisoned
+        /// lock (a prior test panicked) so one failure doesn't cascade across the suite.
+        pub fn redirect(home: &Path) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", home) };
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(prev) => std::env::set_var("HOME", prev),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
