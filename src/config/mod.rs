@@ -362,4 +362,31 @@ mod tests {
         assert_eq!(written.config_hash, "root_hash_bbbb");
         assert_eq!(written.dependencies.len(), 1);
     }
+
+    #[test]
+    fn save_lockfile_skips_rewrite_when_body_unchanged() {
+        // Derived-cache invariant #3 (write atomicity / no churn): save_lockfile must skip
+        // the write when the lock body (config_hash + deps + version + strategy) is unchanged,
+        // even though `generated_at` is re-stamped each call. Pointless rewrites would dirty
+        // git and churn mtime, which `--frozen-lockfile` freshness logic must not see flap.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = lockfile_path(root);
+
+        let lock = make_lock("hash_stable", &["com.google.guava:guava:33.4.0"]);
+        save_lockfile(root, &lock).unwrap();
+        let mtime1 = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Re-save an identical body: generated_at differs but the skip-check ignores it,
+        // so the file must NOT be rewritten (mtime unchanged — the file was never touched).
+        save_lockfile(root, &lock).unwrap();
+        let mtime2 = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "identical lock body must skip rewrite (no mtime churn)");
+
+        // A genuine change must still be written through.
+        let changed = make_lock("hash_changed", &["com.google.guava:guava:33.4.0"]);
+        save_lockfile(root, &changed).unwrap();
+        let written: Lockfile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.config_hash, "hash_changed", "a changed lock body must be written through");
+    }
 }

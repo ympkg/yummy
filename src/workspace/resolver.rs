@@ -4593,4 +4593,114 @@ mod tests {
         assert_eq!(deps[0].artifact_id, "downstream");
         assert_eq!(deps[0].version, "2.0");
     }
+
+    // ───────────────────────── ADR-022: pom_failures high-water-mark pruning ─────────────────────────
+    //
+    // The BFS records every POM fetch/parse failure into `pom_failures`, then partitions them
+    // against the latest-wins winner before fail-loud: a failure whose version is strictly BELOW
+    // the resolved winner cannot enter the classpath, so it's noise (warn, don't block); a failure
+    // at the winner version is fatal. These drive a mock registry (mockito, already in dev-deps),
+    // mirroring `resolve_transitive_cached_recovers_from_corrupt_cache`.
+    //
+    // Layering note: BFS line ~585 skips any coord whose version is below the current high-water
+    // mark, so a stale version only lands in `pom_failures` if it is fetched BEFORE the winner is
+    // seen. The fixture therefore introduces shared:1.0 at depth 1 (direct dep of host) and
+    // shared:2.0 at depth 2 (via mid), guaranteeing 1.0 is fetched (and 404s) before 2.0 wins.
+
+    /// ADR-022 fix ②: a stale POM failure superseded by a higher winner is pruned to a warning,
+    /// not propagated to fail-loud. The build succeeds and the winner is locked.
+    #[test]
+    fn resolve_inner_prunes_stale_pom_failure_superseded_by_winner() {
+        let host_pom = r#"<?xml version="1.0"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.ymtest022</groupId>
+  <artifactId>host</artifactId>
+  <version>1.0</version>
+  <dependencies>
+    <dependency><groupId>com.ymtest022</groupId><artifactId>shared</artifactId><version>1.0</version></dependency>
+    <dependency><groupId>com.ymtest022</groupId><artifactId>mid</artifactId><version>1.0</version></dependency>
+  </dependencies>
+</project>"#;
+        let mid_pom = r#"<?xml version="1.0"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.ymtest022</groupId>
+  <artifactId>mid</artifactId>
+  <version>1.0</version>
+  <dependencies>
+    <dependency><groupId>com.ymtest022</groupId><artifactId>shared</artifactId><version>2.0</version></dependency>
+  </dependencies>
+</project>"#;
+        let shared2_pom = r#"<?xml version="1.0"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.ymtest022</groupId>
+  <artifactId>shared</artifactId>
+  <version>2.0</version>
+</project>"#;
+
+        let mut server = mockito::Server::new();
+        let _h = server.mock("GET", "/com/ymtest022/host/1.0/host-1.0.pom")
+            .with_status(200).with_body(host_pom).create();
+        let _m = server.mock("GET", "/com/ymtest022/mid/1.0/mid-1.0.pom")
+            .with_status(200).with_body(mid_pom).create();
+        let _s2 = server.mock("GET", "/com/ymtest022/shared/2.0/shared-2.0.pom")
+            .with_status(200).with_body(shared2_pom).create();
+        // The stale loser 404s — must be pruned, not fatal.
+        let _s1 = server.mock("GET", "/com/ymtest022/shared/1.0/shared-1.0.pom")
+            .with_status(404).create();
+
+        let cache_dir = std::env::temp_dir().join(format!("ym_adr022_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let mut deps = BTreeMap::new();
+        deps.insert("com.ymtest022:host".to_string(), "1.0".to_string());
+        let registries = vec![RegistryEntry { url: server.url(), scope: None, username: None, password: None }];
+
+        let mut lock = Lockfile::default();
+        let result = resolve_inner(
+            &deps, &cache_dir, &mut lock, &registries, &[],
+            &BTreeMap::new(), &BTreeMap::new(), &HashMap::new(), false,
+        );
+        let keys: Vec<String> = lock.dependencies.keys().cloned().collect();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        result.expect("stale POM failure (1.0) superseded by winner (2.0) must be pruned, not fatal");
+        assert!(keys.iter().any(|k| k == "com.ymtest022:shared:2.0"),
+            "winner shared:2.0 must be locked; got {:?}", keys);
+        assert!(!keys.iter().any(|k| k == "com.ymtest022:shared:1.0"),
+            "stale shared:1.0 must NOT be locked; got {:?}", keys);
+    }
+
+    /// ADR-022 / ADR-021: a POM failure AT the winner version (no higher version supersedes it)
+    /// is fatal — resolve_inner fails loud, naming the missing GAV.
+    #[test]
+    fn resolve_inner_fatal_when_winner_pom_fetch_fails() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/com/ymtest022/missing/1.0/missing-1.0.pom")
+            .with_status(404).create();
+
+        let cache_dir = std::env::temp_dir().join(format!("ym_adr022_fatal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let mut deps = BTreeMap::new();
+        deps.insert("com.ymtest022:missing".to_string(), "1.0".to_string());
+        let registries = vec![RegistryEntry { url: server.url(), scope: None, username: None, password: None }];
+
+        let mut lock = Lockfile::default();
+        let result = resolve_inner(
+            &deps, &cache_dir, &mut lock, &registries, &[],
+            &BTreeMap::new(), &BTreeMap::new(), &HashMap::new(), false,
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let err = result.expect_err("winner-version POM fetch failure must be fatal (fail-loud)");
+        let msg = err.to_string();
+        assert!(msg.contains("missing"), "fail-loud error must name the missing artifact, got:\n{}", msg);
+        assert!(msg.contains("resolution failed") || msg.contains("POM fetch"),
+            "error must indicate dependency resolution failure, got:\n{}", msg);
+    }
 }

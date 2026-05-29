@@ -3514,4 +3514,381 @@ mod tests {
         assert!(msg.contains("no .class"), "error must explain 0-class, got: {}", msg);
         assert!(msg.contains(".java files"), "error must mention .java sources, got: {}", msg);
     }
+
+    // ───────────────────────── Path A: Spring Boot nested layout (ADR-009 / KR17.1-17.4) ─────────────────────────
+    //
+    // build_release_jar packs directly to a zip; there is no extractable helper, so these are
+    // integration tests that drive the real function and read the produced jar back via
+    // zip::ZipArchive — they hit the packaging path itself, not a helper. Fixtures put a fake
+    // spring-boot-loader jar in the `jars` list so the from_jars branch hits and NO network /
+    // home-dir download is triggered.
+
+    /// 4-byte Java class magic (0xCAFEBABE). Typed &[u8] so make_jar entry slices stay homogeneous.
+    const CLASS_MAGIC: &[u8] = &[0xCA, 0xFE, 0xBA, 0xBE];
+
+    /// Build a minimal jar from (entry-name, content) pairs. Fakes loader / autoconfigure / dep jars.
+    fn make_jar(path: &Path, entries: &[(&str, &[u8])]) {
+        let f = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(f));
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, content) in entries {
+            zip.start_file(*name, opts).unwrap();
+            std::io::Write::write_all(&mut zip, content).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    /// Fake spring-boot-loader jar: launcher class + a DEEP subpackage class (net/protocol/nested)
+    /// + the FileSystemProvider SPI + LICENSE/NOTICE — the four things ADR-009 says must be embedded.
+    fn make_loader_jar(path: &Path) {
+        make_jar(path, &[
+            ("org/springframework/boot/loader/launch/JarLauncher.class", CLASS_MAGIC),
+            ("org/springframework/boot/loader/net/protocol/nested/NestedUrlConnection.class", CLASS_MAGIC),
+            ("META-INF/services/java.nio.file.spi.FileSystemProvider", "org.springframework.boot.loader.nio.file.NestedFileSystemProvider\n".as_bytes()),
+            ("META-INF/LICENSE.txt", "Apache License 2.0\n".as_bytes()),
+            ("META-INF/NOTICE.txt", "Spring Boot\n".as_bytes()),
+        ]);
+    }
+
+    /// Lay down out/classes/ with one app class + one resource (mimics post-compile state).
+    fn setup_app_project(proj: &Path) {
+        let pkg = config::output_classes_dir(proj).join("com").join("example");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("App.class"), CLASS_MAGIC).unwrap();
+        std::fs::write(config::output_classes_dir(proj).join("application.properties"), "server.port=8080\n").unwrap();
+    }
+
+    fn sb_app_config() -> YmConfig {
+        let mut cfg = YmConfig::default();
+        cfg.name = "myapp".to_string();
+        cfg.version = Some("1.0.0".to_string());
+        cfg.main = Some("com.example.App".to_string());
+        cfg.target = Some("21".to_string());
+        cfg
+    }
+
+    fn jar_entry_names(jar_path: &Path) -> Vec<String> {
+        let file = std::fs::File::open(jar_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect()
+    }
+
+    fn read_jar_entry(jar_path: &Path, entry: &str) -> String {
+        let file = std::fs::File::open(jar_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut s = String::new();
+        archive.by_name(entry).unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    /// KR17.2 — full nested layout: loader classes + SPI + LICENSE/NOTICE at root,
+    /// app classes/resources under BOOT-INF/classes/, deps under BOOT-INF/lib/, MANIFEST aligned.
+    #[test]
+    fn test_path_a_produces_spring_boot_nested_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let loader = proj.join("spring-boot-loader-3.5.0.jar");
+        make_loader_jar(&loader);
+        let autoconf = proj.join("spring-boot-autoconfigure-3.5.0.jar");
+        make_jar(&autoconf, &[("org/springframework/boot/autoconfigure/Marker.class", CLASS_MAGIC)]);
+        let guava = proj.join("guava-33.0.0.jar");
+        make_jar(&guava, &[("com/google/common/Foo.class", CLASS_MAGIC)]);
+
+        build_release_jar(proj, &sb_app_config(), &[loader, autoconf, guava], None, None)
+            .expect("Path A packaging must succeed");
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        assert!(jar_path.exists(), "release jar must be produced");
+        let names = jar_entry_names(&jar_path);
+
+        assert!(names.iter().any(|n| n == "org/springframework/boot/loader/launch/JarLauncher.class"),
+            "loader JarLauncher must be embedded at root");
+        assert!(names.iter().any(|n| n == "META-INF/services/java.nio.file.spi.FileSystemProvider"),
+            "FileSystemProvider SPI (nested:// scheme) must be present");
+        assert!(names.iter().any(|n| n == "META-INF/LICENSE.txt"), "Apache LICENSE.txt must be kept");
+        assert!(names.iter().any(|n| n == "META-INF/NOTICE.txt"), "Apache NOTICE.txt must be kept");
+        assert!(names.iter().any(|n| n == "BOOT-INF/classes/com/example/App.class"),
+            "app class must live under BOOT-INF/classes/");
+        assert!(names.iter().any(|n| n == "BOOT-INF/classes/application.properties"),
+            "app resource must live under BOOT-INF/classes/");
+        assert!(names.iter().any(|n| n == "BOOT-INF/lib/guava-33.0.0.jar"),
+            "dependency must be nested under BOOT-INF/lib/");
+
+        let manifest = read_jar_entry(&jar_path, "META-INF/MANIFEST.MF");
+        assert!(manifest.contains("Main-Class: org.springframework.boot.loader.launch.JarLauncher"),
+            "Main-Class must be JarLauncher, got:\n{}", manifest);
+        assert!(manifest.contains("Start-Class: com.example.App"),
+            "Start-Class must be the user main, got:\n{}", manifest);
+        assert!(manifest.contains("Spring-Boot-Version: 3.5.0"),
+            "Spring-Boot-Version inferred from autoconfigure jar, got:\n{}", manifest);
+        assert!(manifest.contains("Spring-Boot-Classes: BOOT-INF/classes/"));
+        assert!(manifest.contains("Spring-Boot-Lib: BOOT-INF/lib/"));
+        assert!(manifest.contains("Spring-Boot-Classpath-Index: BOOT-INF/classpath.idx"));
+    }
+
+    /// KR17.2 — BOOT-INF/lib/*.jar MUST be STORED (uncompressed). DEFLATED makes
+    /// spring-boot-loader throw "Unable to open nested entry" at runtime.
+    #[test]
+    fn test_path_a_boot_inf_lib_entries_are_stored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let loader = proj.join("spring-boot-loader-3.5.0.jar");
+        make_loader_jar(&loader);
+        let guava = proj.join("guava-33.0.0.jar");
+        make_jar(&guava, &[("com/google/common/Foo.class", CLASS_MAGIC)]);
+
+        build_release_jar(proj, &sb_app_config(), &[loader, guava], None, None).unwrap();
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        let file = std::fs::File::open(&jar_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let lib = archive.by_name("BOOT-INF/lib/guava-33.0.0.jar").unwrap();
+        assert_eq!(lib.compression(), zip::CompressionMethod::Stored,
+            "BOOT-INF/lib/*.jar must be STORED, was {:?}", lib.compression());
+    }
+
+    /// KR17.2 — classpath.idx strict format: each line `- "BOOT-INF/lib/<jar>"`.
+    #[test]
+    fn test_path_a_classpath_idx_strict_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let loader = proj.join("spring-boot-loader-3.5.0.jar");
+        make_loader_jar(&loader);
+        let guava = proj.join("guava-33.0.0.jar");
+        make_jar(&guava, &[("com/google/common/Foo.class", CLASS_MAGIC)]);
+
+        build_release_jar(proj, &sb_app_config(), &[loader, guava], None, None).unwrap();
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        let idx = read_jar_entry(&jar_path, "BOOT-INF/classpath.idx");
+        assert!(idx.contains("- \"BOOT-INF/lib/guava-33.0.0.jar\""),
+            "classpath.idx must use strict `- \"BOOT-INF/lib/<jar>\"` format, got:\n{}", idx);
+    }
+
+    /// KR17.2 — the loader jar itself must NOT be nested under BOOT-INF/lib/; its classes
+    /// are extracted to the root instead.
+    #[test]
+    fn test_path_a_excludes_loader_jar_from_boot_inf_lib() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let loader = proj.join("spring-boot-loader-3.5.0.jar");
+        make_loader_jar(&loader);
+        let guava = proj.join("guava-33.0.0.jar");
+        make_jar(&guava, &[("com/google/common/Foo.class", CLASS_MAGIC)]);
+
+        build_release_jar(proj, &sb_app_config(), &[loader, guava], None, None).unwrap();
+
+        let names = jar_entry_names(&proj.join("out").join("release").join("myapp-1.0.0.jar"));
+        assert!(!names.iter().any(|n| n == "BOOT-INF/lib/spring-boot-loader-3.5.0.jar"),
+            "loader jar must NOT be nested in BOOT-INF/lib/");
+        assert!(names.iter().any(|n| n == "org/springframework/boot/loader/launch/JarLauncher.class"),
+            "loader classes must be at root instead");
+    }
+
+    /// KR17.2 — loader classes copied recursively incl. deep subpackages
+    /// (net/protocol/nested/...). Missing any subdir → ClassNotFoundException at runtime.
+    #[test]
+    fn test_path_a_embeds_loader_deep_subpackages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let loader = proj.join("spring-boot-loader-3.5.0.jar");
+        make_loader_jar(&loader);
+
+        build_release_jar(proj, &sb_app_config(), &[loader], None, None).unwrap();
+
+        let names = jar_entry_names(&proj.join("out").join("release").join("myapp-1.0.0.jar"));
+        assert!(names.iter().any(|n| n == "org/springframework/boot/loader/net/protocol/nested/NestedUrlConnection.class"),
+            "deep loader subpackage class must be embedded recursively, got: {:?}", names);
+    }
+
+    /// KR17.4 — two deps resolving to the same BOOT-INF/lib/ filename must bail loudly,
+    /// listing the offending entry, instead of letting the zip writer throw a path-less error.
+    #[test]
+    fn test_path_a_duplicate_boot_inf_lib_entry_bails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let loader = proj.join("spring-boot-loader-3.5.0.jar");
+        make_loader_jar(&loader);
+        let a = proj.join("a");
+        let b = proj.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let dup_a = a.join("guava-33.0.0.jar");
+        let dup_b = b.join("guava-33.0.0.jar");
+        make_jar(&dup_a, &[("com/google/common/A.class", CLASS_MAGIC)]);
+        make_jar(&dup_b, &[("com/google/common/B.class", CLASS_MAGIC)]);
+
+        let err = build_release_jar(proj, &sb_app_config(), &[loader, dup_a, dup_b], None, None)
+            .expect_err("duplicate BOOT-INF/lib/ filename must bail");
+        let msg = err.to_string();
+        assert!(msg.contains("Duplicate entry") || msg.contains("Duplicate entries"),
+            "error must mention Duplicate, got: {}", msg);
+        assert!(msg.contains("guava-33.0.0.jar"), "error must name the duplicated entry, got: {}", msg);
+    }
+
+    /// KR17.1 — dispatch + fallback.
+    /// DEVIATION NOTE (spec-code): ADR-009 KR17.1 specifies dispatch by "fat-jar closure contains
+    /// org.springframework.boot:spring-boot core artifact". The implementation instead dispatches by
+    /// "can a spring-boot-loader jar be located (in jars, cache, or downloadable via autoconfigure
+    /// version)". With neither loader nor autoconfigure present it falls back to the flat/uber layout
+    /// (Path B). This pins the CURRENT behavior; if KR17.1 dispatch is later aligned to the spec,
+    /// update this test.
+    #[test]
+    fn test_path_a_falls_back_to_flat_when_no_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let plain = proj.join("guava-33.0.0.jar");
+        make_jar(&plain, &[("com/google/common/Foo.class", CLASS_MAGIC)]);
+
+        build_release_jar(proj, &sb_app_config(), &[plain], None, None).unwrap();
+
+        let names = jar_entry_names(&proj.join("out").join("release").join("myapp-1.0.0.jar"));
+        assert!(names.iter().any(|n| n == "com/example/App.class"),
+            "flat layout puts app classes at the root, got: {:?}", names);
+        assert!(!names.iter().any(|n| n.starts_with("BOOT-INF/")),
+            "fallback must NOT produce BOOT-INF/ layout, got: {:?}", names);
+    }
+
+    /// DEVIATION NOTE (spec-code): ADR-009 says "layers.idx 暂不生成 (P2)", but the implementation
+    /// DOES generate BOOT-INF/layers.idx and writes Spring-Boot-Layers-Index into the MANIFEST.
+    /// Pinning current behavior — layers.idx is harmless and matches spring-boot-maven-plugin's
+    /// default; spec ADR-009 should be updated to match (or the impl reverted).
+    #[test]
+    fn test_path_a_generates_layers_idx_currently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let loader = proj.join("spring-boot-loader-3.5.0.jar");
+        make_loader_jar(&loader);
+
+        build_release_jar(proj, &sb_app_config(), &[loader], None, None).unwrap();
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        let names = jar_entry_names(&jar_path);
+        assert!(names.iter().any(|n| n == "BOOT-INF/layers.idx"),
+            "impl currently generates layers.idx (spec ADR-009 says deferred)");
+        let manifest = read_jar_entry(&jar_path, "META-INF/MANIFEST.MF");
+        assert!(manifest.contains("Spring-Boot-Layers-Index: BOOT-INF/layers.idx"),
+            "impl writes Spring-Boot-Layers-Index (spec's MANIFEST field list omits it)");
+    }
+
+    // ───────────────────────── Path B: flat/uber layout (ADR-009 / KR17.3) ─────────────────────────
+    //
+    // build_release_jar_flat is the non-Spring-Boot path (and the no-loader fallback). It merges
+    // dependency jars flat into an uber jar via a staging dir, applying Shadow-style transformers.
+    // Driven directly (module-private, reachable via `use super::*`).
+
+    /// KR17.3 — whitelist merge: META-INF/services/*, spring.factories, spring/*.imports from
+    /// multiple jars are concatenated (line-deduped), not dropped by first-wins.
+    #[test]
+    fn test_path_b_merges_services_and_spring_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let dep1 = proj.join("dep1.jar");
+        make_jar(&dep1, &[
+            ("META-INF/services/com.example.Service", "com.example.Impl1\n".as_bytes()),
+            ("META-INF/spring.factories", "feature.x=enabled\n".as_bytes()),
+            ("META-INF/spring/org.example.AutoConfiguration.imports", "com.example.AutoA\n".as_bytes()),
+        ]);
+        let dep2 = proj.join("dep2.jar");
+        make_jar(&dep2, &[
+            ("META-INF/services/com.example.Service", "com.example.Impl2\n".as_bytes()),
+            ("META-INF/spring.factories", "feature.y=enabled\n".as_bytes()),
+            ("META-INF/spring/org.example.AutoConfiguration.imports", "com.example.AutoB\n".as_bytes()),
+        ]);
+
+        build_release_jar_flat(proj, &sb_app_config(), &[dep1, dep2], None, None).unwrap();
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        let services = read_jar_entry(&jar_path, "META-INF/services/com.example.Service");
+        assert!(services.contains("com.example.Impl1") && services.contains("com.example.Impl2"),
+            "services file must merge both impls, got:\n{}", services);
+        let factories = read_jar_entry(&jar_path, "META-INF/spring.factories");
+        assert!(factories.contains("feature.x=enabled") && factories.contains("feature.y=enabled"),
+            "spring.factories must merge both, got:\n{}", factories);
+        let imports = read_jar_entry(&jar_path, "META-INF/spring/org.example.AutoConfiguration.imports");
+        assert!(imports.contains("com.example.AutoA") && imports.contains("com.example.AutoB"),
+            "*.imports must merge both, got:\n{}", imports);
+    }
+
+    /// KR17.3 — blacklist discard: dependency MANIFEST.MF, INDEX.LIST and signature blocks
+    /// (*.SF/*.DSA/*.RSA) are dropped; normal classes are kept.
+    #[test]
+    fn test_path_b_discards_manifest_index_and_signatures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let dep = proj.join("signed.jar");
+        make_jar(&dep, &[
+            ("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\nFrom-Dep: leak\n".as_bytes()),
+            ("META-INF/INDEX.LIST", "JarIndex-Version: 1.0\n".as_bytes()),
+            ("META-INF/SIG.SF", "Signature-Version: 1.0\n".as_bytes()),
+            ("META-INF/SIG.RSA", "rsa-sig\n".as_bytes()),
+            ("META-INF/SIG.DSA", "dsa-sig\n".as_bytes()),
+            ("com/example/Real.class", CLASS_MAGIC),
+        ]);
+
+        build_release_jar_flat(proj, &sb_app_config(), &[dep], None, None).unwrap();
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        let names = jar_entry_names(&jar_path);
+        assert!(!names.iter().any(|n| n == "META-INF/INDEX.LIST"), "INDEX.LIST must be discarded");
+        assert!(!names.iter().any(|n| n == "META-INF/SIG.SF"), "*.SF signature must be discarded");
+        assert!(!names.iter().any(|n| n == "META-INF/SIG.RSA"), "*.RSA signature must be discarded");
+        assert!(!names.iter().any(|n| n == "META-INF/SIG.DSA"), "*.DSA signature must be discarded");
+        assert!(names.iter().any(|n| n == "com/example/Real.class"), "normal class must be kept");
+        let manifest = read_jar_entry(&jar_path, "META-INF/MANIFEST.MF");
+        assert!(!manifest.contains("From-Dep: leak"), "dependency MANIFEST.MF must not leak, got:\n{}", manifest);
+    }
+
+    /// KR17.3 — non-mergeable same-path entry: first writer wins. App classes are staged first,
+    /// then deps in order; here two deps carry the same class path and dep1 must win.
+    #[test]
+    fn test_path_b_first_writer_wins_on_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let dep1 = proj.join("dep1.jar");
+        make_jar(&dep1, &[("com/example/Dup.class", "FROM_DEP1".as_bytes())]);
+        let dep2 = proj.join("dep2.jar");
+        make_jar(&dep2, &[("com/example/Dup.class", "FROM_DEP2".as_bytes())]);
+
+        build_release_jar_flat(proj, &sb_app_config(), &[dep1, dep2], None, None).unwrap();
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        let dup = read_jar_entry(&jar_path, "com/example/Dup.class");
+        assert_eq!(dup, "FROM_DEP1", "first writer (dep1) must win the conflict");
+    }
+
+    /// KR17.3 — final MANIFEST is ym-generated (Main-Class + Implementation-*) and the layout
+    /// is flat (no BOOT-INF/, deps + app classes flattened to root).
+    #[test]
+    fn test_path_b_generates_flat_uber_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path();
+        setup_app_project(proj);
+        let dep = proj.join("dep.jar");
+        make_jar(&dep, &[("com/example/Lib.class", CLASS_MAGIC)]);
+
+        build_release_jar_flat(proj, &sb_app_config(), &[dep], None, None).unwrap();
+
+        let jar_path = proj.join("out").join("release").join("myapp-1.0.0.jar");
+        let manifest = read_jar_entry(&jar_path, "META-INF/MANIFEST.MF");
+        assert!(manifest.contains("Main-Class: com.example.App"), "must set user Main-Class, got:\n{}", manifest);
+        assert!(manifest.contains("Implementation-Title: myapp"), "must carry Implementation-Title, got:\n{}", manifest);
+        assert!(manifest.contains("Implementation-Version: 1.0.0"), "must carry Implementation-Version, got:\n{}", manifest);
+
+        let names = jar_entry_names(&jar_path);
+        assert!(!names.iter().any(|n| n.starts_with("BOOT-INF/")), "Path B must be flat (no BOOT-INF/)");
+        assert!(names.iter().any(|n| n == "com/example/Lib.class"), "dep class must be flattened to root");
+        assert!(names.iter().any(|n| n == "com/example/App.class"), "app class must be flattened to root");
+    }
 }
