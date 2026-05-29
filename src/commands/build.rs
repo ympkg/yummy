@@ -1833,9 +1833,9 @@ fn build_release_jar_flat(project: &Path, cfg: &YmConfig, jars: &[PathBuf], outp
 }
 
 
-/// 通过插件系统执行打包。
-/// 解析 plugins，下载插件 JAR，启动 JVM 执行 ConfigRunner，
-/// 由插件决定如何打包（Spring Boot JAR、fat JAR 等）。
+/// Run packaging via the plugin system.
+/// Resolves plugins, downloads plugin JARs, starts a JVM to run ConfigRunner,
+/// and lets the plugin decide how to package (Spring Boot JAR, fat JAR, etc.).
 /// Ensure spring-boot-loader JAR is downloaded to Maven cache.
 /// Called before plugin-based packaging so the plugin can find it.
 fn ensure_spring_boot_loader(jars: &[PathBuf]) {
@@ -1899,20 +1899,20 @@ pub fn build_with_plugins(
         jar_name,
     );
 
-    // 收集插件 JAR 的 classpath
+    // Collect the plugin JARs' classpath
     let plugin_cp = resolve_plugin_classpath(project, cfg)?;
     if plugin_cp.is_empty() {
         bail!("No plugin JARs found. Ensure plugins are installed.");
     }
 
-    // runtime classpath 字符串
+    // runtime classpath string
     let runtime_cp: String = runtime_jars.iter()
         .filter(|j| j.exists())
         .map(|j| j.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join(":");
 
-    // java 可执行文件
+    // java executable
     let java_home = jvm::ensure_jdk(cfg.target.as_deref().unwrap_or("25"), None, false)?;
     let java = if java_home.as_os_str() == "system" {
         PathBuf::from("java")
@@ -1920,7 +1920,7 @@ pub fn build_with_plugins(
         java_home.join("bin").join("java")
     };
 
-    // ym.json 序列化为临时文件，传给 ConfigRunner
+    // Serialize ym.json to a temp file and pass it to ConfigRunner
     let config_json_path = project.join("out").join(".ym-config.json");
     if let Some(parent) = config_json_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1930,14 +1930,14 @@ pub fn build_with_plugins(
 
     let pack_start = Instant::now();
 
-    // 检查是否有 ym.config.java，复制为合法文件名后编译
+    // If ym.config.java exists, copy it to a valid filename and compile it
     let ym_config_java = project.join("ym.config.java");
     let mut extra_cp = String::new();
     if ym_config_java.exists() {
         let config_out = project.join("out").join(".ym-config-classes");
         std::fs::create_dir_all(&config_out)?;
 
-        // ym.config.java → YmConfig.java（合法 Java 文件名）
+        // ym.config.java -> YmConfig.java (a valid Java filename)
         let temp_source = config_out.join("YmConfig.java");
         std::fs::copy(&ym_config_java, &temp_source)?;
 
@@ -1959,7 +1959,7 @@ pub fn build_with_plugins(
         extra_cp = format!(":{}", config_out.display());
     }
 
-    // 调用 ym.internal.ConfigRunner
+    // Invoke ym.internal.ConfigRunner
     let full_cp = format!("{}{}", plugin_cp, extra_cp);
     let status = std::process::Command::new(&java)
         .arg("--enable-preview")
@@ -1979,7 +1979,7 @@ pub fn build_with_plugins(
         bail!("Plugin execution failed (exit code: {})", status.status.code().unwrap_or(-1));
     }
 
-    // 解析 Build Plan JSON（stdout）
+    // Parse the Build Plan JSON (stdout)
     let build_plan = String::from_utf8_lossy(&status.stdout);
     eprintln!(
         "{} Build Plan received ({} bytes)",
@@ -1987,9 +1987,9 @@ pub fn build_with_plugins(
         build_plan.len()
     );
 
-    // TODO: 解析 Build Plan JSON，执行 Task DAG
-    // 当前阶段：直接交给插件 Task 在 JVM 中执行完成
-    // 后续：ym 核心解析 DAG 并调度
+    // TODO: parse the Build Plan JSON and execute the Task DAG.
+    // For now: the plugin Task runs to completion inside the JVM directly.
+    // Later: the ym core parses the DAG and schedules it.
 
     let pack_elapsed = pack_start.elapsed();
     let output_jar = project.join("out").join("release").join(&jar_name);
@@ -3756,7 +3756,7 @@ mod tests {
             "fallback must NOT produce BOOT-INF/ layout, got: {:?}", names);
     }
 
-    /// DEVIATION NOTE (spec-code): ADR-009 says "layers.idx 暂不生成 (P2)", but the implementation
+    /// DEVIATION NOTE (spec-code): ADR-009 says "layers.idx not generated yet (P2)", but the implementation
     /// DOES generate BOOT-INF/layers.idx and writes Spring-Boot-Layers-Index into the MANIFEST.
     /// Pinning current behavior — layers.idx is harmless and matches spring-boot-maven-plugin's
     /// default; spec ADR-009 should be updated to match (or the impl reverted).

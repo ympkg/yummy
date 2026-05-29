@@ -2407,10 +2407,11 @@ mod tests {
     //     javac, so they are deferred together.
     // ========================================================================
 
-    /// 构造「前次构建成功后留下的状态」:写源、写假合法 .class、写匹配的
-    /// fingerprint(source_hash + mtime 与源一致,确保下一次跑 `get_changed_files`
-    /// 返回 `changed = []`)。**不写 manifest** —— 让调用方按需决定是否 seed
-    /// manifest,以触发 fast-path 或落入下游 up-to-date 路径。
+    /// Construct "the state left behind after a successful prior build": write the source,
+    /// a fake-but-valid .class, and a matching fingerprint (source_hash + mtime agree with
+    /// the source so the next `get_changed_files` returns `changed = []`). **Does NOT write
+    /// a manifest** — the caller decides whether to seed one, to trigger the fast-path or
+    /// fall through to the downstream up-to-date path.
     fn seed_prior_build(
         src_dir: &Path,
         output_dir: &Path,
@@ -2451,13 +2452,14 @@ mod tests {
         }
     }
 
-    /// 路径 = manifest fast-path / 不变式 = 触发并 early-return UpToDate
+    /// path = manifest fast-path / invariant = triggers and early-returns UpToDate
     ///
-    /// 前次构建写了 manifest + fingerprint + .class 都和现源对齐 → 本次入口直
-    /// 接走 fast-path(L497-508),javac 永不调到(pool=None 时若真进入编译
-    /// 路径会因 javac 不可用 panic;成功返回 UpToDate 即等价于路径短路)。
-    /// 强不变式:fast-path early-return 在 `prune_orphan_classes` 与
-    /// `BuildManifest::write` 之前 —— 故 manifest 字节不变。
+    /// The prior build wrote a manifest + fingerprint + .class all aligned with the current
+    /// source → this entry takes the fast-path directly (L497-508); javac is never called
+    /// (with pool=None, actually entering the compile path would panic on the missing javac,
+    /// so a successful UpToDate is equivalent to the short-circuit). Strong invariant: the
+    /// fast-path early-return precedes `prune_orphan_classes` and `BuildManifest::write` — so
+    /// the manifest stays byte-identical.
     #[test]
     fn test_manifest_fastpath_short_circuits_when_prior_manifest_consistent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2478,25 +2480,26 @@ mod tests {
         assert_eq!(
             result.outcome,
             super::super::CompileOutcome::UpToDate,
-            "fast-path 触发时必须 early-return UpToDate"
+            "when the fast-path triggers it must early-return UpToDate"
         );
         let manifest_after = std::fs::read(fp_dir.join(BUILD_MANIFEST_FILE)).unwrap();
         assert_eq!(
             manifest_before, manifest_after,
-            "fast-path early-return 不应触达 Stage 4 manifest write — 字节必须不变"
+            "the fast-path early-return must not reach the Stage 4 manifest write — bytes must be unchanged"
         );
     }
 
-    /// 路径 = manifest fast-path / 不变式 = 源集变化时绕过 fast-path
+    /// path = manifest fast-path / invariant = a changed source set bypasses the fast-path
     ///
-    /// `is_consistent_with` 第一关:`curr.len() != prior.len()` 即返回 false
-    /// (L947-949)。manifest 记录 [A, B] 而现源仅 A → fast-path 绕过 → 落入
-    /// `prune_orphan_classes`(Stage 1)清掉 B.class orphan → 进入 has_classes
-    /// 分支 → `changed=[]` + `missing=[]` → 走 up-to-date(L572-603)→ Stage 4
-    /// 复写新 manifest 仅含 A。
+    /// `is_consistent_with`'s first gate: `curr.len() != prior.len()` returns false
+    /// (L947-949). The manifest records [A, B] but the current source is only A → fast-path
+    /// bypassed → falls into `prune_orphan_classes` (Stage 1) which clears the B.class orphan
+    /// → enters the has_classes branch → `changed=[]` + `missing=[]` → takes up-to-date
+    /// (L572-603) → Stage 4 rewrites a new manifest containing only A.
     ///
-    /// 验证两条不变式:① fast-path 真的绕过(manifest 被复写为单源)②
-    /// PrePrune 在下游路径前真的跑了(orphan B.class 被清掉)。
+    /// Verifies two invariants: (1) the fast-path is really bypassed (the manifest is
+    /// rewritten to a single source) (2) PrePrune really ran before the downstream path
+    /// (the B.class orphan was cleared).
     #[test]
     fn test_manifest_fastpath_bypassed_when_source_set_shrinks() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2505,11 +2508,11 @@ mod tests {
         let output_dir = tmp.path().join("out");
         let fp_dir = fingerprint_dir_for(&cache, &output_dir);
 
-        // 现源:仅 A.java + A.class
+        // Current source: only A.java + A.class
         let a = seed_prior_build(&src_dir, &output_dir, &fp_dir, "com/example/A.java");
 
-        // 前次构建留下的 B.java 已删除,但 B.class 还在 output_dir(orphan),
-        // 同时 fingerprints 内还有 B 的旧条目(prior build 记录过 B)。
+        // The prior build's B.java has been deleted, but B.class is still in output_dir
+        // (orphan), and fingerprints still holds B's stale entry (the prior build recorded B).
         let b_phantom = src_dir.join("com/example/B.java");
         let b_class = output_dir.join("com/example/B.class");
         std::fs::write(&b_class, build_test_class(&[0xB1])).unwrap();
@@ -2517,7 +2520,7 @@ mod tests {
         fp.update_source(&b_phantom, "stale-b-hash", 1);
         fp.save(&fp_dir).unwrap();
 
-        // manifest 记录的源集是 [A, B],但 B.java 物理上不存在
+        // The manifest's recorded source set is [A, B], but B.java does not physically exist
         BuildManifest::write(&fp_dir, &output_dir, &[a, b_phantom.clone()]).unwrap();
         assert!(!b_phantom.exists());
 
@@ -2531,28 +2534,28 @@ mod tests {
         assert_eq!(
             manifest.source_paths.len(),
             1,
-            "fast-path 绕过后,下游 up-to-date 路径必须复写 manifest 反映现源集"
+            "after the fast-path is bypassed, the downstream up-to-date path must rewrite the manifest to reflect the current source set"
         );
         assert!(manifest.source_paths[0].ends_with("A.java"));
 
         assert!(
             !b_class.exists(),
-            "PrePrune (ADR-019) 必须在每条非 fast-path 路径上清掉 B.class orphan"
+            "PrePrune (ADR-019) must clear the B.class orphan on every non-fast-path route"
         );
     }
 
-    /// 路径 = manifest fast-path / 不变式 = 记录的 .class 缺失时绕过 fast-path
+    /// path = manifest fast-path / invariant = a missing recorded .class bypasses the fast-path
     ///
-    /// `is_consistent_with` 第二关:遍历 `class_paths`,任一文件不存在即返回
-    /// false(L956-961)。模拟用户 `rm -rf out/` 但 fingerprint 没清(老版本 ym
-    /// 或测试场景),fast-path 必须绕过避免「manifest 说我编译过但 .class 已不
-    /// 在」的静默失败。
+    /// `is_consistent_with`'s second gate: it walks `class_paths` and returns false if any
+    /// file is missing (L956-961). Simulating a user `rm -rf out/` without clearing the
+    /// fingerprint (old ym version or a test scenario), the fast-path must bypass to avoid the
+    /// silent failure of "the manifest says I compiled but the .class is gone".
     ///
-    /// 绕过后:`has_classes=false` → 进 cache-restore 分支 → 测试环境 cache miss
-    /// → 必然进入 `compile_files` 调 javac。pool=None + 测试环境无 javac 时
-    /// `compile_files` 会因 `Command::new("javac")` spawn 失败抛错,这也算 fast-
-    /// path 被绕过的反向实证(任何非 UpToDate / Cached 的结局都说明走到了编
-    /// 译路径)。
+    /// After the bypass: `has_classes=false` → enters the cache-restore branch → the test env
+    /// is a cache miss → necessarily reaches `compile_files` which calls javac. With pool=None
+    /// and no javac in the test env, `compile_files` errors because `Command::new("javac")`
+    /// fails to spawn — which also counts as proof the fast-path was bypassed (any outcome
+    /// other than UpToDate / Cached means we reached the compile path).
     #[test]
     fn test_manifest_fastpath_bypassed_when_recorded_class_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2564,7 +2567,7 @@ mod tests {
         let java = seed_prior_build(&src_dir, &output_dir, &fp_dir, "com/example/A.java");
         BuildManifest::write(&fp_dir, &output_dir, &[java]).unwrap();
 
-        // 用户外部清掉 A.class —— manifest.class_paths 与磁盘不一致
+        // The user externally removes A.class — manifest.class_paths now disagrees with disk
         let a_class = output_dir.join("com/example/A.class");
         std::fs::remove_file(&a_class).unwrap();
 
@@ -2576,22 +2579,22 @@ mod tests {
                 assert_ne!(
                     r.outcome,
                     super::super::CompileOutcome::UpToDate,
-                    "manifest 记录的 class 缺失时 fast-path 必须绕过,不能返回 UpToDate"
+                    "when a manifest-recorded class is missing the fast-path must bypass, not return UpToDate"
                 );
             }
             Err(_) => {
-                // 测试环境无 javac → compile_files 抛错,同样证明走到了编译路径
+                // No javac in the test env → compile_files errors, which equally proves we reached the compile path
             }
         }
     }
 
-    /// 路径 = up-to-date / 不变式 = Stage 4 写 manifest 供下次 fast-path
+    /// path = up-to-date / invariant = Stage 4 writes the manifest for the next fast-path
     ///
-    /// 前次构建留下 fingerprint + .class 但没写 manifest(模拟 ADR-014 之前的
-    /// 老版本 ym 升级场景)。本次跑:fast-path load manifest 返回 None → 绕过
-    /// → has_classes=true + changed=[] + missing=[] → 进入 up-to-date(L589-
-    /// 603)。Stage 4 必须落盘 manifest(L594-596),否则下次跑还是 up-to-date,
-    /// fast-path 永远命不中。
+    /// The prior build left a fingerprint + .class but wrote no manifest (simulating an
+    /// upgrade from a pre-ADR-014 old ym version). This run: the fast-path loads the manifest
+    /// as None → bypass → has_classes=true + changed=[] + missing=[] → enters up-to-date
+    /// (L589-603). Stage 4 must persist the manifest (L594-596), otherwise the next run is
+    /// still up-to-date and the fast-path never hits.
     #[test]
     fn test_up_to_date_path_writes_manifest_for_next_fastpath() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2603,7 +2606,7 @@ mod tests {
         seed_prior_build(&src_dir, &output_dir, &fp_dir, "com/example/A.java");
         assert!(
             !fp_dir.join(BUILD_MANIFEST_FILE).exists(),
-            "测试前提:fp_dir 中不能有 manifest,否则第一次跑就走 fast-path 了"
+            "test precondition: fp_dir must have no manifest, else the first run takes the fast-path"
         );
 
         let config = minimal_config(&src_dir, &output_dir);
@@ -2613,26 +2616,26 @@ mod tests {
         assert_eq!(
             result.outcome,
             super::super::CompileOutcome::UpToDate,
-            "源 + class + fingerprint 全一致 → 应走 up-to-date 路径"
+            "source + class + fingerprint all consistent → should take the up-to-date path"
         );
         assert!(
             fp_dir.join(BUILD_MANIFEST_FILE).exists(),
-            "up-to-date 路径 Stage 4 必须落盘 manifest,否则下次跑无法走 fast-path"
+            "up-to-date path Stage 4 must persist the manifest, else the next run cannot take the fast-path"
         );
     }
 
-    /// 跨 build e2e:up-to-date → fast-path 链路幂等
+    /// cross-build e2e: up-to-date → fast-path chain is idempotent
     ///
-    /// spec 04-compiler.md L156 强制「manifest 落盘 + 下次 fast-path 命中」这
-    /// 类跨多次 build 才能观察的不变式必须 e2e 集成测试。
+    /// spec 04-compiler.md L156 mandates that cross-build-observable invariants like "manifest
+    /// persisted + next fast-path hits" have e2e integration tests.
     ///
-    /// Round 1:无 manifest → 走 up-to-date → Stage 4 写 manifest
-    /// Round 2:有 manifest → 走 fast-path → early-return,*不复写* manifest
+    /// Round 1: no manifest → takes up-to-date → Stage 4 writes the manifest
+    /// Round 2: manifest present → takes the fast-path → early-return, does *not* rewrite the manifest
     ///
-    /// 两个 outcome 都是 UpToDate,但走的是不同路径。通过「Round 2 后 manifest
-    /// 字节与 Round 1 后完全一致」反推:Round 2 命中的是 fast-path(若 Round 2
-    /// 又走 up-to-date 会调 `BuildManifest::write`,后者带新的 `completed_at`
-    /// 时间戳,字节必变)。
+    /// Both outcomes are UpToDate, but via different paths. We infer from "the manifest bytes
+    /// after Round 2 are identical to after Round 1" that Round 2 hit the fast-path (had Round 2
+    /// taken up-to-date again it would call `BuildManifest::write`, whose new `completed_at`
+    /// timestamp would necessarily change the bytes).
     #[test]
     fn test_up_to_date_then_fastpath_chain_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2644,43 +2647,45 @@ mod tests {
         seed_prior_build(&src_dir, &output_dir, &fp_dir, "com/example/A.java");
         let config = minimal_config(&src_dir, &output_dir);
 
-        // Round 1 — up-to-date 路径
+        // Round 1 — up-to-date path
         let r1 = incremental_compile(&config, &cache, None).unwrap();
         assert_eq!(r1.outcome, super::super::CompileOutcome::UpToDate);
         let manifest_after_r1 = std::fs::read(fp_dir.join(BUILD_MANIFEST_FILE)).unwrap();
 
-        // 确保两次跑之间 `completed_at` 真有可能不同 —— manifest 用秒级时间戳,
-        // 同一秒内复写字节仍可能相同,这会让本测试无法区分 fast-path / up-to-
-        // date。睡 1.1 秒强制跨秒边界,让 up-to-date(若误命中)会写出不同字节。
+        // Ensure `completed_at` can actually differ between the two runs — the manifest uses
+        // a second-granularity timestamp, so a rewrite within the same second could still
+        // produce identical bytes, which would defeat this test's fast-path / up-to-date
+        // distinction. Sleep 1.1s to force a second boundary, so up-to-date (if wrongly hit)
+        // writes different bytes.
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        // Round 2 — 应走 fast-path
+        // Round 2 — should take the fast-path
         let r2 = incremental_compile(&config, &cache, None).unwrap();
         assert_eq!(r2.outcome, super::super::CompileOutcome::UpToDate);
         let manifest_after_r2 = std::fs::read(fp_dir.join(BUILD_MANIFEST_FILE)).unwrap();
 
         assert_eq!(
             manifest_after_r1, manifest_after_r2,
-            "Round 2 必须走 fast-path(不复写 manifest)而非 up-to-date(会复写 \
-             带新时间戳的 manifest)。字节相等是 fast-path 命中的反向实证"
+            "Round 2 must take the fast-path (no manifest rewrite), not up-to-date (which would \
+             rewrite the manifest with a new timestamp). Equal bytes are the proof the fast-path hit"
         );
     }
 
-    /// 路径 = up-to-date / 不变式 = Stage 1 PrePrune 必须在 early-return 之前跑
+    /// path = up-to-date / invariant = Stage 1 PrePrune must run before the early-return
     ///
-    /// ADR-019 主回归测试,作为路径矩阵中 up-to-date 行 Stage 1 列 ✓ 的实证锚
-    /// 点。具体测试在文件上方的
-    /// `test_incremental_compile_prunes_orphan_class_when_source_deleted`,本注释
-    /// 仅为矩阵 grep 时能定位到。
+    /// The ADR-019 main regression test, serving as the evidence anchor for the up-to-date
+    /// row × Stage 1 column ✓ in the path matrix. The actual test is
+    /// `test_incremental_compile_prunes_orphan_class_when_source_deleted` above; this comment
+    /// merely makes that cell findable when grepping the matrix.
     #[test]
     fn test_up_to_date_path_pre_prune_runs_before_early_return_anchor() {
-        // 真正的实证测试是 `test_incremental_compile_prunes_orphan_class_when_source_deleted`
-        // (ADR-019 主回归)。本测试只是确认锚点存在 —— 如果未来有人误删上面那个
-        // 测试,本测试名 grep 能让 reviewer 立刻发现 ADR-019 / 路径矩阵中
-        // up-to-date × Stage 1 PrePrune 这一格丢了实证。
+        // The real evidence test is `test_incremental_compile_prunes_orphan_class_when_source_deleted`
+        // (the ADR-019 main regression). This test only confirms the anchor exists — if someone
+        // later deletes that test by mistake, grepping this test name lets a reviewer immediately
+        // notice the ADR-019 / matrix up-to-date × Stage 1 PrePrune cell lost its evidence.
         //
-        // 这是 spec L154 「测试命名应反映路径+不变式两个维度,便于 grep 倒查」
-        // 的具体实现策略。
+        // This implements spec L154 ("test names should reflect both the path and invariant
+        // dimensions, for grep-based reverse lookup").
         let _ = test_incremental_compile_prunes_orphan_class_when_source_deleted;
     }
 

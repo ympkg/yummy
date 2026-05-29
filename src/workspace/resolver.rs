@@ -2454,7 +2454,7 @@ fn verify_pom_body(body: &[u8]) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// L3 (ADR-024): unlink any cached POM that fails integrity check so the caller's subsequent `.exists()` check triggers a refetch ("完整性 > 存在性").
+/// L3 (ADR-024): unlink any cached POM that fails integrity check so the caller's subsequent `.exists()` check triggers a refetch ("integrity > existence").
 fn invalidate_corrupt_pom(pom_path: &Path) {
     if !pom_path.exists() {
         return;
@@ -4339,7 +4339,7 @@ mod tests {
         );
     }
 
-    // L3 (ADR-024) — stale corrupt cache files must not satisfy a downstream `.exists()` hit ("完整性 > 存在性").
+    // L3 (ADR-024) — stale corrupt cache files must not satisfy a downstream `.exists()` hit ("integrity > existence").
     #[test]
     fn invalidate_corrupt_pom_unlinks_empty_file() {
         let dir = std::env::temp_dir().join(format!("ym_inv_empty_{}", std::process::id()));
